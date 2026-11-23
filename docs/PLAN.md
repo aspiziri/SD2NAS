@@ -22,17 +22,21 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
 - Name and sort files exactly like CameraImport: `YYYY-MM-DD HH.mm.ss.ext`, videos
   with resolution, frame rate and duration, and `Capture/` and `Videos/`
   subfolders.
+- Keep every newly ingested file in two places, the SSD staging copy and a
+  safety copy on the array, until it's promoted (§3).
 - Manage staging from a browser, phone first: browse, merge, rename, move files,
   cull, discard, promote.
 - Keep a hash index of the existing archive, fill it once in the background, and
   rescan it nightly.
-- Unmount the card when done and send a notification saying it's safe to format.
+- Unmount the card when done and send a notification saying whether it's safe
+  to format.
 
 ### v1 does not
 - Delete or modify anything on a card. Never.
-- Edit photos or write metadata.
+- Edit photos or write metadata. Files are copied byte for byte.
+- Create or touch Capture One session files (§8).
 - Have user accounts. It's reachable only on the LAN or Tailscale, with an
-  optional shared token (see §9).
+  optional shared token (§10).
 - Replace CameraImport, which stays as the desktop tool.
 
 ---
@@ -51,9 +55,10 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
    │  POST /api/ingest?wait=1  ───────────────►  ingest job
    │                                              ├─ scan /cards/SONY_A7IV
    │                                              ├─ fingerprint → catalog lookup
-   │                                              ├─ copy new → /photos/Staging/…
+   │                                              ├─ copy new → /staging/…   (SSD)
+   │                                              ├─ safety copy → /archive/.sd2nas/incoming (array)
    │                                              └─ record in SQLite (/config)
-   │  ◄─────────────────── JSON summary ────────
+   │  ◄─────────────────── summary ─────────────
    ├─ rc.unassigned umount
    └─ Unraid notify "112 new, card safe to format"
 
@@ -66,26 +71,73 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
 | Container path | Host path (example) | Mode | Purpose |
 |---|---|---|---|
 | `/cards` | `/mnt/disks` | RW/Slave, used read-only | Cards mounted by Unassigned Devices. Slave propagation is required so cards mounted after the container starts are visible. |
-| `/photos` | `/mnt/user/Photos` | RW | Holds `Staging/` and `Archive/` (both configurable). One mount keeps promotes as instant renames. |
+| `/staging` | `/mnt/cache/PhotoStaging` | RW | Staging on the 1 TB cache SSD. A share set to cache only, so the mover never touches it. |
+| `/archive` | `/mnt/user/Photos` (your existing archive share) | RW | The archive, on the array. SD2NAS's own files live in a hidden `.sd2nas/` folder at its root. |
 | `/config` | `/mnt/cache/appdata/sd2nas` | RW | SQLite database, thumbnail cache, settings. Use the cache path directly, not `/mnt/user`, to avoid SQLite locking problems on Unraid's share filesystem. |
 
 The container runs as `99:100` (nobody:users) with `UMASK=000` so files stay
-editable over SMB, and must have `TZ` set (see §12).
+editable over SMB, and must have `TZ` set (§13).
 
 ---
 
-## 3. Repository layout
+## 3. Storage and the safety copy
+
+**Why not just let Unraid's mover handle it:** the mover *moves* files from
+cache to the array; it doesn't keep a copy on both. And moving a file between
+shares through `/mnt/user` is a known Unraid trap: the file keeps living on the
+cache disk under the new share. So staging (SSD) and the archive (array) are
+separate shares, and SD2NAS always does real copies between them.
+
+**The safety copy:**
+- During ingest, each new file is written to `/staging` (fast to browse and make
+  thumbnails from) **and** to `/archive/.sd2nas/incoming/<hash[:2]>/<hash>.<ext>`
+  on the array.
+- The safety copy is named by hash and never reorganized, so merges, renames and
+  moves in staging only touch the SSD copy.
+- **Promote** moves each file's safety copy to its final archive path. That's a
+  rename within the same share on the array, so it's fast. Then it deletes the
+  SSD copy. If a safety copy is missing, promote copies from staging and
+  verifies the hash instead.
+- **Cull/discard** deletes both copies.
+- Unraid hides dot-folders over SMB by default, so `.sd2nas/` won't clutter the
+  archive list (verify in M0).
+
+**"Safe to format"** is only sent when every file on the card is either already
+in the archive or has both its staging copy and its safety copy. Failed files or
+a missing safety copy turn it into a warning instead.
+
+**Cost:** array writes with parity run at roughly 100 MB/s, so the safety copy
+is the slowest step. A typical card with a few GB of new files takes a couple of
+minutes; a 128 GB card of new 4K video takes about 20 minutes. It can be turned
+off in settings if the cache pool is mirrored.
+
+**Capacity guards:**
+- Before copying, ingest adds up the size of the new files and refuses to start
+  if staging would drop below a reserve (default 50 GB). The card stays mounted
+  and a notification explains why.
+- Staging shows a warning banner, plus a daily notification, when free space
+  drops below 150 GB or a folder has been in staging longer than 30 days. Both
+  thresholds are settings.
+
+**Catalog backup:** the database is the only record of what you culled, and
+that can't be rebuilt from the archive. Nightly, after the rescan, SD2NAS writes
+`VACUUM INTO /archive/.sd2nas/backups/catalog-YYYY-MM-DD.db` and keeps the last
+14. This is on top of the Appdata Backup plugin.
+
+---
+
+## 4. Repository layout
 
 ```
 cmd/sd2nas/            main: flags/env, wiring, HTTP server, background workers
-internal/media/        naming, EXIF date, video metadata, copy-with-hash, RAW preview
-internal/catalog/      SQLite schema, migrations, queries
-internal/ingest/       card ingest job (scan → fingerprint → copy → record)
-internal/staging/      staging folders: list, merge, rename, move, cull, promote
+internal/media/        naming, EXIF date, video metadata, copy-with-hash
+internal/catalog/      SQLite schema, migrations, queries, nightly backup
+internal/ingest/       card ingest job (scan → fingerprint → copy → safety copy → record)
+internal/staging/      staging folders: list, merge, rename, move, cull, promote; folder locks
 internal/indexer/      archive backfill + nightly rescan
-internal/thumbs/       thumbnail generation + cache
-internal/api/          HTTP handlers, SSE event hub
-internal/config/       settings (import rules, folder names) + env
+internal/thumbs/       thumbnail generation + cache (exiftool, ffmpeg)
+internal/api/          HTTP handlers, SSE event hub, request guard
+internal/config/       settings (import rules, folder names, thresholds) + env
 web/                   Svelte 5 + Vite SPA, built into web/dist and embedded
 deploy/
   Dockerfile
@@ -105,19 +157,19 @@ library (`net/http` with Go 1.22 path patterns), so no router dependency.
 
 ---
 
-## 4. Code borrowed from CameraImport
+## 5. Code borrowed from CameraImport
 
 This is a one-time copy, not a shared module (Go blocks importing another
 module's `internal/` packages). The two repos are free to drift.
 
 | CameraImport source | SD2NAS destination | Changes |
 |---|---|---|
-| `internal/exif/exif.go` | `internal/media/exif.go` | Keep `ReadExif`, `GetCaptureDate`, `FileModDate`. |
-| `importer.go`: `canCarryExif`, filename building, collision loop | `internal/media/naming.go` | Pull out pure functions: `CaptureTime(path, kind)`, `DestFileName(t, kind, videoMeta, ext)`, `TypeSubdir(kind, cfg)`. No service struct, no progress state. |
-| `importer.go`: `getVideoMetadata` | `internal/media/video.go` | Also read `mvhd` creation time so videos get a real capture time instead of the file's modified time (see §12 about GoPro time zones). |
+| `internal/exif/exif.go` | `internal/media/exif.go` | Keep `ReadExif`, `GetCaptureDate`, `FileModDate`. Also read `OffsetTimeOriginal` and GPS time when present (§12). |
+| `importer.go`: `canCarryExif`, filename building, collision loop | `internal/media/naming.go` | Pull out pure functions: `CaptureTime(path, kind)`, `FolderDate(t, dayStartsAt)`, `DestFileName(t, kind, videoMeta, ext)`, `TypeSubdir(kind, cfg)`. No service struct, no progress state. |
+| `importer.go`: `getVideoMetadata` | `internal/media/video.go` | Also read `mvhd` creation time so videos get a real capture time instead of the file's modified time (§13 on GoPro time zones). |
 | `importer.go`: `copyFile` | `internal/media/copy.go` | Becomes `CopyHashed(src, dst) (sha256, error)`. Writes to `dst.partial` with `O_EXCL`, hashes while copying, fsyncs, then renames into place. Keeps the original modified time. |
-| `importer.go`: `filesAreIdentical`, `fileHash` | `internal/media/hash.go` | Plus `QuickFingerprint(path)` (see §5). |
-| `internal/preview/preview.go` | `internal/thumbs/` | JPEG/PNG resized in Go as before. RAW: `exiftool -b -PreviewImage` (falling back to `JpgFromRaw`). Video: `ffmpeg` frame at 1s. Results cached on disk under `/config/thumbs/` by hash. |
+| `importer.go`: `filesAreIdentical`, `fileHash` | `internal/media/hash.go` | Plus `QuickFingerprint(path)` (§6). |
+| `internal/preview/preview.go` | `internal/thumbs/` | JPEG/PNG resized in Go as before. RAW: `exiftool -b -PreviewImage` (falling back to `JpgFromRaw`). Video: `ffmpeg` frame at 1s. Cached under `/config/thumbs/` by hash. |
 | `internal/config/config.go` | `internal/config/` | Same format lists and subfolder paths. Source and destination come from mounts, not settings. Add `cr3`. |
 | `importer_test.go` | `internal/media/*_test.go`, `internal/ingest/*_test.go` | Port the collision, duplicate and overwrite tests as they are. |
 
@@ -126,11 +178,10 @@ Not brought over: Wails, `ImportService`, `usbdetector`, the Svelte components
 
 ---
 
-## 5. Catalog (SQLite)
+## 6. Catalog (SQLite)
 
-Driver: `modernc.org/sqlite`, pure Go so no cgo, which keeps the static binary
-and the small image. **This is a new dependency to approve.** WAL mode, one
-writer goroutine.
+Driver: `modernc.org/sqlite` (approved), pure Go so no cgo, which keeps the
+static binary and the small image. WAL mode, one writer goroutine.
 
 ### Tables
 
@@ -141,8 +192,10 @@ CREATE TABLE assets (
   size          INTEGER NOT NULL,
   kind          TEXT NOT NULL,          -- image | raw | video
   capture_time  TEXT,                   -- local time, as named
+  tz_offset     TEXT,                   -- from EXIF OffsetTimeOriginal, if any
   state         TEXT NOT NULL,          -- staged | archived | culled | missing
-  rel_path      TEXT,                   -- relative to /photos; NULL when culled
+  rel_path      TEXT,                   -- relative to /staging or /archive; NULL when culled
+  safety_path   TEXT,                   -- safety copy under .sd2nas/incoming while staged
   mtime         INTEGER,                -- for cheap rescans
   first_ingest  INTEGER REFERENCES ingests(id),  -- NULL if found by indexer
   updated_at    TEXT NOT NULL
@@ -152,7 +205,7 @@ CREATE INDEX assets_path ON assets(rel_path);
 -- Quick fingerprints, many-to-one. Never deleted, so an old fingerprint still
 -- matches after an archived file has its metadata edited (see "aliases").
 CREATE TABLE fingerprints (
-  quick_fp  BLOB NOT NULL,              -- see below
+  quick_fp  BLOB NOT NULL,
   sha256    BLOB NOT NULL REFERENCES assets(sha256),
   PRIMARY KEY (quick_fp, sha256)
 );
@@ -168,9 +221,10 @@ CREATE TABLE ingests (
   id           INTEGER PRIMARY KEY,
   card_label   TEXT, card_serial TEXT, card_size INTEGER,
   started_at   TEXT NOT NULL, finished_at TEXT,
-  status       TEXT NOT NULL,           -- running | done | failed | cancelled
+  status       TEXT NOT NULL,           -- running | done | failed | refused | cancelled
   seen INTEGER, new INTEGER, in_archive INTEGER, in_staging INTEGER,
   seen_before INTEGER, failed INTEGER,
+  safe_to_format INTEGER NOT NULL DEFAULT 0,
   error        TEXT
 );
 
@@ -188,7 +242,7 @@ CREATE TABLE ingest_files (
 
 CREATE TABLE staging_folders (
   id      INTEGER PRIMARY KEY,
-  name    TEXT NOT NULL UNIQUE,         -- directory name under Staging/
+  name    TEXT NOT NULL UNIQUE,         -- directory name under /staging
   dates   TEXT NOT NULL,                -- JSON array of YYYY-MM-DD it covers
   created_at TEXT NOT NULL
 );
@@ -203,15 +257,14 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 | Situation | What happens | Cost |
 |---|---|---|
-| Fingerprint not in catalog | **New.** Copy to staging while computing the full SHA-256, then insert the asset and its fingerprint. | One read of the file, which the copy needs anyway |
+| Fingerprint not in catalog | **New.** Copy to staging while computing the full SHA-256, write the safety copy, then insert the asset and its fingerprint. | The copy's own reads |
 | Fingerprint matches an asset | **Known.** Record the outcome from the asset's state (archived, staged, culled → "seen before"). Don't copy. | 128 KB |
 | Full hash of a new copy matches an existing asset (fingerprint collision or an alias) | Delete the copy, record it as known. | Rare |
 
-> Correction to the earlier discussion: matches are **not** fully re-hashed by
-> default. Fully hashing the ~1,000 known files on every insert is the slow part
-> we're trying to avoid. Same size plus identical first and last 64 KB is a safe
-> match for camera files. A `verify_known=full` setting can force full hashing
-> for anyone who wants it.
+Matches are **not** fully re-hashed by default: fully hashing the ~1,000 known
+files on every insert is exactly the slowness we're avoiding. Same size plus
+identical first and last 64 KB is a safe match for camera files. A
+`verify_known=full` setting can force full hashing.
 
 **Aliases:** when the indexer finds an archived file whose content changed (same
 path, new hash), it stores the new hash and keeps the old one in `aliases` and
@@ -224,29 +277,39 @@ skipped on future ingests. The ingest summary offers "Re-import anyway".
 
 ---
 
-## 6. Ingest pipeline (`internal/ingest`)
+## 7. Ingest pipeline (`internal/ingest`)
 
 1. **Trigger.** `POST /api/ingest {path, label, serial}` from the Unassigned
-   Devices script, with an optional in-container poller as a fallback (§10). One
+   Devices script, with an optional in-container poller as a fallback (§11). One
    ingest runs at a time; others queue. The same card path already running
    returns the running job.
 2. **Scan.** Walk the card, keeping files whose extension matches the import
    rules. Ignore `DCIM/.Trashes`, `MISC/`, `.thumbnails`, and GoPro `.LRV`/`.THM`
    (low-res proxies and thumbnails).
-3. **Fingerprint and classify** each file against the catalog. Card reads are
-   sequential-ish; run 2–4 workers.
-4. **Copy new files**, one at a time to keep card reads sequential:
+3. **Fingerprint and classify** each file against the catalog. Run 2–4 workers.
+4. **Space check.** Sum the sizes of the new files; refuse the ingest
+   (`status = refused`) if staging would drop below the reserve (§3).
+5. **Copy new files**, one at a time to keep card reads sequential:
    - capture time: EXIF for images and RAW; `mvhd` creation time for video;
      modified time as a last resort
-   - target folder: the staging folder whose `dates` contains that date, else a
-     new folder named `YYYY-MM-DD`
+   - folder date: the capture date, shifted by the **day cutoff** (setting
+     `day_starts_at`, default 04:00). A photo taken at 01:30 on 05-31 goes in the
+     05-30 folder so a night out stays together. The filename keeps the real
+     time: `2025-05-31 01.30.12.JPG`. Changing the cutoff only affects future
+     ingests.
+   - target folder: the staging folder whose `dates` contains that folder date,
+     else a new folder named `YYYY-MM-DD`
    - target name and subfolder from `internal/media`, with CameraImport's
      collision loop (identical file → skip, else add `-1`, `-2`)
-   - `CopyHashed` to `.partial`, fsync, rename
+   - `CopyHashed` to `.partial`, fsync, rename; holding that staging folder's
+     lock (§8)
+   - safety copy to `/archive/.sd2nas/incoming/` (a second worker, so the next
+     card read overlaps the array write)
    - insert the asset and fingerprint, update `staging_folders`
-5. **Finish.** Write ingest totals, publish an SSE event, return the JSON summary
-   (the script uses it for the notification). Queue thumbnail generation for the
-   new assets.
+6. **Clock check** on the new files (§12) and attach any warnings to the summary.
+7. **Finish.** Write ingest totals and `safe_to_format`, publish an SSE event,
+   return the summary (the script uses it for the notification). Queue thumbnail
+   generation for the new assets.
 
 **Failure handling**
 - Unreadable file → `outcome = failed`, continue, show it in the summary. The
@@ -254,50 +317,85 @@ skipped on future ingests. The ingest summary offers "Re-import anyway".
 - Card pulled mid-ingest → job `failed`, finished files stay recorded. Partial
   files are removed. Re-inserting the card picks up where it left off, because
   done files now match.
-- On startup: delete stray `*.partial` under Staging, mark `running` ingests as
-  `failed`.
+- On startup: delete stray `*.partial` files, mark `running` ingests as
+  `failed`, and redo safety copies that are missing for staged assets.
 
 ---
 
-## 7. Staging operations (`internal/staging`)
+## 8. Staging operations (`internal/staging`)
 
 The filesystem is the truth for what files exist. The database is updated after
 each filesystem step. A startup reconcile pass fixes drift: files added or
 removed by hand over SMB.
 
-| Operation | Filesystem | Catalog |
-|---|---|---|
-| List folders | read `Staging/` | join counts and sizes from `assets` |
-| Rename | rename the directory | update `staging_folders.name`, `assets.rel_path` prefix |
-| Merge N → 1 | move files into the target folder (collision loop), remove empty sources | union `dates`, update paths |
-| Move files | same as merge, per file; "New folder…" creates one | update paths and dates |
-| Cull files / discard folder | delete files | `state = culled`, `rel_path = NULL` |
-| Promote | `os.Rename(Staging/X, Archive/<pattern>)`. If the target exists: merge into it with the collision loop. If rename returns `EXDEV`: copy, verify hash, then delete. | `state = archived`, new paths, drop the `staging_folders` row |
+**Folder locks:** every operation, including ingest writing into a folder, takes
+a lock on each staging folder it touches. If you try to merge or rename a folder
+that a card ingest is currently filling, the API returns `409 Conflict` and the
+UI says "this folder is being imported into". Locks are held for one operation,
+never across user think time.
+
+| Operation | Staging (SSD) | Archive (array) | Catalog |
+|---|---|---|---|
+| List folders | read `/staging` | none | join counts and sizes from `assets` |
+| Rename | rename the directory | none | update `staging_folders.name`, `assets.rel_path` prefix |
+| Merge N → 1 | move files into the target folder (collision loop), remove empty sources | none | union `dates`, update paths |
+| Move files | same as merge, per file; "New folder…" creates one | none | update paths and dates |
+| Cull files / discard folder | delete files | delete safety copies | `state = culled`, `rel_path = NULL` |
+| Promote | delete SSD copies after the archive side succeeds | rename safety copies into `/archive/<pattern>/…`; if the target folder exists, merge with the collision loop; if a safety copy is missing, copy from staging and verify the hash | `state = archived`, new paths, drop the `staging_folders` row |
+
+Promote runs as a background job with progress, so a big folder doesn't tie up
+the phone.
 
 **Folder naming follows the existing archive:** `YYYY-MM-DD - Title`, e.g.
 `2007-11-10 - SMU Homecoming`. New staging folders start as just `YYYY-MM-DD`.
 The UI's rename asks only for the title, keeps the date prefix, and inserts the
 ` - ` separator. A merged folder takes the earliest date of its sources.
 
-Promote pattern defaults to `{name}`, meaning straight into the archive root,
-matching the flat layout. Tokens `{year}` and `{month}` are available if that
-changes, e.g. `{year}/{name}`. Promoting a folder that still has no title shows
-a warning but is allowed.
+Promote pattern defaults to `{name}`, straight into the archive root, matching
+the flat layout. Tokens `{year}` and `{month}` are available if that ever
+changes. Promoting a folder with no title shows a warning but is allowed.
+
+**Capture One sessions:** each archive folder is a Capture One session:
+
+```
+2025-05-30 - France and Italy Trip/
+  2025-05-30 02.46.25.JPG …            JPGs at the top level
+  Capture/                             RAW files (SD2NAS creates this)
+  Videos/                              videos (SD2NAS creates this)
+  Selects/  Output/  Trash/            created by Capture One
+  Other/
+  2025-05-30 - France and Italy Trip.cosessiondb
+```
+
+SD2NAS only creates the CameraImport part (top-level JPGs, `Capture/`,
+`Videos/`). It never creates or edits the Capture One folders or the
+`.cosessiondb`, which is a proprietary database. The session is created in
+Capture One after promoting, as you do today.
 
 Destructive operations (cull, discard) need a confirmation in the UI, like the
 mockup. Everything else is reversible by doing the opposite operation.
 
 ---
 
-## 8. Archive indexer (`internal/indexer`)
+## 9. Archive indexer (`internal/indexer`)
 
-- **Backfill (first run):** walk `Archive/`, hash every media file, insert as
+- **Backfill (first run):** walk the archive, hash every media file, insert as
   `archived` with `first_ingest = NULL`. Resumable (skips paths already indexed
   with matching size and modified time), low priority, progress in the UI. The
   archive is about 150k files; older JPEGs are a few MB and recent RAWs about
   25 MB, so expect roughly 1–2 TB and a few hours of reading from the array at
-  ~150 MB/s. Run it overnight. The first run also builds thumbnails, which can
-  be deferred to a separate background pass.
+  ~150 MB/s. Run it overnight. **No thumbnails** are made for the archive: v1
+  has no archive browser, and making 150k thumbnails would add hours of
+  exiftool and ffmpeg work for nothing.
+- **What gets indexed inside a session folder:** top-level media, `Capture/`,
+  `Selects/`, `Trash/`, `Videos/`, `Other/`. **Skipped:** `Output/` (exports
+  made from originals, never from a card), `CaptureOne/` subfolders (cache and
+  settings), `*.cosessiondb`, and `.sd2nas/`. Files in `Trash/` still count as
+  seen, so rejected shots don't come back from the card.
+- **Moves are recognized:** Capture One moves files between `Capture/`,
+  `Selects/` and `Trash/`. When a path disappears and the same hash shows up at
+  a new path in the same scan, it's recorded as a move, not as "missing" plus
+  "new".
 - Folder names give a date hint but are **parsed as text, never as a strict
   date**: the archive contains names like `2007-09-31 - Random Party`
   (September has 30 days), which a strict date parser would reject.
@@ -305,32 +403,34 @@ mockup. Everything else is reversible by doing the opposite operation.
   - size and modified time unchanged → skip
   - changed → re-hash, store the old hash as an alias, list it under
     "changed since indexed"
-  - gone → `state = missing`, still counted as seen
+  - gone, and not seen elsewhere → `state = missing`, still counted as seen
   - new file not from SD2NAS (copied in by hand) → index it
+  - then the catalog backup (§3)
 - **Manual "Rescan now"** from the UI.
 
 ---
 
-## 9. HTTP API (`internal/api`)
+## 10. HTTP API (`internal/api`)
 
 JSON throughout. Server-sent events at `/api/events` push ingest progress,
-staging changes and indexer progress, which replaces CameraImport's polling.
+staging changes, promote jobs and indexer progress, which replaces
+CameraImport's polling.
 
 ```
 POST   /api/ingest                       {path,label,serial}  ?wait=1 blocks until done
 GET    /api/ingest/current
 POST   /api/ingest/{id}/reimport-culled
 GET    /api/ingests                      history
-GET    /api/ingests/{id}                 summary + skipped-file breakdown
+GET    /api/ingests/{id}                 summary + skipped-file breakdown + clock warnings
 
-GET    /api/staging                      folders with counts, sizes, sample thumbs
+GET    /api/staging                      folders with counts, sizes, sample thumbs, warnings
 GET    /api/staging/{id}/files           ?kind=raw|jpg|video
-PATCH  /api/staging/{id}                 {name}
-POST   /api/staging/merge                {ids[], name}
-POST   /api/staging/move                 {fileShas[], toId | newName}
+PATCH  /api/staging/{id}                 {title}
+POST   /api/staging/merge                {ids[], title}
+POST   /api/staging/move                 {fileShas[], toId | newTitle}
 POST   /api/staging/cull                 {fileShas[]}
 DELETE /api/staging/{id}                 discard folder
-POST   /api/staging/promote              {ids[], pattern}
+POST   /api/staging/promote              {ids[], pattern} → job id
 
 GET    /api/thumbs/{sha}                 small (~400px), cached
 GET    /api/preview/{sha}                large (~1600px) for the phone lightbox
@@ -345,13 +445,21 @@ PUT    /api/settings
 GET    /healthz
 ```
 
-**Auth:** none by default. Optional `SD2NAS_TOKEN`: when set, every request
-needs it, the UI asks once and remembers it, and the script sends it as a
-header. Never port-forward; use Tailscale for remote access.
+**Request guard (always on):** without a login, any webpage open in a browser
+on your network could otherwise send requests to `tower:8080` and cull files.
+Every request that changes something must carry the header `X-SD2NAS: 1` and,
+if it has an `Origin`, that origin must be SD2NAS itself. Browsers won't let
+another site add a custom header without a CORS check, and SD2NAS answers no
+CORS requests, so those requests fail. The UI and the card script send the
+header automatically.
+
+**Optional token:** `SD2NAS_TOKEN`; when set, every request needs it, the UI
+asks once and remembers it, and the script sends it. Never port-forward; use
+Tailscale for remote access.
 
 ---
 
-## 10. Card trigger and unmount
+## 11. Card trigger and unmount
 
 `deploy/unassigned-devices.sh` is attached to the card reader in Unassigned
 Devices with auto-mount on:
@@ -367,16 +475,16 @@ case "$ACTION" in
     # so the script doesn't depend on jq being installed on the host
     if RESULT=$(curl -fsS --max-time 7200 -X POST \
         "http://localhost:$PORT/api/ingest?wait=1&format=text" \
-        -H "Content-Type: application/json" \
+        -H "Content-Type: application/json" -H "X-SD2NAS: 1" \
         ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
         -d "{\"path\":\"/cards/$(basename "$MOUNTPOINT")\",\"label\":\"$LABEL\",\"serial\":\"$SERIAL\"}"); then
       LEVEL=$(echo "$RESULT" | sed -n 1p)
       MSG=$(echo "$RESULT" | sed -n 2p)
       /usr/local/sbin/rc.unassigned umount "$DEVICE"
     else
-      # Container down or ingest errored: leave the card mounted so it can be retried
+      # Container down, ingest refused or errored: leave the card mounted so it can be retried
       LEVEL="alert"
-      MSG="Ingest of $LABEL failed. Card left mounted. Check the SD2NAS logs."
+      MSG="Ingest of $LABEL failed. Card left mounted. Check SD2NAS."
     fi
     /usr/local/emhttp/webGui/scripts/notify -s "SD2NAS" -d "$MSG" -i "$LEVEL"
     ;;
@@ -398,13 +506,62 @@ plugged in, or only when the reader itself is plugged in.
 
 ---
 
-## 11. Container, CI and Unraid install
+## 12. Camera clock problems
+
+A camera with the wrong time gives every file the wrong name and folder. There's
+no general way to know a clock is wrong: the files, the card and the camera all
+share the same clock. A few cases **can** be caught:
+
+| Signal | What it catches | Reliability |
+|---|---|---|
+| Capture time after the NAS's current time | Clock set in the future | Certain |
+| Capture time on a known reset default (e.g. `2000-01-01`, or before the camera model existed) | Dead clock battery, factory reset | Certain |
+| GPS timestamp in EXIF (UTC from satellites, if the camera has GPS or phone location sync) vs. capture time | Wrong clock or time zone, to the minute | Good, but only when GPS data is present |
+| `OffsetTimeOriginal` in EXIF (newer Sony bodies write it) vs. the NAS time zone | Camera still on home time zone after travel | Hint only: the camera may be right and you were abroad |
+| Two cameras covering the same event on the same ingest | Clock drift between bodies | Heuristic, too unreliable for v1 |
+
+**v1:** run the certain and GPS checks during ingest and show warnings on the
+summary and the affected staging folders. Show the camera's time zone, when
+known, in the folder details.
+
+**M7: "Shift times" tool** in staging: pick files or a folder and shift them by
+±H:MM. It renames the files and re-files them into the right date folders. Only
+filenames change, never file contents, so hashes and duplicate detection are
+unaffected.
+
+---
+
+## 13. Gotchas to handle in code
+
+- **Time zones.** EXIF `DateTimeOriginal` has no time zone and is treated as
+  local. File modified times and MP4 `mvhd` times are absolute and get converted
+  with the container's `TZ`. A container left on UTC would name videos hours off.
+  The template sets `TZ`, and `/healthz` reports it.
+- **GoPro `mvhd` times.** Some GoPro firmware writes local time into the UTC
+  field. Add a per-camera "video time is local" setting, detected from the
+  `udta` make/model.
+- **exFAT modified times** on cards are local with no zone, so they're
+  unreliable as a fallback. Prefer EXIF and `mvhd`.
+- **RAW + JPEG pairs** share a timestamp and differ only by extension; they go
+  in different subfolders anyway.
+- **Burst shots** collide on the one-second timestamp. CameraImport's `-1`,
+  `-2` suffixes handle it; keep the order stable by sorting on original card
+  filename within the same second.
+- **Day cutoff** applies to the folder only, never the filename, so files still
+  sort by real time inside a folder.
+- **Staging → archive is always a real copy** (or a rename of the array-side
+  safety copy), never a rename across shares (§3).
+
+---
+
+## 14. Container, CI and Unraid install
 
 **Dockerfile** (multi-stage): node builds `web/dist` → Go builds a static binary
 with the UI embedded → final `alpine` image containing the binary plus
 `tzdata`, `exiftool` (~20 MB, RAW previews for every format including CR3) and
-`ffmpeg` (~80 MB, video poster frames). Both are installed with `apk` from
-Alpine's packages. Expected image size is about 120 MB. Exposes 8080, runs as `99:100`, with a `HEALTHCHECK` on `/healthz`.
+`ffmpeg` (~80 MB, video poster frames), both installed with `apk`. Expected
+image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
+`HEALTHCHECK` on `/healthz`.
 
 **GitHub Actions**
 - `ci.yml`: `go vet`, `go test ./...`, `npm ci && npm run build` on every push
@@ -413,58 +570,52 @@ Alpine's packages. Expected image size is about 120 MB. Exposes 8080, runs as `9
   `v*` tag publish `:X.Y.Z` and `:latest`. linux/amd64 only. The package is
   public because the repo is. ghcr image names must be lowercase.
 
-**Unraid template** `deploy/unraid/sd2nas.xml`: repository, web UI link,
-port, the three paths (with `/cards` as RW/Slave), `TZ`, `UMASK=000`, optional
-`SD2NAS_TOKEN`, and `--user 99:100` in Extra Parameters. The image isn't
-linuxserver-based, so it doesn't use their `PUID`/`PGID` convention; the
-binary applies `UMASK` itself at startup. Install by adding the repo's `deploy/unraid`
-URL under Docker → Template repositories, or by pasting the values into Add
-Container. Updates show up in the Docker tab like any CA app.
+**Unraid setup**
+- Create a `PhotoStaging` share with primary storage on the cache pool and no
+  secondary storage, so the mover leaves it alone.
+- Template `deploy/unraid/sd2nas.xml`: repository, web UI link, port, the four
+  paths (with `/cards` as RW/Slave), `TZ`, `UMASK=000`, optional
+  `SD2NAS_TOKEN`, and `--user 99:100` in Extra Parameters. The image isn't
+  linuxserver-based, so it doesn't use their `PUID`/`PGID` convention; the
+  binary applies `UMASK` itself at startup.
+- Install by adding the repo's `deploy/unraid` URL under Docker → Template
+  repositories, or by pasting the values into Add Container. Updates show up in
+  the Docker tab like any CA app.
 
 **Local development**
-- `go run ./cmd/sd2nas --cards ./testdata/cards --photos ./tmp/photos --config ./tmp/config`
+- `go run ./cmd/sd2nas --cards ./testdata/cards --staging ./tmp/staging --archive ./tmp/archive --config ./tmp/config`
 - `npm run dev` in `web/` with a Vite proxy to the Go server
 - `deploy/docker-compose.dev.yml` runs the real image on the desktop against
   test folders before deploying
 
 ---
 
-## 12. Gotchas to handle in code
-
-- **Time zones.** EXIF `DateTimeOriginal` has no time zone and is treated as
-  local. File modified times and MP4 `mvhd` times are absolute and get converted
-  with the container's `TZ`. A container left on UTC would name videos hours off.
-  The template sets `TZ`, and `/healthz` reports it.
-- **GoPro `mvhd` times.** Some GoPro firmware writes local time into the
-  UTC field. Add a per-camera "video time is local" setting, detected from
-  the `udta` make/model.
-- **exFAT modified times** on cards are local with no zone, so they're
-  unreliable as a fallback. Prefer EXIF and `mvhd`.
-- **RAW + JPEG pairs** share a timestamp and differ only by extension, so they
-  don't collide (they go in different subfolders anyway).
-- **Burst shots** collide on the one-second timestamp. CameraImport's `-1`,
-  `-2` suffixes handle it; keep the order stable by sorting on original card
-  filename within the same second.
-- **Cross-mount moves** (`EXDEV`): always fall back to copy, verify, delete.
-
----
-
-## 13. Decisions
+## 15. Decisions
 
 | Topic | Decision |
 |---|---|
-| Archive layout | Flat folders named `YYYY-MM-DD - Title`, about 150k photos. Promote pattern defaults to `{name}`. |
+| Archive layout | One flat list of `YYYY-MM-DD - Title` folders, about 150k photos. Each is a Capture One session with CameraImport's layout inside. Promote pattern defaults to `{name}`. |
+| Staging location | 1 TB cache SSD (~600 GB free), separate cache-only share, plus a safety copy on the array until promoted |
+| Day cutoff | Setting `day_starts_at`, default 04:00 |
+| Clock errors | Automatic warnings for certain cases and GPS mismatches in v1; manual shift tool in M7 |
 | RAW previews | `exiftool` in the image |
 | Video thumbnails | `ffmpeg` in the image |
 | Frontend | Svelte 5 + Vite, single-page app with no SvelteKit. The UI is written from scratch, so there's no reason to start on the older version. |
 | Dependencies | Approved: `modernc.org/sqlite`. Carried over: `goexif`, `go-mp4`, `imaging`. Frontend: `svelte`, `vite`. |
 
-Still to confirm: whether the date folders sit directly in the archive root or
-inside year folders (the pattern is a one-line setting either way).
+### Still open
+1. **Capture One step.** After promoting, how do you create the session today?
+   If Capture One expects the folder to be empty or named a certain way, promote
+   may need to adapt. And what goes in `Other/`?
+2. **Cache pool redundancy.** Is the cache a single SSD or a mirrored pool?
+   With a single SSD the safety copy should stay on; with a mirror it could be
+   optional.
+3. **Archive share path.** The exact share and path of the archive on the NAS
+   (the plan assumes `/mnt/user/Photos`).
 
 ---
 
-## 14. Milestones
+## 16. Milestones
 
 Each milestone ends with tests passing and a commit. The checklist under each
 is what "done" means.
@@ -472,6 +623,8 @@ is what "done" means.
 ### M0: Skeleton and hardware check
 - [ ] Card reader tested with Unassigned Devices: insert-triggered or reader-plug only
 - [ ] Confirm the variables Unassigned Devices passes to device scripts (`LABEL`, `SERIAL`, `MOUNTPOINT`) on your Unraid version
+- [ ] Confirm Unraid's SMB hides dot-folders (`.sd2nas/`)
+- [ ] `PhotoStaging` share created on the cache pool
 - [ ] Go module, `cmd/sd2nas` serving "hello" and `/healthz`
 - [ ] Dockerfile builds; image runs locally
 - [ ] CI and release workflows publish `ghcr.io/aspiziri/sd2nas:edge`
@@ -479,29 +632,36 @@ is what "done" means.
 
 ### M1: Media core
 - [ ] `internal/media` ported with CameraImport's tests passing
-- [ ] `CopyHashed`, `QuickFingerprint`, `mvhd` capture time
+- [ ] `CopyHashed`, `QuickFingerprint`, `mvhd` capture time, day cutoff
 - [ ] Fixtures in `testdata/` (real tiny JPEG, ARW, MP4)
 
 ### M2: Catalog and ingest (headless)
 - [ ] Schema and migrations; catalog tests on a temp database
 - [ ] Ingest job against a folder of fixtures: new, known, seen before, failed
+- [ ] Safety copy, space check and `safe_to_format` logic
+- [ ] Clock checks (future date, reset default, GPS mismatch)
 - [ ] `POST /api/ingest?wait=1` returns the summary
 - [ ] Re-running on the same folder imports 0 files
 
 ### M3: Web UI, read-only
-- [ ] Svelte app embedded; ingest page with live SSE progress and history
-- [ ] Staging list and folder view with thumbnails (JPEG first)
+- [ ] Svelte app embedded; request guard on all changing endpoints
+- [ ] Ingest page with live SSE progress and history
+- [ ] Staging list and folder view with thumbnails, **including RAW and video**
+  (exiftool, ffmpeg), since culling RAWs on a phone needs them
 - [ ] Phone layout: bottom tab bar, one-column cards, full-screen preview
 - [ ] PWA manifest and icon (Add to Home Screen)
 
 ### M4: Staging operations
-- [ ] Rename, merge, move files, cull, discard, promote, all with tests on temp dirs
-- [ ] Startup reconcile for changes made over SMB
+- [ ] Rename, merge, move files, cull, discard, promote (background job), all with tests on temp dirs
+- [ ] Folder locks; 409 on conflict with a running ingest
+- [ ] Startup reconcile for changes made over SMB; redo missing safety copies
+- [ ] Free-space and age warnings
 - [ ] Touch-friendly selection (long-press to start selecting, swipe-select in grids)
 
 ### M5: Archive indexer
-- [ ] Resumable backfill with progress
+- [ ] Resumable backfill with progress, Capture One skip rules, move detection
 - [ ] Nightly rescan, aliases, "changed since indexed" view
+- [ ] Nightly catalog backup to the array
 - [ ] Backfill run against the real archive
 
 ### M6: Unraid integration
@@ -511,6 +671,6 @@ is what "done" means.
 
 ### M7: Polish
 - [ ] Extra staging views (timeline, list)
-- [ ] RAW and video thumbnails (exiftool, ffmpeg)
+- [ ] "Shift times" tool for wrong camera clocks
 - [ ] Optional token auth
 - [ ] `v0.1.0` tag → `:latest`
