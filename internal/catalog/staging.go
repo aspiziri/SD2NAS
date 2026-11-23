@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -113,6 +114,93 @@ func (d *DB) StagingFolders(ctx context.Context) ([]StagingFolder, error) {
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+// StagingFolderByID returns the folder with id, or ErrNotFound.
+func (d *DB) StagingFolderByID(ctx context.Context, id int64) (StagingFolder, error) {
+	f, err := scanStagingFolder(d.db.QueryRowContext(ctx, "SELECT "+stagingCols+" FROM staging_folders WHERE id = ?", id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return StagingFolder{}, fmt.Errorf("staging folder %d: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return StagingFolder{}, fmt.Errorf("staging folder %d: %w", id, err)
+	}
+	return f, nil
+}
+
+// prefixRange is [prefix, prefix with its final "/" replaced by "0").
+// "0" is the byte after "/", so the range holds exactly the paths below
+// prefix, as a range scan on the assets_path index with no LIKE wildcards.
+func prefixRange(prefix string) (lo, hi string, err error) {
+	if len(prefix) < 2 || !strings.HasSuffix(prefix, "/") {
+		return "", "", fmt.Errorf("catalog: path prefix %q must be a folder ending in /", prefix)
+	}
+	return prefix, prefix[:len(prefix)-1] + "0", nil
+}
+
+// AssetsUnder returns the assets in state whose rel_path lies below prefix (a
+// folder path ending in "/"), ordered by rel_path in byte order.
+func (d *DB) AssetsUnder(ctx context.Context, prefix string, state AssetState) ([]Asset, error) {
+	lo, hi, err := prefixRange(prefix)
+	if err != nil {
+		return nil, fmt.Errorf("assets under %s: %w", prefix, err)
+	}
+	rows, err := d.db.QueryContext(ctx, "SELECT "+assetCols+
+		" FROM assets WHERE rel_path >= ? AND rel_path < ? AND state = ? ORDER BY rel_path", lo, hi, string(state))
+	if err != nil {
+		return nil, fmt.Errorf("assets under %s: %w", prefix, err)
+	}
+	var out []Asset
+	for rows.Next() {
+		a, err := scanAsset(rows)
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("assets under %s: %w", prefix, err), rows.Close())
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.Join(fmt.Errorf("assets under %s: %w", prefix, err), rows.Close())
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("assets under %s: %w", prefix, err)
+	}
+	return out, nil
+}
+
+// ClockWarningsUnder returns the clock warnings of the assets AssetsUnder
+// would return, ordered by the asset's rel_path and the warning kind.
+func (d *DB) ClockWarningsUnder(ctx context.Context, prefix string, state AssetState) ([]ClockWarning, error) {
+	lo, hi, err := prefixRange(prefix)
+	if err != nil {
+		return nil, fmt.Errorf("clock warnings under %s: %w", prefix, err)
+	}
+	rows, err := d.db.QueryContext(ctx, `SELECT w.card_path, w.sha256, w.kind, w.detail
+		FROM clock_warnings w JOIN assets a ON a.sha256 = w.sha256
+		WHERE a.state = ? AND a.rel_path >= ? AND a.rel_path < ? ORDER BY a.rel_path, w.kind`, string(state), lo, hi)
+	if err != nil {
+		return nil, fmt.Errorf("clock warnings under %s: %w", prefix, err)
+	}
+	var out []ClockWarning
+	for rows.Next() {
+		var (
+			w    ClockWarning
+			sha  []byte
+			kind string
+		)
+		if err := rows.Scan(&w.CardPath, &sha, &kind, &w.Detail); err != nil {
+			return nil, errors.Join(fmt.Errorf("clock warnings under %s: %w", prefix, err), rows.Close())
+		}
+		w.Kind = ClockWarningKind(kind)
+		w.SHA256 = blobToHex(sha)
+		out = append(out, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.Join(fmt.Errorf("clock warnings under %s: %w", prefix, err), rows.Close())
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("clock warnings under %s: %w", prefix, err)
 	}
 	return out, nil
 }

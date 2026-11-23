@@ -1,8 +1,12 @@
 package catalog
 
 import (
+	"errors"
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/aspiziri/SD2NAS/internal/media"
 )
 
 func insertFolder(t *testing.T, d *DB, name, dates string) int64 {
@@ -103,5 +107,106 @@ func TestStagingFolders(t *testing.T) {
 	if len(all) != 2 || all[0].Name != "a" || all[1].Name != "b" ||
 		!reflect.DeepEqual(all[0].Dates, []string{"2025-01-01", "2025-01-03"}) {
 		t.Errorf("folders = %+v", all)
+	}
+}
+
+func seedUnder(t *testing.T, d *DB) {
+	t.Helper()
+	rows := []struct {
+		rel   string
+		kind  media.Kind
+		state AssetState
+	}{
+		{"Staging/2025-05-30/2025-05-30 10.00.00.JPG", media.KindImage, StateStaged},
+		{"Staging/2025-05-30/Capture/2025-05-30 10.00.00.ARW", media.KindRaw, StateStaged},
+		{"Staging/2025-05-30 - Trip/a.JPG", media.KindImage, StateStaged},
+		{"Staging/50%_off/b.JPG", media.KindImage, StateStaged},
+		{"Archive/2025-05-30 - Old/c.JPG", media.KindImage, StateArchived},
+		{"Staging/2025-05-30/d.JPG", media.KindImage, StateArchived},
+	}
+	for i, r := range rows {
+		err := d.InsertAsset(t.Context(), Asset{SHA256: hexN(byte(i + 1)), Size: 10, Kind: r.kind, State: r.state,
+			RelPath: r.rel, UpdatedAt: time.Now()}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAssetsUnderPrefixTrap(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	seedUnder(t, d)
+	shas := func(prefix string) []string {
+		t.Helper()
+		as, err := d.AssetsUnder(ctx, prefix, StateStaged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, a := range as {
+			out = append(out, a.SHA256)
+		}
+		return out
+	}
+	for _, c := range []struct {
+		prefix string
+		want   []string
+	}{
+		{"Staging/2025-05-30/", []string{hexN(1), hexN(2)}},
+		{"Staging/50%_off/", []string{hexN(4)}},
+		{"Staging/", []string{hexN(3), hexN(1), hexN(2), hexN(4)}},
+	} {
+		if got := shas(c.prefix); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("AssetsUnder(%q) = %v, want %v", c.prefix, got, c.want)
+		}
+	}
+	for _, bad := range []string{"Staging", "/"} {
+		if _, err := d.AssetsUnder(ctx, bad, StateStaged); err == nil {
+			t.Errorf("AssetsUnder(%q) succeeded", bad)
+		}
+	}
+}
+
+func TestStagingFolderByID(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	f, err := d.StagingFolderForDate(ctx, "2025-05-30", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.StagingFolderByID(ctx, f.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, f) {
+		t.Errorf("got %+v, want %+v", got, f)
+	}
+	if _, err := d.StagingFolderByID(ctx, 999); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestClockWarningsUnder(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	seedUnder(t, d)
+	in, err := d.CreateIngest(ctx, "/cards/X", "X", "", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = d.AddClockWarnings(ctx, in.ID, []ClockWarning{
+		{CardPath: "DCIM/a.JPG", SHA256: hexN(1), Kind: ClockFuture, Detail: "in the future"},
+		{CardPath: "DCIM/c.JPG", SHA256: hexN(5), Kind: ClockFuture, Detail: "x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.ClockWarningsUnder(ctx, "Staging/2025-05-30/", StateStaged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA256 != hexN(1) || got[0].Detail != "in the future" {
+		t.Errorf("got %+v", got)
 	}
 }

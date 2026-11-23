@@ -19,6 +19,7 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/config"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
+	"github.com/aspiziri/SD2NAS/internal/staging"
 	"github.com/aspiziri/SD2NAS/web"
 )
 
@@ -96,6 +97,7 @@ func run(log *slog.Logger) error {
 		}
 		mgr.Start()
 		srv.MountIngest(mgr, db, api.DefaultMaxWait)
+		srv.MountStaging(staging.New(db, cfg.Photos))
 	}
 
 	httpSrv := &http.Server{
