@@ -15,7 +15,7 @@ Relevant spec sections: §1 (scope), §4 (layout), §5 (CameraImport → SD2NAS 
 ## Global Constraints
 
 - Module path `github.com/aspiziri/SD2NAS`. `go.mod` keeps `go 1.24` and gets no `toolchain` line. Use no API newer than Go 1.24 (e.g. no `sync.WaitGroup.Go`, no `testing.T.Output`). The local toolchain is go1.26 on Windows; CI runs `gofmt -l .`, `go vet ./...` and `go test ./...` on ubuntu.
-- M1 touches only `internal/media/`, `internal/media/mediatest/`, `testdata/`, `.gitattributes`, `go.mod`, `go.sum`, and one table row of `docs/PLAN.md` (Task 1). Do not modify `cmd/`, `internal/api/` or `internal/config/`.
+- M1 touches only `internal/media/`, `internal/media/mediatest/`, `testdata/`, `.gitattributes`, `go.mod`, `go.sum`, and, in `docs/PLAN.md`, one §5 table row and the §16 M1 checklist bullets (both Task 1). Do not modify `cmd/`, `internal/api/` or `internal/config/`.
 - Dependencies: only `github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd` (Task 5) and `github.com/abema/go-mp4 v1.4.1` (Task 6), the versions CameraImport uses. `go-mp4` brings `github.com/google/uuid v1.1.2 // indirect`; that is expected. Nothing else outside the standard library.
 - Tests pass on Windows and Linux. Use `path/filepath`. No Unix-only syscalls. Never assert permission bits. Never depend on the value of `time.Local`: build expected values with `time.Local` or a `time.FixedZone`, and compare instants with `Equal`.
 - Close every file before returning. Windows cannot delete or rename open files, and `t.TempDir` cleanup fails if one is left open.
@@ -28,23 +28,25 @@ Relevant spec sections: §1 (scope), §4 (layout), §5 (CameraImport → SD2NAS 
 
 ## Review Focus
 
-1. **Zero or garbage EXIF rationals** (GPS `30/0`, absurd hour values). Manual lenses and cheap GPS loggers write these. Expected: no panic, `GPSTime` is zero, and the capture time is still read. Pinned in Task 5 (`TestReadExifBadGPSRational`).
+1. **Zero or garbage EXIF rationals** (GPS `30/0`, absurd hour values). Manual lenses and cheap GPS loggers write these. Expected: no panic, `GPSTime` is zero (each unit is bounded: hour < 24, minute < 60, second < 61), and the capture time is still read. Pinned in Task 5 (`TestReadExifBadGPSRational`).
 2. **A stale `.partial` left by a crash or a pulled card.** Expected: `CopyHashed` refuses with `fs.ErrExist` and does not delete a partial it didn't create (M2's startup cleanup owns those). Pinned in Task 3 (`TestCopyHashedStalePartial`).
 3. **Burst shots in the same second, and a re-inserted card.** Expected: different content gets `-1`, `-2`; identical content is reported as a duplicate, including when the identical copy sits at a suffixed name. Pinned in Task 3 (`TestFreeNameIdenticalAtSuffix`) and Task 7 (ported tests).
 4. **Video with the audio track before the video track.** Expected: the frame rate comes from the video track's `mdhd`/`stts`, never the audio's. Pinned in Task 6 (the GoPro fixture has audio first).
-5. **`mvhd` creation time of 0**, which many cameras write. Expected: falls back to the modified time, and `Capture.Fallback` says why. Pinned in Task 7 (`TestCaptureTimeVideoWithoutCreationTime`).
+5. **`mvhd` creation time of 0**, which many cameras write, or a tiny garbage value (1 would read as 1904). Expected: both count as absent (anything below 2082844800 does), the capture time falls back to the modified time, and `Capture.Fallback` says why. Pinned in Task 6 (`TestReadVideoMetaPreUnixCreationTime`) and Task 7 (`TestCaptureTimeVideoWithoutCreationTime`).
+6. **Dropped errors.** goexif's non-critical decode error and an unparsable `DateTime` string must not vanish: they land in `ExifData.Warning`, and `CaptureTime` carries them into `Capture.Fallback` when it falls back. Malformed video `udta` text atoms are advisory and give empty Make/Model/Firmware (documented on `ReadVideoMeta`). Pinned in Task 5 (`TestReadExifBadDateTimeWarning`) and Task 7 (`TestCaptureTimeMalformedExifDateTimeWarning`).
+7. **Stale or corrupt committed fixtures.** Expected: `TestFixtures` without `-update` fails and says to rerun with `-update`. Pinned in Task 4.
 
 ## Decisions
 
 1. **Format lists and subfolders live in `internal/media/formats.go`**, as a `Rules` value with `DefaultRules()`. `internal/config` holds only process flags and env (its own doc comment says user settings will live in the catalog). M2's settings layer builds a `Rules` from stored settings. The §5 table row in `docs/PLAN.md` is updated to say so (Task 1).
 2. **Format lists**: CameraImport's lists plus `cr3`, stored in lowercase and matched case-insensitively. Image: jpg, jpeg, png, gif, tif. RAW: arw, cr2, cr3, nef, dng. Video: mp4, avi, mov. Nothing else is added (no `tiff`, `heic`, `hif`). Subfolders: images at the folder root, RAW in `Capture`, video in `Videos`.
-3. **Fixtures are synthesized, not real camera files.** Real JPEG/ARW/MP4 files are megabytes to gigabytes. `internal/media/mediatest` builds byte-exact TIFF/EXIF structures, a decodable 8×8 JPEG with an EXIF APP1 segment, an ARW-shaped TIFF, and an MP4 `moov` (mvhd/tkhd/mdhd/stts/udta) written with go-mp4's own `Writer`. The committed fixtures live under `testdata/cards/<LABEL>/DCIM/...`, a card-shaped layout that M2's ingest tests and `go run ./cmd/sd2nas --cards ./testdata/cards` can use directly. They are regenerated with `go test ./internal/media/mediatest -run TestFixtures -update`. There is no byte-for-byte drift check, because `image/jpeg` output may change between Go versions. Instead, `internal/media` tests assert the known metadata values of the committed files. `mediatest` is a normal package, so M2 tests can import it; it must never import `internal/media`, because that would create an import cycle in media's tests.
+3. **Fixtures are synthesized, not real camera files.** Real JPEG/ARW/MP4 files are megabytes to gigabytes. `internal/media/mediatest` builds byte-exact TIFF/EXIF structures, a decodable 8×8 JPEG with an EXIF APP1 segment, an ARW-shaped TIFF, and an MP4 `moov` (mvhd/tkhd/mdhd/stts/udta) written with go-mp4's own `Writer`. The committed fixtures live under `testdata/cards/<LABEL>/DCIM/...`, a card-shaped layout that M2's ingest tests and `go run ./cmd/sd2nas --cards ./testdata/cards` can use directly. They are regenerated with `go test ./internal/media/mediatest -run TestFixtures -update`. `TestFixtures` without `-update` regenerates each fixture in memory and compares it with the committed file: byte-exact for fixtures whose generator involves no `image/jpeg` encoding (the ARW and the MP4), and over the EXIF APP1 segment only for the JPEG, so a Go version change to the JPEG encoder cannot cause failures. A mismatch says to rerun with `-update`. `internal/media` tests also assert the known metadata values of the committed files. `mediatest` is a normal package, so M2 tests can import it; it must never import `internal/media`, because that would create an import cycle in media's tests.
 4. **`ReadExif` is kept but trimmed** to what SD2NAS uses: capture time, camera, `OffsetTimeOriginal` and GPS time. Lens, ISO, aperture, exposure, focal length and dimensions are not ported, because v1 has no consumer for them; they can be re-ported when one appears. This also drops CameraImport's `Rat(0)` calls, which panic on zero denominators.
 5. **`OffsetTimeOriginal` (tag 0x9011) is read by tag ID** from the Exif sub-IFD with goexif's `tiff.DecodeDir`, because goexif's field table predates EXIF 2.31 and silently drops the tag. GPS uses goexif's own `GPSDateStamp`/`GPSTimeStamp` fields. GPS is advisory, so a malformed GPS block yields a zero `GPSTime` instead of failing the read.
-6. **goexif's non-critical errors are tolerated.** When `exif.Decode` returns partial data with an error for which `exif.IsCriticalError` is false (a broken sub-IFD), the partial data is used. CameraImport discarded it. Critical errors are returned.
+6. **goexif's non-critical errors are tolerated.** When `exif.Decode` returns partial data with an error for which `exif.IsCriticalError` is false (a broken sub-IFD), the partial data is used. CameraImport discarded it. Critical errors are returned. The non-critical error is not dropped: it is kept in `ExifData.Warning` (with any `DateTime` parse failure), and `CaptureTime` carries it into `Capture.Fallback` when it falls back.
 7. **`GetCaptureDate` is folded into `CaptureTime`.** `FileModDate` keeps its name but returns `(time.Time, error)` instead of falling back to `time.Now()`.
-8. **`CaptureTime` returns a `Capture` struct** with the time, its `Source` (exif / mvhd / mtime), `Offset`, `GPS`, `Camera`, and `Fallback`: the reason a better source was tried and not used. It returns an error only when even the modified time can't be read. PNG and GIF go straight to the modified time with `Fallback == nil`, as CameraImport's `canCarryExif` did.
-9. **Time zones** (§13): EXIF wall-clock times are interpreted in `time.Local`, the container's `TZ`. `mvhd` times are seconds since 1904-01-01 UTC, exposed as UTC in `VideoMeta.CreationTime`, and converted to `time.Local` by `CaptureTime`. A value of 0, or one at or above 2^40, means absent. The GoPro "video time is local" setting is later work; M1 only exposes the raw inputs: UTC `CreationTime`, udta `©mak`/`©mod` (QuickTime text atoms) as `Make`/`Model`, and udta `FIRM` as `Firmware`. GoPro writes `FIRM`, not `©mak`.
+8. **`CaptureTime` returns a `Capture` struct** with the time, its `Source` (exif / mvhd / mtime), `Offset`, `GPS`, `Camera`, and `Fallback`: the reason a better source was tried and not used (including any EXIF warning). On the mtime fallback, `Time` is the file's modified time and `Source` is `SourceMtime`. It returns an error only when even the modified time can't be read. PNG and GIF go straight to the modified time with `Fallback == nil`, as CameraImport's `canCarryExif` did.
+9. **Time zones** (§13): EXIF wall-clock times are interpreted in `time.Local`, the container's `TZ`. `mvhd` times are seconds since 1904-01-01 UTC, exposed as UTC in `VideoMeta.CreationTime`, and converted to `time.Local` by `CaptureTime`. A value below 2082844800 (the seconds from 1904 to the Unix epoch, so it would give a pre-1970 time), which includes 0, or one at or above 2^40, means absent. The GoPro "video time is local" setting is later work; M1 only exposes the raw inputs: UTC `CreationTime`, udta `©mak`/`©mod` (QuickTime text atoms) as `Make`/`Model`, and udta `FIRM` as `Firmware`. GoPro writes `FIRM`, not `©mak`.
 10. **Video naming is preserved verbatim**, including the odd case of an unknown frame rate, which gives a double space (`" - 3840w -  - 12sec"`). `ReadVideoMeta` still fails when no video track has dimensions, as in CameraImport. One bug is fixed: the frame rate comes from the first video track only, using that track's own `mdhd` timescale. The per-trak reset does this.
 11. **`FolderDate`** uses `t`'s wall clock in its own location and returns a `"YYYY-MM-DD"` string. A time exactly at the cutoff belongs to the new day. `DefaultDayStartsAt = 4h`. Validating and parsing the `day_starts_at` setting is M2's job.
 12. **Hashes are lowercase hex strings** (`HashFile`, `QuickFingerprint`, `CopyHashed`). M2 converts them to the catalog's BLOBs.
@@ -71,7 +73,7 @@ internal/media/mediatest/
   exif.go           ExifSpec, TIFF, JPEG, ARW                              (Task 4)
   mp4.go            VideoSpec, MP4                                         (Task 6)
   fixtures.go       SonyExif, GoProVideo, fixture paths, Fixtures()        (Tasks 4, 6)
-  fixtures_test.go  TestFixtures (-update writes testdata/)                (Task 4)
+  fixtures_test.go  TestFixtures (-update writes testdata/; else compares) (Task 4)
 testdata/cards/SONY_A7IV/DCIM/100MSDCF/DSC00001.JPG, DSC00001.ARW          (Task 4)
 testdata/cards/GOPRO/DCIM/100GOPRO/GX010001.MP4                            (Task 6)
 ```
@@ -128,7 +130,7 @@ type VideoMeta struct {
 	Height       int
 	FrameRate    string    // fmt "%.3f", e.g. "29.970"; "" when unknown
 	Resolution   string    // fmt "%dw" of Width, e.g. "3840w"
-	CreationTime time.Time // mvhd creation time in UTC; zero when absent
+	CreationTime time.Time // mvhd creation time in UTC; zero when absent (values before the Unix epoch count as absent)
 	Make         string    // udta ©mak; "" when absent
 	Model        string    // udta ©mod; "" when absent
 	Firmware     string    // udta FIRM (GoPro); "" when absent
@@ -312,6 +314,8 @@ In `docs/PLAN.md` §5, replace the table row whose first cell is `internal/confi
 ```
 | `internal/config/config.go` | `internal/media/formats.go` | Same format lists and subfolder paths, as `media.Rules` / `DefaultRules()` (`internal/config` holds only process flags and env). Source and destination come from mounts, not settings. Add `cr3`. |
 ```
+
+Then, in `docs/PLAN.md` §16, in the M1 checklist, reword two bullets. The one that says "`internal/media` ported with CameraImport's tests passing" must say the applicable CameraImport tests are ported. The one that says "Fixtures in `testdata/` (real tiny JPEG, ARW, MP4)" must say the fixtures are synthesized by `internal/media/mediatest` and committed under `testdata/cards/...`. Keep the `- [ ]` checkboxes and leave the other bullet alone.
 
 Change nothing else in `docs/PLAN.md`.
 
@@ -583,12 +587,19 @@ func CopyHashed(src, dst string) (string, error) {
 	}
 	// The partial exists and is ours: remove it on any later failure.
 	if err := finishPartial(partial, dst, info.ModTime()); err != nil {
-		if rmErr := os.Remove(partial); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
-			err = errors.Join(err, rmErr)
-		}
-		return "", err
+		return "", removePartial(partial, err)
 	}
 	return sum, nil
+}
+
+// removePartial removes the partial file CopyHashed created, after err
+// occurred. A partial that is already gone (fs.ErrNotExist) is fine. Any
+// other removal failure is joined onto err, so neither error is lost.
+func removePartial(partial string, err error) error {
+	if rmErr := os.Remove(partial); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+		return errors.Join(err, rmErr)
+	}
+	return err
 }
 
 // copyToPartial creates partial with O_EXCL (a stale partial is an
@@ -608,10 +619,7 @@ func copyToPartial(r io.Reader, partial string) (string, error) {
 		err = cerr
 	}
 	if err != nil {
-		if rmErr := os.Remove(partial); rmErr != nil {
-			err = errors.Join(err, rmErr)
-		}
-		return "", err
+		return "", removePartial(partial, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -767,8 +775,11 @@ func TestARWIsLittleEndianTIFF(t *testing.T) {
 ```go
 var update = flag.Bool("update", false, "rewrite the committed fixtures under testdata/")
 
-// TestFixtures builds every fixture. With -update it writes them to the
-// repo's testdata/; without it, it checks that they are committed.
+// TestFixtures builds every fixture in memory. With -update it writes them to
+// the repo's testdata/. Without it, it compares each build with the committed
+// file: byte-exact when the generator involves no image/jpeg encoding, and,
+// for the JPEG, over the EXIF APP1 segment only, so a Go version change to
+// the JPEG encoder cannot cause failures.
 // Regenerate: go test ./internal/media/mediatest -run TestFixtures -update
 func TestFixtures(t *testing.T) {
 	for _, f := range Fixtures() {
@@ -786,12 +797,43 @@ func TestFixtures(t *testing.T) {
 			}
 			continue
 		}
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("fixture %s missing (go test ./internal/media/mediatest -run TestFixtures -update): %v", f.Path, err)
+		committed, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("fixture %s unreadable: %v (rerun with -update: go test ./internal/media/mediatest -run TestFixtures -update)", f.Path, err)
+			continue
+		}
+		want, got := committed, data
+		if strings.EqualFold(filepath.Ext(f.Path), ".jpg") {
+			// Compare only the metadata; the encoded pixels may differ across Go versions.
+			if want, err = exifSegment(committed); err != nil {
+				t.Errorf("fixture %s (committed): %v (rerun with -update)", f.Path, err)
+				continue
+			}
+			if got, err = exifSegment(data); err != nil {
+				t.Fatalf("%s (built): %v", f.Path, err)
+			}
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("fixture %s is stale or corrupt: committed bytes differ from the generator's (rerun with -update: go test ./internal/media/mediatest -run TestFixtures -update)", f.Path)
 		}
 	}
 }
+
+// exifSegment returns the APP1 segment (marker, length and payload) that
+// directly follows SOI in a JPEG built by JPEG().
+func exifSegment(b []byte) ([]byte, error) {
+	if len(b) < 6 || b[0] != 0xFF || b[1] != 0xD8 || b[2] != 0xFF || b[3] != 0xE1 {
+		return nil, errors.New("does not start with SOI + APP1")
+	}
+	end := 4 + int(binary.BigEndian.Uint16(b[4:6]))
+	if end > len(b) {
+		return nil, errors.New("APP1 segment is truncated")
+	}
+	return b[2:end], nil
+}
 ```
+
+`fixtures_test.go` imports `bytes`, `encoding/binary`, `errors`, `flag`, `os`, `path/filepath`, `strings` and `testing`. Any fixture whose generator uses no `image/jpeg` (the ARW here, the MP4 in Task 6) is compared byte for byte; only a path ending in `.jpg`/`.JPG` is compared over its APP1 segment.
 
 - [ ] **Step 2: Run the tests and confirm they fail**
 
@@ -813,6 +855,7 @@ import (
 	"encoding/binary"
 	"image"
 	"image/jpeg"
+	"sort"
 )
 
 type entry struct {
@@ -900,11 +943,7 @@ func ifdSize(es []entry) int {
 // writeIFD appends one IFD at the buffer's current offset followed by its
 // out-of-line values. Entries are sorted by tag, as TIFF requires.
 func writeIFD(buf *bytes.Buffer, order binary.ByteOrder, es []entry) {
-	for i := 1; i < len(es); i++ {
-		for j := i; j > 0 && es[j].tag < es[j-1].tag; j-- {
-			es[j], es[j-1] = es[j-1], es[j]
-		}
-	}
+	sort.Slice(es, func(i, j int) bool { return es[i].tag < es[j].tag })
 	dataOff := buf.Len() + 2 + 12*len(es) + 4
 	var data []byte
 	binary.Write(buf, order, uint16(len(es)))
@@ -1000,6 +1039,12 @@ type ExifData struct {
 	Camera     string    // "Make Model" when both are present
 	OffsetTime string    // OffsetTimeOriginal as written (e.g. "+02:00"); "" when absent
 	GPSTime    time.Time // GPSDateStamp + GPSTimeStamp in UTC; zero when absent or malformed
+	// Warning holds problems that did not stop the read but that a caller
+	// may want to report: goexif's non-critical decode error (a broken
+	// sub-IFD, partial data was used) and a DateTime[Original] string that is
+	// present but doesn't parse. nil when there were none. A merely absent
+	// DateTime is not a warning. Errors are joined with errors.Join.
+	Warning error
 }
 func ReadExif(path string) (*ExifData, error)
 func FileModDate(path string) (time.Time, error) // os.Stat(path).ModTime()
@@ -1038,6 +1083,9 @@ func checkSony(t *testing.T, d *ExifData, wantGPS time.Time) {
 	if !d.GPSTime.Equal(wantGPS) {
 		t.Errorf("GPSTime = %v, want %v", d.GPSTime, wantGPS)
 	}
+	if d.Warning != nil {
+		t.Errorf("Warning = %v, want nil", d.Warning)
+	}
 }
 ```
 
@@ -1045,9 +1093,10 @@ func checkSony(t *testing.T, d *ExifData, wantGPS time.Time) {
 - `TestReadExifSonyARWFixture`: the same for `mt.SonyARW`.
 - `TestReadExifBigEndianTIFF`: `writeBytes(t, dir, "x.TIF", mt.TIFF(binary.BigEndian, mt.SonyExif))` passes `checkSony(…, sonyGPS)`.
 - `TestReadExifWithoutOptionalTags`: `mt.JPEG(mt.ExifSpec{DateTimeOriginal: "2025:05:31 01:30:12"})` gives the right DateTime, `OffsetTime == ""`, `GPSTime.IsZero()` and `Camera == ""`.
-- `TestReadExifNoDateTime`: `mt.JPEG(mt.ExifSpec{Make: "SONY", Model: "ILCE-7M4"})` gives a nil error, `DateTime.IsZero()` and `Camera == "SONY ILCE-7M4"`.
+- `TestReadExifNoDateTime`: `mt.JPEG(mt.ExifSpec{Make: "SONY", Model: "ILCE-7M4"})` gives a nil error, `DateTime.IsZero()`, `Warning == nil` (an absent time is not a warning) and `Camera == "SONY ILCE-7M4"`.
 - `TestReadExifFractionalGPSSeconds`: a SonyExif copy with `GPSTime = {{23, 1}, {30, 1}, {1234, 100}}` gives GPSTime `Equal(time.Date(2025, 5, 30, 23, 30, 12, 340000000, time.UTC))`.
-- `TestReadExifBadGPSRational` (Review Focus 1): GPSTime `{{23, 1}, {30, 0}, {12, 1}}` and, separately, `{{0xFFFFFFFF, 1}, {30, 1}, {12, 1}}`. Each gives no panic, a nil error, `GPSTime.IsZero()`, and DateTime still `"2025-05-31 01.30.12"`.
+- `TestReadExifBadGPSRational` (Review Focus 1): GPSTime `{{23, 1}, {30, 0}, {12, 1}}` and, separately, `{{0xFFFFFFFF, 1}, {30, 1}, {12, 1}}` and `{{50, 1}, {30, 1}, {12, 1}}` (hour 50: bounded per unit, hour < 24, minute < 60, second < 61). Each gives no panic, a nil error, `GPSTime.IsZero()`, and DateTime still `"2025-05-31 01.30.12"`.
+- `TestReadExifBadDateTimeWarning`: `mt.JPEG(mt.ExifSpec{Make: "SONY", Model: "ILCE-7M4", DateTimeOriginal: "2025-05-31 01:30:12"})` (wrong separators) gives a nil error, `DateTime.IsZero()`, `Warning != nil`, and `Camera == "SONY ILCE-7M4"`. The test that reads `SonyExif` (`checkSony`) also asserts `d.Warning == nil`. (The non-critical goexif decode error is not synthesized; it is covered by the code path only.)
 - `TestReadExifBadGPSDate`: `GPSDate: "2025-05-30"` (wrong separators) gives `GPSTime.IsZero()` and a nil error.
 - `TestReadExifNotExif`: `writeSourceFile(t, dir, "a.jpg", "first")` gives a non-nil error. An empty file gives a non-nil error. A missing path gives a non-nil error.
 - `TestFileModDate`: `writeSourceFile` gives `Equal(fixedMtime)` and a nil error. A missing path gives an error that wraps `fs.ErrNotExist`.
@@ -1072,10 +1121,14 @@ func ReadExif(path string) (*ExifData, error) {
 	if err != nil && (x == nil || exif.IsCriticalError(err)) {
 		return nil, fmt.Errorf("exif %s: %w", path, err)
 	}
-	// A non-critical error means a sub-IFD failed; use what was decoded.
-	d := &ExifData{GPSTime: gpsTime(x)}
+	// A non-critical error means a sub-IFD failed; use what was decoded and
+	// keep the error in Warning.
+	d := &ExifData{GPSTime: gpsTime(x), Warning: err}
 	if dt, err := x.DateTime(); err == nil {
 		d.DateTime = dt
+	} else if !isTagNotPresent(err) {
+		// The tag is there but unusable (a malformed string): say so.
+		d.Warning = errors.Join(d.Warning, fmt.Errorf("DateTime: %w", err))
 	}
 	mk, okMake := strTag(x, exif.Make)
 	md, okModel := strTag(x, exif.Model)
@@ -1086,6 +1139,13 @@ func ReadExif(path string) (*ExifData, error) {
 		return nil, fmt.Errorf("exif %s: %w", path, err)
 	}
 	return d, nil
+}
+
+// isTagNotPresent reports whether err is goexif's "tag absent" error, which
+// is not a problem: many files carry no capture time.
+func isTagNotPresent(err error) bool {
+	var np exif.TagNotPresentError
+	return errors.As(err, &np)
 }
 
 func strTag(x *exif.Exif, name exif.FieldName) (string, bool) {
@@ -1150,9 +1210,16 @@ func gpsTime(x *exif.Exif) time.Time {
 		return time.Time{}
 	}
 	var d time.Duration
-	for i, unit := range []time.Duration{time.Hour, time.Minute, time.Second} {
+	// Each unit has its own bound on the whole part: hour < 24, minute < 60,
+	// second < 61 (a leap second).
+	units := []struct {
+		unit  time.Duration
+		limit int64
+	}{{time.Hour, 24}, {time.Minute, 60}, {time.Second, 61}}
+	for i, u := range units {
+		unit := u.unit
 		num, den, err := ts.Rat2(i)
-		if err != nil || den <= 0 || num < 0 || num/den > 60 {
+		if err != nil || den <= 0 || num < 0 || num/den >= u.limit {
 			return time.Time{}
 		}
 		d += time.Duration(num/den)*unit + time.Duration(math.Round(float64(num%den)*float64(unit)/float64(den)))
@@ -1195,7 +1262,7 @@ git commit -m "Read EXIF capture time, offset and GPS time" -m "Co-Authored-By: 
     	Height       int
     	FrameRate    string    // fmt "%.3f", e.g. "29.970"; "" when unknown
     	Resolution   string    // fmt "%dw" of Width, e.g. "3840w"
-    	CreationTime time.Time // mvhd creation time in UTC; zero when absent
+    	CreationTime time.Time // mvhd creation time in UTC; zero when absent (values before the Unix epoch count as absent)
     	Make         string    // udta ©mak; "" when absent
     	Model        string    // udta ©mod; "" when absent
     	Firmware     string    // udta FIRM (GoPro); "" when absent
@@ -1203,7 +1270,7 @@ git commit -m "Read EXIF capture time, offset and GPS time" -m "Co-Authored-By: 
     ```
 
   - Test helpers in `internal/media`: `writeBytes(t, dir, name string, data []byte) string`, `writeSourceFile(t, dir, name, content string) string`, and `fixture(t, rel string) string` (the path under the repo's `testdata/`).
-  - `internal/media/mediatest/fixtures.go` already has `type Fixture struct { Path string; Build func() ([]byte, error) }` and `func Fixtures() []Fixture` (returning the Sony JPEG and ARW). `TestFixtures` with `-update` writes every entry to `testdata/<Path>`.
+  - `internal/media/mediatest/fixtures.go` already has `type Fixture struct { Path string; Build func() ([]byte, error) }` and `func Fixtures() []Fixture` (returning the Sony JPEG and ARW). `TestFixtures` with `-update` writes every entry to `testdata/<Path>`. Without `-update` it regenerates every entry in memory and compares it with the committed file: byte-exact for anything that is not a `.jpg`, and over the EXIF APP1 segment only for the JPEG. The MP4 is not a JPEG and uses no `image/jpeg`, so adding it to `Fixtures()` is all it takes to join the byte-exact check. Do not change `TestFixtures`.
 - Produces:
 
 ```go
@@ -1272,11 +1339,12 @@ func TestMP4Structure(t *testing.T) {
 }
 ```
 
-`internal/media/video_test.go`, with `want := time.Date(2025, 5, 31, 8, 30, 12, 0, time.UTC)` and a helper `writeMP4(t, spec) string` that calls `mt.MP4` and `writeBytes`:
+`internal/media/video_test.go`, with `want := time.Date(2025, 5, 31, 8, 30, 12, 0, time.UTC)`. It defines, in `video_test.go`, the helper `func writeMP4(t *testing.T, s mt.VideoSpec) string`, which calls `mt.MP4(s)` and writes the bytes with `writeBytes` into `t.TempDir()` as `x.MP4`, returning the path (Task 7 reuses it, so keep this exact signature):
 - `TestReadVideoMetaGoProFixture`: `ReadVideoMeta(fixture(t, mt.GoProMP4))` gives Width 3840, Height 2160, Resolution `"3840w"`, FrameRate `"29.970"` (Review Focus 4: the audio trak comes first and must not set it), Duration `12.512`, `CreationTime.Equal(want)` with `CreationTime.Location() == time.UTC`, Firmware `"HD9.01.01.60.00"`, and Make and Model `""`.
 - `TestReadVideoMetaVersion1Boxes`: `GoProVideo` with `Version = 1` gives the same values.
 - `TestReadVideoMetaMakeModel`: `Make "Apple"`, `Model "iPhone 15"` read back as `Make == "Apple"`, `Model == "iPhone 15"`.
 - `TestReadVideoMetaNoCreationTime`: `CreationTime = 0` gives `CreationTime.IsZero()` and a nil error.
+- `TestReadVideoMetaPreUnixCreationTime`: `CreationTime = 1` (garbage that would be 1904-01-01) gives `CreationTime.IsZero()` and a nil error. `CreationTime = 2082844800` gives `CreationTime.Equal(time.Unix(0, 0))`.
 - `TestReadVideoMetaAudioOnly`: `Width = 0, Height = 0` gives an error whose text contains `"could not extract video dimensions"`.
 - `TestReadVideoMetaNotMP4`: `writeSourceFile(t, dir, "x.MP4", "first")` gives a non-nil error. A missing path gives a non-nil error.
 
@@ -1436,6 +1504,14 @@ var (
 
 // ReadVideoMeta reads duration, first-video-track size and frame rate, the
 // mvhd creation time, and udta make/model/firmware from an MP4/MOV.
+//
+// CreationTime is zero (absent) when mvhd's value is below 2082844800 (the
+// seconds from 1904-01-01 to the Unix epoch: it includes 0, which many
+// cameras write, and would otherwise give a pre-1970 time) or at or above 2^40.
+//
+// Make, Model and Firmware are advisory metadata: a malformed udta text atom
+// (shorter than its declared length) yields an empty string rather than an
+// error.
 func ReadVideoMeta(path string) (*VideoMeta, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -1535,8 +1611,9 @@ func ReadVideoMeta(path string) (*VideoMeta, error) {
 	if videoTimeScale > 0 {
 		meta.Duration = float64(videoDuration) / float64(videoTimeScale)
 	}
-	// 0 means "not set"; values at or above 2^40 s (about year 36,800) are garbage.
-	if creation != 0 && creation < 1<<40 {
+	// Below the Unix epoch (which includes 0, "not set") would name files
+	// from garbage; at or above 2^40 s (about year 36,800) is garbage too.
+	if creation >= mp4EpochOffset && creation < 1<<40 {
 		meta.CreationTime = time.Unix(int64(creation)-mp4EpochOffset, 0).UTC()
 	}
 	if meta.Width == 0 || meta.Height == 0 {
@@ -1562,7 +1639,7 @@ func quickTimeText(b []byte) string {
 - [ ] **Step 6: Generate the fixture and run the tests**
 
 Run: `go test ./internal/media/mediatest/ -run TestFixtures -update`, then `go mod tidy`, then `go test ./internal/media/... -v`
-Expected: PASS. `testdata/cards/GOPRO/DCIM/100GOPRO/GX010001.MP4` exists (about 565 bytes). The Sony fixtures are rewritten with identical metadata, so `git status` may show them as modified only if the local `image/jpeg` encoder changed. Commit whatever was regenerated. `gofmt -l internal` prints nothing; `go vet ./...` is clean.
+Expected: PASS. `testdata/cards/GOPRO/DCIM/100GOPRO/GX010001.MP4` exists (about 530 bytes). The Sony fixtures are rewritten with identical metadata, so `git status` may show them as modified only if the local `image/jpeg` encoder changed. Commit whatever was regenerated. Then run `go test ./internal/media/mediatest/ -run TestFixtures` once more without `-update`: it must pass, which confirms the committed MP4 matches the generator byte for byte. `gofmt -l internal` prints nothing; `go vet ./...` is clean.
 
 - [ ] **Step 7: Commit**
 
@@ -1585,9 +1662,9 @@ git commit -m "Read video metadata and mvhd creation time" -m "Co-Authored-By: C
   - `const DefaultDayStartsAt = 4 * time.Hour`; `func FolderDate(t time.Time, dayStartsAt time.Duration) string` (`"YYYY-MM-DD"`, with the cutoff applied).
   - `func DestFileName(t time.Time, kind Kind, meta *VideoMeta, ext string) string`: `"2006-01-02 15.04.05"+ext`, or for video with meta `"<time> - <Resolution> - <FrameRate> - <int Duration>sec<ext>"`.
   - `func FreeName(src, dir, name string) (dst string, duplicate bool, err error)`; `func CopyHashed(src, dst string) (string, error)` (lowercase hex SHA-256; never overwrites; dir must exist); `func HashFile(path string) (string, error)`; `func QuickFingerprint(path string) (string, error)`.
-  - `func ReadExif(path string) (*ExifData, error)` with `ExifData{DateTime time.Time (Local; zero if absent), Camera, OffsetTime string, GPSTime time.Time (UTC; zero if absent)}`; `func FileModDate(path string) (time.Time, error)`.
-  - `func ReadVideoMeta(path string) (*VideoMeta, error)` with `VideoMeta{Duration float64; Width, Height int; FrameRate, Resolution string; CreationTime time.Time (UTC; zero if absent); Make, Model, Firmware string}`.
-  - Test helpers: `fixedMtime` (`2026-01-02 15:04:05`, `time.Local`), `writeBytes`, `writeSourceFile` (both set mtime to `fixedMtime`), `fixture(t, rel) string`.
+  - `func ReadExif(path string) (*ExifData, error)` with `ExifData{DateTime time.Time (Local; zero if absent or unparsable), Camera, OffsetTime string, GPSTime time.Time (UTC; zero if absent), Warning error (goexif's non-critical decode error and/or a DateTime parse failure, joined; nil when none; an absent DateTime is not a warning)}`; `func FileModDate(path string) (time.Time, error)`.
+  - `func ReadVideoMeta(path string) (*VideoMeta, error)` with `VideoMeta{Duration float64; Width, Height int; FrameRate, Resolution string; CreationTime time.Time (UTC; zero if absent: mvhd values of 0 or below 2082844800, i.e. before the Unix epoch, and values at or above 2^40, all read as absent); Make, Model, Firmware string}`.
+  - Test helpers: `fixedMtime` (`2026-01-02 15:04:05`, `time.Local`), `writeBytes`, `writeSourceFile` (both set mtime to `fixedMtime`), `fixture(t, rel) string`, and `writeMP4(t *testing.T, s mt.VideoSpec) string` (defined in Task 6's `internal/media/video_test.go`, same package: it writes `mt.MP4(s)` to a temp file and returns the path). Do not redefine `writeMP4`; use it from `capture_test.go`.
   - `mediatest` (`mt`): `ExifSpec`, `JPEG(ExifSpec) ([]byte, error)`, `VideoSpec`, `MP4(VideoSpec) ([]byte, error)`, `SonyExif`, `GoProVideo`, and the paths `SonyJPEG`, `SonyARW`, `GoProMP4`. The Sony pair was shot at `2025:05:31 01:30:12` with offset `+02:00`, GPS `2025-05-30 23:30:12Z`, camera `SONY ILCE-7M4`. The GoPro video was created at `2025-05-31 08:30:12Z` (3840w, 29.970 fps, 12.512 s, no make/model).
 - Produces:
 
@@ -1612,7 +1689,7 @@ type Capture struct {
 	Offset   string     // EXIF OffsetTimeOriginal (e.g. "+02:00"); "" when unknown
 	GPS      time.Time  // EXIF GPS timestamp in UTC; zero when absent
 	Camera   string     // EXIF "Make Model", or video udta make/model; "" when unknown
-	Fallback error      // why a better source than mtime was tried and not used; nil otherwise
+	Fallback error      // why a better source than mtime was tried and not used (includes ExifData.Warning when EXIF was read); nil otherwise
 }
 
 // CaptureTime resolves a file's capture time: EXIF for images and RAW
@@ -1630,8 +1707,9 @@ func CaptureTime(path string, kind Kind) (Capture, error)
 - `TestCaptureTimeVideoMakeModel`: GoProVideo with `Make "Apple"`, `Model "iPhone 15"` gives Camera `"Apple iPhone 15"`.
 - `TestCaptureTimePNGUsesMtime`: `writeSourceFile(t, dir, "x.png", "not a png")` with KindImage gives Source `SourceMtime`, `Time.Equal(fixedMtime)`, and Fallback nil (png can't carry EXIF, so nothing was tried).
 - `TestCaptureTimeJPEGWithoutDate`: `writeBytes` of `mt.JPEG(mt.ExifSpec{Make: "SONY", Model: "ILCE-7M4"})` gives Source mtime, `Time.Equal(fixedMtime)`, `errors.Is(Fallback, ErrNoExifTime)`, and Camera `"SONY ILCE-7M4"`.
+- `TestCaptureTimeMalformedExifDateTimeWarning`: `writeBytes` of `mt.JPEG(mt.ExifSpec{Make: "SONY", Model: "ILCE-7M4", DateTimeOriginal: "2025-05-31 01:30:12"})` gives Source mtime, `Time.Equal(fixedMtime)`, `errors.Is(Fallback, ErrNoExifTime)` and `strings.Contains(Fallback.Error(), "DateTime")` (the warning is carried in the fallback reason, not dropped).
 - `TestCaptureTimeNotReallyJPEG`: `writeSourceFile(t, dir, "a.jpg", "first")` gives Source mtime and `Fallback != nil`.
-- `TestCaptureTimeVideoWithoutCreationTime` (Review Focus 5): GoProVideo with `CreationTime = 0` gives Source mtime, `Time.Equal(fixedMtime)`, and `errors.Is(Fallback, ErrNoMvhdTime)`.
+- `TestCaptureTimeVideoWithoutCreationTime` (Review Focus 5): `writeMP4(t, spec)` with GoProVideo and `CreationTime = 0` gives Source mtime, `Time.Equal(fixedMtime)`, and `errors.Is(Fallback, ErrNoMvhdTime)`. The same holds for `CreationTime = 1` (before the Unix epoch, so also "absent"). (`writeMP4` goes through `writeBytes`, so the file's mtime is `fixedMtime`.)
 - `TestCaptureTimeUnparsableVideo`: `writeSourceFile(t, dir, "x.MP4", "first")` with KindVideo gives Source mtime and `Fallback != nil`.
 - `TestCaptureTimeMissingFile`: a non-nil error.
 
@@ -1701,9 +1779,9 @@ func canCarryExif(path string, kind Kind) bool {
 ```
 
 `CaptureTime`:
-- For `KindVideo`, call `ReadVideoMeta`. An error gives `Fallback = fmt.Errorf("video metadata: %w", err)`. A zero `CreationTime` gives `Fallback = ErrNoMvhdTime`. Otherwise `Time = meta.CreationTime.In(time.Local)` and `Source = SourceMvhd`. Whenever the meta was read, set `Camera = strings.TrimSpace(meta.Make + " " + meta.Model)`.
-- If `canCarryExif`, call `ReadExif`. An error gives `Fallback = fmt.Errorf("exif: %w", err)`. A zero `DateTime` gives `Fallback = ErrNoExifTime`. Otherwise `Time = x.DateTime` and `Source = SourceExif`. Whenever EXIF was read, copy `Offset`, `GPS` and `Camera` from it, even if the time is missing.
-- If `Source` is still empty, call `FileModDate`. If that fails, return `Capture{}` and the error (joined with `Fallback` when non-nil). Otherwise `Source = SourceMtime`.
+- For `KindVideo`, call `ReadVideoMeta`. An error gives `Fallback = fmt.Errorf("video metadata: %w", err)`. A zero `CreationTime` (which is what `ReadVideoMeta` returns for an mvhd value of 0, one before the Unix epoch, or garbage) gives `Fallback = ErrNoMvhdTime`. Otherwise `Time = meta.CreationTime.In(time.Local)` and `Source = SourceMvhd`. Whenever the meta was read, set `Camera = strings.TrimSpace(meta.Make + " " + meta.Model)`.
+- If `canCarryExif`, call `ReadExif`. An error gives `Fallback = fmt.Errorf("exif: %w", err)`. A zero `DateTime` gives `Fallback = ErrNoExifTime`, joined with `x.Warning` when that is non-nil (`errors.Join(ErrNoExifTime, x.Warning)`, so `errors.Is` still matches and the text names the malformed field). Otherwise `Time = x.DateTime` and `Source = SourceExif`. Whenever EXIF was read, copy `Offset`, `GPS` and `Camera` from it, even if the time is missing. When the EXIF time is used, a non-nil `x.Warning` is not part of the result (`Fallback` stays nil, because nothing fell back).
+- If `Source` is still empty, call `FileModDate`. If that fails, return `Capture{}` and the error (joined with `Fallback` when non-nil). Otherwise `Time = mtime` (the file's modified time, as returned by `FileModDate`, in its own location) and `Source = SourceMtime`; `Fallback` keeps the reason a better source was not used, or nil for png/gif.
 
 - [ ] **Step 4: Run the whole package**
 
