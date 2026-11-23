@@ -64,6 +64,7 @@ func run(log *slog.Logger) error {
 		{Name: "photos", Path: cfg.Photos, NeedWrite: true},
 		{Name: "config", Path: cfg.Data, NeedWrite: true},
 	})
+	srv.SetLogger(log)
 	if err := srv.MountUI(web.Dist()); err != nil {
 		return err
 	}
@@ -114,6 +115,7 @@ func run(log *slog.Logger) error {
 			defer cancel()
 			err = errors.Join(err, wrap("stopping ingest", mgr.Close(closeCtx)))
 		}
+		srv.Close()
 		return err
 	case <-ctx.Done():
 	}
@@ -127,6 +129,9 @@ func run(log *slog.Logger) error {
 	if mgr != nil {
 		mgrErr = wrap("stopping ingest", mgr.Close(shutdownCtx))
 	}
+	// Ends /api/events streams and background work, which Shutdown would
+	// otherwise wait for until its deadline.
+	srv.Close()
 	return errors.Join(mgrErr, wrap("stopping http server", httpSrv.Shutdown(shutdownCtx)))
 }
 

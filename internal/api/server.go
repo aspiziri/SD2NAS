@@ -2,10 +2,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -33,6 +36,15 @@ type Server struct {
 	mux      *http.ServeMux
 	handler  http.Handler // mux behind the request guard
 	problems []string     // permanent /healthz problems added after startup
+
+	log       *slog.Logger // SetLogger; slog.Default() until then
+	hub       *Hub
+	keepalive time.Duration   // DefaultKeepalive; tests shorten it
+	bgCtx     context.Context // cancelled by Close; background goroutines stop on it
+	bgCancel  context.CancelFunc
+	bg        sync.WaitGroup // background goroutines (ingest feed, thumbnail warm-up)
+	closers   []func()       // run by Close once bg has stopped (e.g. the thumbnail cache)
+	closeOnce sync.Once
 }
 
 // New builds the server and probes writable mounts once. Probing on every
@@ -50,12 +62,36 @@ func New(version string, mounts []Mount) *Server {
 			s.writable[m.Name] = probeWrite(m.Path)
 		}
 	}
+	s.log = slog.Default()
+	s.hub = NewHub()
+	s.keepalive = DefaultKeepalive
+	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /api/events", s.handleEvents)
 	s.handler = guard(s.mux)
 	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
+
+// SetLogger sets the logger for errors the server can only log (event
+// snapshots, thumbnail failures). Call it before any Mount method.
+func (s *Server) SetLogger(l *slog.Logger) { s.log = l }
+
+// Close ends every /api/events stream, stops the server's background work
+// and runs the registered closers (the thumbnail cache). Call it before
+// http.Server.Shutdown, which would otherwise wait for the open streams.
+// Calling it again does nothing.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		s.bgCancel()
+		s.bg.Wait()
+		s.hub.Close()
+		for _, c := range s.closers {
+			c()
+		}
+	})
+}
 
 // AddProblem adds a permanent /healthz problem (for example, the catalog
 // failed to open). Call it before serving.
