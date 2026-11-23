@@ -22,8 +22,8 @@ type ExifData struct {
 	GPSTime    time.Time // GPSDateStamp + GPSTimeStamp in UTC; zero when absent or malformed
 	// Warning holds problems that did not stop the read but that a caller
 	// may want to report: goexif's non-critical decode error (a broken
-	// sub-IFD, partial data was used) and a DateTime[Original] string that is
-	// present but doesn't parse. nil when there were none. A merely absent
+	// sub-IFD, partial data was used), a DateTime[Original] string that is
+	// present but doesn't parse, and an OffsetTimeOriginal that can't be read. nil when there were none. A merely absent
 	// DateTime is not a warning. Errors are joined with errors.Join.
 	Warning error
 }
@@ -53,8 +53,11 @@ func ReadExif(path string) (*ExifData, error) {
 	if okMake && okModel {
 		d.Camera = mk + " " + md
 	}
+	// OffsetTimeOriginal is an advisory time-zone hint: a failure to read it
+	// is a warning, not a failed read.
 	if d.OffsetTime, err = offsetTimeOriginal(x); err != nil {
-		return nil, fmt.Errorf("exif %s: %w", path, err)
+		d.OffsetTime = ""
+		d.Warning = errors.Join(d.Warning, fmt.Errorf("OffsetTimeOriginal: %w", err))
 	}
 	return d, nil
 }

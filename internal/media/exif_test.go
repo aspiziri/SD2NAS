@@ -183,3 +183,40 @@ func TestFileModDate(t *testing.T) {
 		t.Errorf("missing: err = %v, want fs.ErrNotExist", err)
 	}
 }
+
+// corruptExifIFD returns a copy of a little-endian TIFF whose Exif sub-IFD
+// claims 0x7FFF entries, so decoding it runs past the end of the data. The
+// IFD is located through the ExifIFDPointer (0x8769) entry in IFD0.
+func corruptExifIFD(t *testing.T, tiff []byte) []byte {
+	t.Helper()
+	le := binary.LittleEndian
+	ifd0 := int(le.Uint32(tiff[4:]))
+	n := int(le.Uint16(tiff[ifd0:]))
+	for i := 0; i < n; i++ {
+		e := ifd0 + 2 + 12*i
+		if le.Uint16(tiff[e:]) == 0x8769 {
+			out := append([]byte(nil), tiff...)
+			le.PutUint16(out[le.Uint32(tiff[e+8:]):], 0x7FFF)
+			return out
+		}
+	}
+	t.Fatal("no ExifIFDPointer in IFD0")
+	return nil
+}
+
+func TestReadExifCorruptExifIFDIsWarning(t *testing.T) {
+	b := corruptExifIFD(t, mt.TIFF(binary.LittleEndian, mt.SonyExif))
+	d, err := ReadExif(writeBytes(t, t.TempDir(), "x.ARW", b))
+	if err != nil {
+		t.Fatalf("ReadExif: %v, want nil error", err)
+	}
+	if d.Warning == nil {
+		t.Error("Warning = nil, want the sub-IFD failure")
+	}
+	if d.Camera != "SONY ILCE-7M4" {
+		t.Errorf("Camera = %q", d.Camera)
+	}
+	if d.OffsetTime != "" {
+		t.Errorf("OffsetTime = %q, want empty", d.OffsetTime)
+	}
+}
