@@ -5,3 +5,6 @@
 *.go text eol=lf
 *.mod text eol=lf
 *.sum text eol=lf
+
+# Synthesized camera fixtures are byte-exact; never convert line endings.
+testdata/cards/** binary
