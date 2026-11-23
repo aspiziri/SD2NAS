@@ -23,18 +23,20 @@ const (
 	KeyDayStartsAt        = "day_starts_at"
 	KeyVerifyKnown        = "verify_known"
 	KeyFreeSpaceReserveGB = "free_space_reserve_gb"
+	KeyStagingWarnDays    = "staging_warn_days"
 )
 
 // Settings are the user-tunable options, with defaults for unset keys.
 type Settings struct {
-	DayStartsAt  time.Duration // folder-day cutoff, from "HH:MM"
-	VerifyKnown  VerifyMode
-	ReserveBytes uint64 // free-space reserve on the photos share
+	DayStartsAt     time.Duration // folder-day cutoff, from "HH:MM"
+	VerifyKnown     VerifyMode
+	ReserveBytes    uint64 // free-space reserve on the photos share
+	StagingWarnDays int    // days in staging before a folder is flagged; 0 = never
 }
 
 // DefaultSettings returns the values used when a key is unset.
 func DefaultSettings() Settings {
-	return Settings{DayStartsAt: 4 * time.Hour, VerifyKnown: VerifyQuick, ReserveBytes: 50_000_000_000}
+	return Settings{DayStartsAt: 4 * time.Hour, VerifyKnown: VerifyQuick, ReserveBytes: 50_000_000_000, StagingWarnDays: 30}
 }
 
 var dayStartRE = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9]$`)
@@ -67,6 +69,15 @@ func (s *Settings) apply(key, value string) error {
 		if err == nil {
 			s.ReserveBytes = n * 1_000_000_000
 		}
+	case KeyStagingWarnDays:
+		var n int
+		n, err = strconv.Atoi(value)
+		if err == nil && (n < 0 || n > 3650) {
+			err = fmt.Errorf("want 0 (off) to 3650 days")
+		}
+		if err == nil {
+			s.StagingWarnDays = n
+		}
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -98,7 +109,7 @@ func (d *DB) Settings(ctx context.Context) (Settings, error) {
 	if err := rows.Close(); err != nil {
 		return s, fmt.Errorf("read settings: %w", err)
 	}
-	for _, key := range []string{KeyDayStartsAt, KeyVerifyKnown, KeyFreeSpaceReserveGB} {
+	for _, key := range []string{KeyDayStartsAt, KeyVerifyKnown, KeyFreeSpaceReserveGB, KeyStagingWarnDays} {
 		if v, ok := kv[key]; ok {
 			if err := s.apply(key, v); err != nil {
 				return DefaultSettings(), err

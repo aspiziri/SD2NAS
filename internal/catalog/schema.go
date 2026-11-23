@@ -2,7 +2,7 @@ package catalog
 
 // migrations[i] upgrades a database from user_version i to i+1. Append only;
 // never edit a migration that has shipped.
-var migrations = []string{schemaV1}
+var migrations = []string{schemaV1, schemaV2}
 
 const schemaV1 = `
 CREATE TABLE ingests (
@@ -85,4 +85,11 @@ CREATE TABLE staging_folders (
 );
 
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+`
+
+// schemaV2 (M4): "Forget this import" marks the ingest instead of deleting
+// it, and forgetting finds an import's assets by first_ingest.
+const schemaV2 = `
+ALTER TABLE ingests ADD COLUMN forgotten_at TEXT;   -- set by "Forget this import"; NULL = never
+CREATE INDEX assets_first_ingest ON assets(first_ingest);
 `

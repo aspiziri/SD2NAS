@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,8 +19,8 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != SchemaVersion || SchemaVersion != 1 {
-		t.Fatalf("version = %d, want 1", v)
+	if v != SchemaVersion {
+		t.Fatalf("version = %d, want %d", v, SchemaVersion)
 	}
 	rows, err := d.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
 	if err != nil {
@@ -86,8 +87,8 @@ func TestOpenTwice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 1 {
-		t.Errorf("version = %d, want 1", v)
+	if v != SchemaVersion {
+		t.Errorf("version = %d, want %d", v, SchemaVersion)
 	}
 	var val string
 	if err := d.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = 'k'`).Scan(&val); err != nil {
@@ -104,7 +105,7 @@ func TestOpenRefusesNewerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.db.Exec("PRAGMA user_version = 2"); err != nil {
+	if _, err := d.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion+1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.Close(); err != nil {

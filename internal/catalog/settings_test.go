@@ -13,7 +13,7 @@ func TestSettingsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Settings{4 * time.Hour, VerifyQuick, 50_000_000_000}
+	want := Settings{DayStartsAt: 4 * time.Hour, VerifyKnown: VerifyQuick, ReserveBytes: 50_000_000_000, StagingWarnDays: 30}
 	if got != want || got != DefaultSettings() {
 		t.Errorf("Settings = %+v, want %+v", got, want)
 	}
@@ -93,5 +93,27 @@ func TestSettingsReportsBadStoredValue(t *testing.T) {
 	_, err := d.Settings(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "day_starts_at") {
 		t.Fatalf("error = %v, want one naming day_starts_at", err)
+	}
+}
+
+func TestStagingWarnDaysSetting(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	s, err := d.Settings(ctx)
+	if err != nil || s.StagingWarnDays != 30 {
+		t.Fatalf("default = %d, %v; want 30", s.StagingWarnDays, err)
+	}
+	for value, want := range map[string]int{"0": 0, "45": 45} {
+		if err := d.SetSetting(ctx, KeyStagingWarnDays, value); err != nil {
+			t.Fatalf("SetSetting %q: %v", value, err)
+		}
+		if s, err = d.Settings(ctx); err != nil || s.StagingWarnDays != want {
+			t.Errorf("after %q: %d, %v; want %d", value, s.StagingWarnDays, err, want)
+		}
+	}
+	for _, bad := range []string{"-1", "x", "3651"} {
+		if err := d.SetSetting(ctx, KeyStagingWarnDays, bad); err == nil {
+			t.Errorf("SetSetting %q: want error", bad)
+		}
 	}
 }

@@ -88,10 +88,11 @@ type Ingest struct {
 	// UnsupportedExts are the distinct extensions of the unsupported files,
 	// lowercase with the dot ("" for a file with no extension), sorted with
 	// "" last. nil when there are none.
-	UnsupportedExts []string `json:"unsupported_exts,omitempty"`
-	ClockWarnings   int      `json:"clock_warnings"`
-	SafeToFormat    bool     `json:"safe_to_format"`
-	Error           string   `json:"error,omitempty"`
+	UnsupportedExts []string  `json:"unsupported_exts,omitempty"`
+	ClockWarnings   int       `json:"clock_warnings"`
+	SafeToFormat    bool      `json:"safe_to_format"`
+	Error           string    `json:"error,omitempty"`
+	ForgottenAt     time.Time `json:"forgotten_at,omitzero"` // "Forget this import" ran then; zero = never
 }
 
 // IngestFile is what happened to one file on the card.
@@ -125,20 +126,21 @@ type ClockWarning struct {
 const interruptedMessage = "interrupted: SD2NAS stopped before this import finished"
 
 const ingestCols = "id, card_path, card_label, card_uuid, card_size, started_at, finished_at, status, " +
-	"seen, new, in_archive, in_staging, seen_before, failed, unsupported, unsupported_exts, clock_warnings, safe_to_format, error"
+	"seen, new, in_archive, in_staging, seen_before, failed, unsupported, unsupported_exts, clock_warnings, safe_to_format, error, forgotten_at"
 
 func scanIngest(s scanner) (Ingest, error) {
 	var (
-		in       Ingest
-		started  string
-		finished sql.NullString
-		status   string
-		exts     string
-		safe     int
+		in        Ingest
+		started   string
+		finished  sql.NullString
+		status    string
+		exts      string
+		safe      int
+		forgotten sql.NullString
 	)
 	err := s.Scan(&in.ID, &in.CardPath, &in.CardLabel, &in.CardUUID, &in.CardSize, &started, &finished, &status,
 		&in.Counts.Seen, &in.Counts.New, &in.Counts.InArchive, &in.Counts.InStaging, &in.Counts.SeenBefore,
-		&in.Counts.Failed, &in.Counts.Unsupported, &exts, &in.ClockWarnings, &safe, &in.Error)
+		&in.Counts.Failed, &in.Counts.Unsupported, &exts, &in.ClockWarnings, &safe, &in.Error, &forgotten)
 	if err != nil {
 		return Ingest{}, err
 	}
@@ -158,6 +160,11 @@ func scanIngest(s scanner) (Ingest, error) {
 	if finished.Valid {
 		if in.FinishedAt, err = parseTime(finished.String); err != nil {
 			return Ingest{}, fmt.Errorf("ingest %d: parse finished_at: %w", in.ID, err)
+		}
+	}
+	if forgotten.Valid {
+		if in.ForgottenAt, err = parseTime(forgotten.String); err != nil {
+			return Ingest{}, fmt.Errorf("ingest %d: parse forgotten_at: %w", in.ID, err)
 		}
 	}
 	return in, nil
@@ -242,6 +249,17 @@ func (d *DB) FinishIngest(ctx context.Context, in Ingest) error {
 		return fmt.Errorf("finish ingest %d: %w", in.ID, err)
 	}
 	return d.requireChanged(ctx, res, in.ID, "finish", "is already finished")
+}
+
+// MarkIngestForgotten records that ingest id was forgotten at at. The
+// ingest must have finished and not been forgotten already.
+func (d *DB) MarkIngestForgotten(ctx context.Context, id int64, at time.Time) error {
+	res, err := d.db.ExecContext(ctx, `UPDATE ingests SET forgotten_at = ?
+		WHERE id = ? AND forgotten_at IS NULL AND status NOT IN ('queued','running')`, formatTime(at), id)
+	if err != nil {
+		return fmt.Errorf("forget ingest %d: %w", id, err)
+	}
+	return d.requireChanged(ctx, res, id, "forget", "has not finished or was already forgotten")
 }
 
 // Ingest returns the ingest with the given id, or ErrNotFound.

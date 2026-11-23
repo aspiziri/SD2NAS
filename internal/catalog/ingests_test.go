@@ -2,8 +2,10 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -380,4 +382,103 @@ func TestIngestJSON(t *testing.T) {
 	if strings.Contains(s, `"finished_at"`) {
 		t.Errorf("%s has finished_at", s)
 	}
+}
+
+func TestMigrateV1ToV2(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sd2nas.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{schemaV1, "PRAGMA user_version = 1",
+		`INSERT INTO ingests (card_path, started_at, status) VALUES ('/cards/X', '2026-01-01T12:00:00.000Z', 'done')`} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := t.Context()
+	if v, err := d.Version(ctx); err != nil || v != 2 {
+		t.Fatalf("version = %d, %v; want 2", v, err)
+	}
+	in, err := d.Ingest(ctx, 1)
+	if err != nil || !in.ForgottenAt.IsZero() {
+		t.Fatalf("ingest = %+v, %v", in, err)
+	}
+	var found bool
+	rows, err := d.db.QueryContext(ctx, "SELECT name FROM pragma_index_list('assets')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		found = found || n == "assets_first_ingest"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Error("index assets_first_ingest missing")
+	}
+}
+
+func TestMarkIngestForgotten(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	in, err := d.CreateIngest(ctx, "/cards/A", "", "", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.MarkIngestForgotten(ctx, in.ID, t0); err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("queued ingest: err = %v, want a non-NotFound error", err)
+	}
+	if err := d.StartIngest(ctx, in.ID, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishIngest(ctx, Ingest{ID: in.ID, Status: StatusDone, FinishedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(mustIngest(t, d, in.ID))
+	if err != nil || strings.Contains(string(b), "forgotten_at") {
+		t.Errorf("never forgotten JSON = %s, %v", b, err)
+	}
+	if err := d.MarkIngestForgotten(ctx, in.ID, t0); err != nil {
+		t.Fatal(err)
+	}
+	got := mustIngest(t, d, in.ID)
+	if !got.ForgottenAt.Equal(t0) {
+		t.Errorf("ForgottenAt = %v, want %v", got.ForgottenAt, t0)
+	}
+	b, err = json.Marshal(got)
+	if err != nil || !strings.Contains(string(b), `"forgotten_at"`) {
+		t.Errorf("JSON = %s, %v", b, err)
+	}
+	if err := d.MarkIngestForgotten(ctx, in.ID, t0); err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("second call: err = %v, want a non-NotFound error", err)
+	}
+	if err := d.MarkIngestForgotten(ctx, 999, t0); !errors.Is(err, ErrNotFound) {
+		t.Errorf("id 999: err = %v, want ErrNotFound", err)
+	}
+}
+
+func mustIngest(t *testing.T, d *DB, id int64) Ingest {
+	t.Helper()
+	in, err := d.Ingest(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return in
 }
