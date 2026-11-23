@@ -7,6 +7,8 @@ export const live = $state({
   current: { running: null, queued: [] }, // the last ingest.current
   finished: null, // the last ingest.finished
   finishedCount: 0, // bumps on every ingest.finished; pages reload on it
+  staging: { version: 0, rescanning: false, last_rescan: null }, // the last staging.changed
+  promote: null, // the last promote.progress: { running, queued: [...], last }; null until it arrives
 });
 
 let source = null;
@@ -34,6 +36,12 @@ export function connectEvents() {
   source.addEventListener('ingest.finished', (e) => {
     live.finished = JSON.parse(e.data);
     live.finishedCount += 1;
+  });
+  source.addEventListener('staging.changed', (e) => {
+    live.staging = JSON.parse(e.data);
+  });
+  source.addEventListener('promote.progress', (e) => {
+    live.promote = JSON.parse(e.data);
   });
 }
 

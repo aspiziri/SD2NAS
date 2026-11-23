@@ -4,6 +4,7 @@
   import { match } from './lib/paths.js';
   import { connectEvents } from './lib/live.svelte.js';
   import { getHealth } from './lib/api.js';
+  import Toast from './components/Toast.svelte';
   import Nav from './components/Nav.svelte';
   import HealthBanner from './components/HealthBanner.svelte';
   import Ingest from './pages/Ingest.svelte';
@@ -74,6 +75,7 @@
     {/if}
   </main>
 </div>
+<Toast />
 
 <style>
   .app { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; min-height: 100dvh; padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left); }

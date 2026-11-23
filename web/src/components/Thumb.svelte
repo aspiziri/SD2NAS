@@ -9,7 +9,7 @@
   {#if failed}
     <span class="ph" aria-hidden="true">{icon}</span>
   {:else}
-    <img src="/api/thumbs/{sha}" alt="" loading="lazy" decoding="async" onerror={() => (failed = true)} />
+    <img src="/api/thumbs/{sha}" alt="" draggable="false" loading="lazy" decoding="async" onerror={() => (failed = true)} />
   {/if}
   {#if kind === 'video'}<span class="play" aria-hidden="true">▶</span>{/if}
   <span class="b">{badge}</span>
