@@ -301,6 +301,22 @@ func TestRecordNewIsAtomic(t *testing.T) {
 	if _, err := d.AssetBySHA(ctx, hexN(3)); !errors.Is(err, ErrNotFound) {
 		t.Errorf("asset written despite bad outcome: %v", err)
 	}
+
+	// Fails after insertAsset succeeded: the malformed fingerprint is rejected
+	// in step 2, so the asset written in step 1 must be rolled back.
+	c := a
+	c.SHA256 = hexN(4)
+	f.Outcome = OutcomeNew
+	if err := d.RecordNew(ctx, in.ID, c, "xyz", f); !errors.Is(err, ErrBadHash) {
+		t.Errorf("bad fingerprint: %v, want ErrBadHash", err)
+	}
+	if _, err := d.AssetBySHA(ctx, hexN(4)); !errors.Is(err, ErrNotFound) {
+		t.Errorf("asset not rolled back after fingerprint failure: %v", err)
+	}
+	files, err = d.IngestFiles(ctx, in.ID)
+	if err != nil || len(files) != 0 {
+		t.Errorf("files after rollback = %v, %v", files, err)
+	}
 }
 
 func TestClockWarningsRoundTrip(t *testing.T) {
