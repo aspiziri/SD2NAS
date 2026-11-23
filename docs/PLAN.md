@@ -105,8 +105,9 @@ editable over SMB, and must have `TZ` set (§13).
 - The disks never spin down on this NAS, so ingest doesn't wake anything.
 
 **"Safe to format"** is sent when every file on the card is either already
-known (archived, staged or culled) or was copied into staging and verified.
-Failed files turn it into a warning instead.
+known (archived, staged or culled), was copied into staging and verified, or is
+a camera sidecar on the ignore list (§7). Failed files, and any file SD2NAS
+neither imports nor ignores, turn it into a warning instead.
 
 **Capacity guards:**
 - Before copying, ingest adds up the size of the new files and refuses to start
@@ -280,9 +281,17 @@ skipped on future ingests. The ingest summary offers "Re-import anyway".
    Devices script, with an optional in-container poller as a fallback (§11). One
    ingest runs at a time; others queue. The same card path already running
    returns the running job.
-2. **Scan.** Walk the card, keeping files whose extension matches the import
-   rules. Ignore `DCIM/.Trashes`, `MISC/`, `.thumbnails`, and GoPro `.LRV`/`.THM`
-   (low-res proxies and thumbnails).
+2. **Scan.** Walk the card, skipping housekeeping folders (`MISC/`,
+   `.Trashes`, `.thumbnails`, Sony `THMBNL/` and `M4ROOT/SUB/`, `System Volume
+   Information`, `$RECYCLE.BIN`) and dot files. Each remaining regular file is
+   **imported** if its extension matches the import rules, **ignored** if its
+   extension is on the ignore list of camera sidecars and metadata (`xml bin
+   ctg thm lrv lrf dat ind bdm mpl cpi smi bnp int inp txt`, case-insensitive),
+   and otherwise **unsupported**. Unsupported files (an unknown format such as
+   `.360`, `.CRM`, `.MKV` or `.HIF`, or a file with no extension) are recorded,
+   named by extension in the summary ("3 files not imported (.360, .mkv)") and
+   block "safe to format", because formatting would lose them. Extending the
+   ignore list is the fix for a sidecar that turns out to be harmless.
 3. **Fingerprint and classify** each file against the catalog. Run 2–4 workers.
 4. **Space check.** Sum the sizes of the new files; refuse the ingest
    (`status = refused`) if the share would drop below the reserve (§3).
@@ -665,10 +674,11 @@ left for later.
 
 Implementation plan: `docs/plans/m2-catalog-ingest.md`. The schema in
 `internal/catalog/schema.go` is authoritative; it extends §6 with a `queued`
-ingest status, `ingests.card_path`/`unsupported`/`clock_warnings` columns, an
-`unsupported` file outcome and a `clock_warnings` table. A card is safe to
-format only when the import finished, nothing failed, no file was in a format
-SD2NAS doesn't import (e.g. `.HIF`), and at least one photo or video was found.
+ingest status, `ingests.card_path`/`unsupported`/`unsupported_exts`/`clock_warnings`
+columns, an `unsupported` file outcome and a `clock_warnings` table. A card is
+safe to format only when the import finished, nothing failed, every file was
+imported, already known or on the sidecar ignore list (§7; anything else, e.g.
+`.HIF` or `.MKV`, is unsupported), and at least one photo or video was found.
 Refused, failed and cancelled imports answer `?wait=1` with a non-2xx status, so
 the card stays mounted; M6's script should use `curl --fail-with-body` so the
 reason reaches the notification. **To measure RAW ingest:** insert a card holding
@@ -698,11 +708,14 @@ the staged copy instead of the card is the follow-up.
 - [ ] Nightly rescan, aliases, "changed since indexed" view
 - [ ] Nightly catalog backup to the array
 - [ ] Backfill run against the real archive
+- [ ] `missing` assets (catalogued copy vanished without a cull) stay known so they are not re-imported, but do not count toward safe to format: add a blocking count and message ('N files' archive copies are missing')
 
 ### M6: Unraid integration
 - [ ] `unassigned-devices.sh`: ingest, unmount, notify
 - [ ] Template finalized; install doc in README
 - [ ] End-to-end test on the NAS with a real card, twice (second run imports 0)
+- [ ] Recover from a panic in the ingest worker (fail the job, keep serving); `catalog.tx` must roll back in a defer first so a panic can't leak the single connection
+- [ ] Take an exclusive lock on `/config` at startup so a second instance can't fail the live job or delete its partials
 
 ### M7: Polish
 - [ ] Extra staging views (timeline, list)
