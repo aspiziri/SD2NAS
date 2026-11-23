@@ -391,7 +391,8 @@ func TestMigrateV1ToV2(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, q := range []string{schemaV1, "PRAGMA user_version = 1",
-		`INSERT INTO ingests (card_path, started_at, status) VALUES ('/cards/X', '2026-01-01T12:00:00.000Z', 'done')`} {
+		`INSERT INTO ingests (card_path, started_at, status) VALUES ('/cards/X', '2026-01-01T12:00:00.000Z', 'done')`,
+		`INSERT INTO staging_folders (id, name, dates, created_at) VALUES (7, '2025-05-30', '["2025-05-30"]', '2026-01-01T12:00:00.000Z')`} {
 		if _, err := raw.Exec(q); err != nil {
 			t.Fatal(err)
 		}
@@ -407,6 +408,14 @@ func TestMigrateV1ToV2(t *testing.T) {
 	ctx := t.Context()
 	if v, err := d.Version(ctx); err != nil || v != 2 {
 		t.Fatalf("version = %d, %v; want 2", v, err)
+	}
+	f, err := d.StagingFolderForDate(ctx, "2025-05-30", t0)
+	if err != nil || f.ID != 7 {
+		t.Fatalf("migrated folder = %+v, %v; want id 7 kept", f, err)
+	}
+	g, err := d.StagingFolderForDate(ctx, "2025-06-01", t0)
+	if err != nil || g.ID <= 7 {
+		t.Fatalf("new folder = %+v, %v; want an id above 7", g, err)
 	}
 	in, err := d.Ingest(ctx, 1)
 	if err != nil || !in.ForgottenAt.IsZero() {

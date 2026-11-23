@@ -452,10 +452,22 @@ const maxFolderAttempts = 5
 // since that operation may rename, merge away or promote the folder, it
 // looks the row up again once it has the lock.
 func (j *ingestRun) folderFor(date string) (catalog.StagingFolder, error) {
+	var taken int64 // the lock this call took last and still holds only for that folder
+	drop := func() {
+		if taken != 0 {
+			j.held[taken]()
+			delete(j.held, taken)
+			taken = 0
+		}
+	}
 	for range maxFolderAttempts {
 		f, err := j.cat().StagingFolderForDate(j.dbctx, date, j.now)
 		if err != nil {
+			drop()
 			return catalog.StagingFolder{}, err
+		}
+		if f.ID != taken {
+			drop() // the folder moved on while we waited: the old lock is stale
 		}
 		if _, ok := j.held[f.ID]; ok {
 			return f, nil
@@ -465,7 +477,9 @@ func (j *ingestRun) folderFor(date string) (catalog.StagingFolder, error) {
 			return catalog.StagingFolder{}, err
 		}
 		j.held[f.ID] = release
+		taken = f.ID
 	}
+	drop()
 	return catalog.StagingFolder{}, fmt.Errorf("the staging folder for %s kept changing while the import waited for it", date)
 }
 

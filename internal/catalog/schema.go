@@ -92,4 +92,16 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 const schemaV2 = `
 ALTER TABLE ingests ADD COLUMN forgotten_at TEXT;   -- set by "Forget this import"; NULL = never
 CREATE INDEX assets_first_ingest ON assets(first_ingest);
+
+-- Folder ids are never reused (a lock or a waiter may still hold a deleted
+-- folder's id): rebuild staging_folders with AUTOINCREMENT, keeping every id.
+CREATE TABLE staging_folders_new (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE,
+  dates      TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+INSERT INTO staging_folders_new (id, name, dates, created_at) SELECT id, name, dates, created_at FROM staging_folders;
+DROP TABLE staging_folders;
+ALTER TABLE staging_folders_new RENAME TO staging_folders;
 `

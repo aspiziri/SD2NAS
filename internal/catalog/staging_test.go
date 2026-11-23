@@ -210,3 +210,26 @@ func TestClockWarningsUnder(t *testing.T) {
 		t.Errorf("got %+v", got)
 	}
 }
+
+func TestStagingFolderIDsNeverReused(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	var top int64
+	for _, date := range []string{"2025-05-30", "2025-05-31", "2025-06-01"} {
+		f, err := d.StagingFolderForDate(ctx, date, t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		top = max(top, f.ID)
+	}
+	if err := d.DeleteStagingFolder(ctx, top); err != nil {
+		t.Fatal(err)
+	}
+	f, err := d.StagingFolderForDate(ctx, "2025-06-01", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.ID <= top {
+		t.Fatalf("new folder id %d, want above every earlier id (%d)", f.ID, top)
+	}
+}

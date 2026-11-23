@@ -3,7 +3,9 @@ package staging
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,7 +103,14 @@ func TestLockContextCancel(t *testing.T) {
 		_, err := l.Lock(ctx, HolderIngest, 7)
 		errc <- err
 	}()
-	time.Sleep(20 * time.Millisecond) // let it start waiting; cancelling first works too
+	deadline := time.Now().Add(10 * time.Second)
+	buf := make([]byte, 1<<20)
+	for !strings.Contains(string(buf[:runtime.Stack(buf, true)]), "(*Locks).Lock(") { // wait until it is waiting
+		if time.Now().After(deadline) {
+			t.Fatal("Lock never started waiting")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 	select {
 	case err := <-errc:

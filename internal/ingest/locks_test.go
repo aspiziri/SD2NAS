@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +97,25 @@ func TestRunHoldsFolderLocks(t *testing.T) {
 	unlock()
 }
 
+// waitBlockedInLock waits until some goroutine is inside Locks.Lock, so the
+// tests below know the import reached its wait (and will re-look the folder
+// up) before they change the folder.
+func waitBlockedInLock(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if strings.Contains(string(buf[:n]), "staging.(*Locks).Lock(") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the import never waited for the folder lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // blockedImport holds the 2025-05-30 folder, starts an import of the Sony
 // card and returns once it waits for the folder. copied is closed when a
 // copy starts.
@@ -133,10 +153,11 @@ func startBlocked(t *testing.T) *blockedImport {
 	b := &blockedImport{e: e, folder: f, unlock: unlock, copied: copied, cancel: cancel}
 	b.done = runAsync(ctx, e, queued(t, e, card), p)
 	waitPhase(t, p, PhaseCopying)
+	waitBlockedInLock(t)
 	select {
 	case <-copied:
 		t.Fatal("a copy started while the folder was locked")
-	case <-time.After(300 * time.Millisecond): // negative check: the import must still be waiting
+	default:
 	}
 	return b
 }
@@ -196,11 +217,6 @@ func TestRunFollowsFolderRenamedWhileWaiting(t *testing.T) {
 
 func TestRunFolderDeletedWhileWaiting(t *testing.T) {
 	b := startBlocked(t)
-	// SQLite reuses the highest rowid, so keep a later folder to make the
-	// recreated row's id differ from the deleted one.
-	if _, err := b.e.cat.StagingFolderForDate(t.Context(), "2025-06-01", testNow); err != nil {
-		t.Fatal(err)
-	}
 	if err := b.e.cat.DeleteStagingFolder(t.Context(), b.folder.ID); err != nil {
 		t.Fatal(err)
 	}
