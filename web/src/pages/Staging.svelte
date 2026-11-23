@@ -4,7 +4,7 @@
   import { live } from '../lib/live.svelte.js';
   import { navigate } from '../lib/router.svelte.js';
   import { formatBytes, formatCount, dateRange } from '../lib/format.js';
-  import { clickAction, toggleKey, selectRange, prune } from '../lib/selection.js';
+  import { clickAction, toggleKey, selectRange, prune, isTextEntry } from '../lib/selection.js';
   import { splitName, folderName, folderDate, earliestDate, checkTitle, promoteTarget, DEFAULT_PATTERN } from '../lib/naming.js';
   import { describeError, rescanSummary, plural, promoteStates } from '../lib/messages.js';
   import { longPressSelect } from '../lib/press.js';
@@ -140,7 +140,7 @@
   const press = { onlong: (key) => { if (!selected.has(key)) toggle(key); } };
 
   function onkeydown(e) {
-    if (dialog || e.target.closest?.('input, textarea, select')) return;
+    if (dialog || isTextEntry(e.target)) return;
     if (e.key === 'Escape' && selected.size) clear();
     else if ((e.ctrlKey || e.metaKey) && e.key === 'a' && folders.length) {
       e.preventDefault();

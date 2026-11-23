@@ -52,3 +52,15 @@ test('auto-scroll speeds up towards the edges', () => {
   assert.equal(autoScrollSpeed(-50, 800), -18);
   assert.equal(autoScrollSpeed(900, 800), 18);
 });
+
+test('isTextEntry spots text fields but not checkboxes or buttons', async () => {
+  const { isTextEntry } = await import('./selection.js');
+  assert.equal(isTextEntry({ tagName: 'INPUT', type: 'text' }), true);
+  assert.equal(isTextEntry({ tagName: 'INPUT' }), true);
+  assert.equal(isTextEntry({ tagName: 'TEXTAREA' }), true);
+  assert.equal(isTextEntry({ tagName: 'SELECT' }), true);
+  assert.equal(isTextEntry({ tagName: 'DIV', isContentEditable: true }), true);
+  assert.equal(isTextEntry({ tagName: 'INPUT', type: 'checkbox' }), false);
+  assert.equal(isTextEntry({ tagName: 'BUTTON' }), false);
+  assert.equal(isTextEntry(null), false);
+});

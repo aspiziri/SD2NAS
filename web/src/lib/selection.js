@@ -56,3 +56,15 @@ export function autoScrollSpeed(y, height, edge = 64, max = 18) {
   if (y > height - edge) return Math.min(max, Math.ceil(((y - (height - edge)) / edge) * max));
   return 0;
 }
+
+// isTextEntry: whether typing goes into this element, so page shortcuts
+// (Esc, Ctrl/⌘-A) must leave it alone. Checkboxes, buttons and other
+// non-text controls are not text entry.
+const NON_TEXT_INPUTS = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'image', 'file', 'range', 'color']);
+export function isTextEntry(el) {
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  const tag = el.tagName?.toLowerCase();
+  if (tag === 'textarea' || tag === 'select') return true;
+  return tag === 'input' && !NON_TEXT_INPUTS.has((el.type || 'text').toLowerCase());
+}
