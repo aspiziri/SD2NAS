@@ -22,21 +22,21 @@
     - `POST /api/staging/move` `{"fileShas": [hex…], "toId": int}` **or** `{"fileShas": […], "newTitle": string}` (exactly one of the two) → 200 `{"folder": Folder, "moved": int, "removed": [id…]}`.
     - `POST /api/staging/cull` `{"fileShas": [hex…]}` → 200 `{"culled": int, "removed": [id…]}`.
     - `DELETE /api/staging/{id}` → 200 `{"culled": int, "removed": bool, "kept": [path…]}`.
-    - `POST /api/staging/promote` `{"ids": [int…], "pattern": string}` (`""` = `{name}`) → 202 `{"job": PromoteJob}`. `GET /api/staging/promote` → 200 `{"job": PromoteJob|null}` (the running or last job).
+    - `POST /api/staging/promote` `{"ids": [int…], "pattern": string}` (`""` = `{name}`) always enqueues → 202 `{"job": PromoteJob}` whose `state` is `queued` or `running`; jobs run one after another in FIFO order. `GET /api/staging/promote` → 200 `{"running": PromoteJob|null, "queued": [PromoteJob…], "last": PromoteJob|null}` (`last` = the last finished job). `DELETE /api/staging/promote/{jobId}` cancels a queued job → 200 `{"job": PromoteJob}` (state `cancelled`, its locks released); 409 `promote_started` when it is running or finished; 404 for an unknown id. A running job can't be cancelled (shutdown still stops it between files).
     - `POST /api/staging/rescan` → 202 `{"started": bool}` (false: one was already running).
     - `GET /api/ingest/{id}/forget` → 200 ForgetSummary. `POST /api/ingest/{id}/forget` `{"deleteFiles": bool}` (required) → 200 `{"result": ForgetResult, "ingest": ingestView}`. `POST /api/ingest/{id}/reimport-culled` → 200 `{"forgotten": int, "started": ingestView|null, "message": string}`.
     - `fileShas` holds at most **20000** hashes (`staging.MaxFiles`); request bodies at most 4 MiB for move/cull, 64 KiB otherwise; unknown JSON fields → 400.
-    - Errors are JSON `{"error": msg, "code"?: string, "folder_id"?: int, "holder"?: string}` with `Cache-Control: no-store`. 409 codes: `folder_busy` (with `holder` = `ingest` | `operation` | `rescan` and `folder_id`), `name_taken`, `changed`, `promote_running`, `ingest_running`, `already_forgotten`. 400 for bad input (bad title, bad pattern, bad hashes, files not in staging), 404 for an unknown folder or ingest, 503 `shutting down`. The busy messages are exactly: `<name> is being imported into. Try again when the import finishes.` / `<name> is busy with another change. Try again in a moment.` / `<name> is being rescanned. Try again in a moment.`
+    - Errors are JSON `{"error": msg, "code"?: string, "folder_id"?: int, "holder"?: string}` with `Cache-Control: no-store`. 409 codes: `folder_busy` (with `holder` = `ingest` | `operation` | `rescan` | `promote`, plus `folder_id` when the busy key is a folder's rather than a directory name's), `name_taken`, `changed`, `promote_started`, `ingest_running`, `already_forgotten`. 400 for bad input (bad title, bad pattern, bad hashes, files not in staging), 404 for an unknown folder, ingest or promote job, 503 `SD2NAS is shutting down`. Error sentences are plain, never Go error chains: `name_taken` → `A folder with that name already exists in Staging. Pick another title.`; a 400 is the reason with the `staging: …:` prefix trimmed, a capital letter and a full stop; a 404 → `That folder no longer exists.` / `That import no longer exists.` / `That promote no longer exists.`; `promote_started` → `That promote has already started or finished, so it can't be cancelled.` The busy messages are exactly: `<name> is being imported into. Try again when the import finishes.` / `<name> is busy with another change. Try again in a moment.` / `<name> is being rescanned. Try again in a moment.` / `<name> is waiting to be promoted.` (a queued promote holds it) / `<name> is being promoted.` (the running promote holds it).
     - `GET /api/staging` adds `version`, `stale_after_days`, `stale` (count) to the listing; Folder adds `age_days` and `stale`; `GET /api/staging/{id}/files` adds `version`. The ingest view adds `forgotten_at` (omitted when never forgotten).
-  - Events on `/api/events` (both also sent as a snapshot on connect): `staging.changed` data `{"version": uint, "rescanning": bool, "last_rescan": RescanResult|null}`, published after every change (operation, rescan, finished ingest); `promote.progress` data = PromoteJob or `null`, published at most every **250 ms** plus at every folder and job state change.
-  - Locks: an import holds the lock of each staging folder it writes into **until the import ends**; staging operations take all their locks at once or fail immediately (`*staging.BusyError`, never wait); the import waits for a folder an operation holds and looks the folder up again once it has the lock; the rescan skips busy folders.
+  - Events on `/api/events` (both also sent as a snapshot on connect): `staging.changed` data `{"version": uint, "rescanning": bool, "last_rescan": RescanResult|null}`, published after every change (operation, rescan, finished ingest); `promote.progress` data = the `GET /api/staging/promote` body `{"running", "queued", "last"}`, published at most every **250 ms** plus at every enqueue, cancel, folder and job state change.
+  - Locks: keys are staging folder ids **and destination directory names** (`Staging/<name>` for rename, merge and move-to-new-folder; `Archive/<target>` for promote; compared case-insensitively). An import holds the lock of each staging folder it writes into **until the import ends**; staging operations take all their keys at once or fail immediately (`*staging.BusyError`, never wait); the import waits for a folder an operation or a queued promote holds and looks the folder up again once it has the lock; the rescan skips busy folders and takes a directory's name key before adopting it (skipping it when busy). A promote job's folders and names are locked from enqueue (holder `promote`), and each folder is released as soon as it is done.
   - Folder names: `YYYY-MM-DD - Title`; a title is trimmed and must not contain `/ \ < > : " | ? *` or control characters, start with `.`, end with `.` or a space, or exceed **200** bytes (`staging.MaxNameBytes`). Promote pattern tokens `{name}`, `{year}`, `{month}`; default `{name}`; the result lives under `Archive/`, and every path element obeys the same rules.
   - Junk files that never keep a folder alive (deleted when the folder is otherwise empty): `.DS_Store`, `Thumbs.db`, `desktop.ini` (case-insensitive), `._*`, `*.partial`.
   - Catalog: `SchemaVersion = 2`; migration 2 adds `ingests.forgotten_at TEXT` and `CREATE INDEX assets_first_ingest ON assets(first_ingest)`. Setting `staging_warn_days`, default **30**, `0` = off, at most 3650.
   - UI: long press **450 ms** with **10 px** slop; phone breakpoint `max-width: 760px`; tap targets ≥ 44 px; sticky elements use `top: env(safe-area-inset-top)`; the phone selection bar sits above the tab bar at `bottom: calc(var(--tabbar) + env(safe-area-inset-bottom))`.
 - **Responsive, not phone-only (owner requirement).** Every page and dialog must work well on a desktop (mouse, keyboard: click opens, Ctrl/⌘-click and the checkbox toggle, Shift-click selects a range, Esc clears, Ctrl/⌘-A selects all, multi-column grids) and on a phone (touch: tap opens, long-press starts selecting, then taps toggle; in the file grid a long-press followed by a drag selects every file the finger crosses; bottom selection bar; full-width dialogs). Reviewers check both at 375×812 and at desktop width.
 - Svelte 5 runes only (`$state`, `$derived`, `$effect`, `$props`), no `{@html}`, no `export let`. Plain CSS (tokens in `web/src/app.css`, component styles scoped). Logic worth testing (selection, naming, messages) lives in `web/src/lib/*.js` with `*.test.js` beside it. Follow M3's live-page pattern: one AbortController per load, keep the last good data on screen and show a refetch failure above it, refetch after a real reconnect.
-- **Filesystem first, then the catalog, after every step.** Never delete a file except to cull, discard or forget it (with `deleteFiles`), or after a verified copy. Never overwrite: every move goes through `media.FreeName` (CameraImport's collision loop). Mutating handlers run with `context.WithoutCancel(r.Context())`, so a phone going to sleep can't stop an operation half way.
+- **Filesystem first, then the catalog, after every step.** Never delete a file except to cull, discard or forget it (with `deleteFiles`), or after a verified copy. Never overwrite: every move goes through `media.FreeName` (CameraImport's collision loop); SD2NAS's own writers are kept out by the locks, and the remaining gap (an SMB client creating that exact name between the check and the rename) is accepted (Decision 3). Mutating handlers run with `context.WithoutCancel(r.Context())`, so a phone going to sleep can't stop an operation half way.
 - SQLite has **one connection**: never call a `catalog.DB` method while a `*sql.Rows` from it is open, and inside `d.tx(…)` use only `tx`. Catalog methods return slices, not iterators.
 - Tests pass on Windows and Linux. Use `path/filepath` for OS paths and `path` for slash-separated `rel_path` values. Close every file, `*sql.Rows`, `*catalog.DB` and `*staging.Service`. In tests, call `t.TempDir()` before registering a `Close` cleanup. Tests that wait use a 10 s deadline and fail clearly; sleeps only inside polling loops, or for the few negative checks this plan names (each ≤ 300 ms).
 - **Commands.** Windows (Git Bash, repo root): `gofmt -l .` (prints nothing), `go vet ./...`, `go test ./...`. Linux (Docker Desktop running):
@@ -49,28 +49,28 @@
 
 ## Review Focus
 
-1. **Locks and the running import.** An operation on a folder an import is filling must answer 409 with holder `ingest` for the whole import, an import must wait (not fail) for a folder an operation holds, and must write into the folder's *current* name after the wait (it may have been renamed, merged away or promoted). Every lock must be released on every path (errors, cancellation, panic-free early returns), and nothing may deadlock: only the import waits while holding locks; operations never wait; the rescan skips. Pinned in Task 3 (`TestTryLockAllOrNothing`, `TestLockWaitsForRelease`, `TestLocksConcurrent`, `TestRunHoldsFolderLocks`, `TestRunWaitsForBusyFolder`, `TestRunFollowsFolderRenamedWhileWaiting`, `TestRunCancelledWhileWaiting`), Task 5 (`TestRenameBusy`), Task 7 (`TestPromoteReleasesEachFolder`), Task 11 (`TestStagingRenameBusy409`).
+1. **Locks and the running import.** An operation on a folder an import is filling must answer 409 with holder `ingest` for the whole import, an import must wait (not fail) for a folder an operation holds, and must write into the folder's *current* name after the wait (it may have been renamed, merged away or promoted). Every lock must be released on every path (errors, cancellation, panic-free early returns), and nothing may deadlock: only the import waits while holding locks; operations never wait; the rescan skips. Pinned in Task 3 (`TestTryLockAllOrNothing`, `TestLockWaitsForRelease`, `TestLocksConcurrent`, `TestRunHoldsFolderLocks`, `TestRunWaitsForBusyFolder`, `TestRunFollowsFolderRenamedWhileWaiting`, `TestRunCancelledWhileWaiting`), Task 5 (`TestRenameBusy`), Task 7 (`TestPromoteReleasesEachFolder`, `TestPromoteEnqueueLocksAtOnce`), Task 8 (`TestRescanDoesNotAdoptDirectoryBeingRenamed`), Task 11 (`TestStagingRenameBusy409`).
 2. **Never lose or overwrite a file.** Moves use the collision loop; identical content already at the destination removes only the source; a cross-device move deletes the original only after re-hashing the copy and matching the catalog hash; files SD2NAS doesn't track (sidecars, notes, media not yet rescanned) are moved along by merge and promote and never deleted by discard or cull. Pinned in Task 4 (`TestMoveFileCollision`, `TestMoveFileIdentical`, `TestMoveFileCrossDevice`, `TestMoveFileCrossDeviceMismatch`, `TestRemoveEmptyTree`), Task 5 (`TestMergeMovesFilesAndRemovesSources`), Task 6 (`TestDiscardKeepsUntrackedFiles`), Task 7 (`TestPromoteMergesIntoExistingTarget`, `TestPromoteCrossDeviceVerifyFails`).
 3. **Catalog and disk agree after partial failures, crashes and SMB edits.** Each filesystem step is recorded right after it; a rescan adopts untracked folders and media, follows files moved by hand, culls files deleted by hand, restores culled content put back, drops rows whose folder is gone, and does nothing at all when `Staging/` is missing (an unmounted share must not cull everything). Pinned in Task 8 (`TestReconcile*`, especially `TestReconcileStagingMissing`, `TestReconcileFollowsMoveBetweenFolders`, `TestReconcileSkipsFileBeingWritten`).
 4. **Odd names.** Non-ASCII folder names (SQLite `substr`/`length` count characters, Go counts bytes), the prefix trap (`2025-05-30` vs `2025-05-30 - Trip`), SMB-illegal characters, a case-only rename on a case-insensitive disk, a title that would collide with another folder or an untracked directory. Pinned in Task 2 (`TestRenameStagingFolderRewritesPaths`), Task 4 (`TestCleanTitle`, `TestExpandPattern`), Task 5 (`TestRenameNameTaken`, `TestRenameNonASCII`), Task 13 (`naming.test.js`, which mirrors the Go rules).
-5. **Promote.** Instant rename into `Archive/<pattern>` when the target doesn't exist; file-by-file merge with the collision loop when it does (leaving Capture One's own files alone); EXDEV → copy, verify, delete; the staging row dropped and assets `archived` with new paths; tracked files missing on disk culled first; one job at a time; folders released as each finishes; shutdown stops the job between files and leaves sources intact. Pinned in Task 7 (`TestPromote*`).
-6. **Forget and re-import.** `archived` rows are never forgotten; refused while any import runs or waits (and imports wait while a forget runs); fingerprints, aliases and clock warnings of forgotten assets go too, so the same card imports them again; the ingest stays in the history marked forgotten. Pinned in Task 10 (`TestForgetAssets`, `TestManagerExclusive`, `TestForget*`) and Task 12 (`TestForgetAPIRetestsCard`, `TestReimportCulledAPI`).
+5. **Promote.** Instant rename into `Archive/<pattern>` when the target doesn't exist; file-by-file merge with the collision loop when it does (leaving Capture One's own files alone); EXDEV → copy, verify, delete; the staging row dropped and assets `archived` with new paths; tracked files missing on disk culled first; a FIFO queue whose jobs lock their folders and target names at enqueue (so a queued folder answers 409 holder `promote`), run one after another, release each folder as it finishes, and can be cancelled while queued (releasing their locks); shutdown stops the running job between files, leaves sources intact and drops the queue with a log line. Pinned in Task 7 (`TestPromote*`, especially `TestPromoteQueueFIFO`, `TestPromoteEnqueueLocksAtOnce`, `TestPromoteCancelQueued`, `TestPromoteStopsOnClose`, `TestPromoteCloseDropsQueue`) and Task 12 (`TestPromoteQueueAPI`).
+6. **Forget and re-import.** `archived` rows are never forgotten; refused while any import runs or waits (and imports wait while a forget runs); fingerprints, aliases and clock warnings of forgotten assets go too, so the same card imports them again; the ingest stays in the history marked forgotten. Forget deletes rows before files. Pinned in Task 10 (`TestForgetAssets`, `TestManagerExclusive`, `TestForget*`) and Task 12 (`TestForgetAPIRetestsCard`, `TestReimportCulledAPI`).
 7. **Events.** `staging.changed` carries a version the pages compare with the `version` in their data, so a missed event plus a reconnect never leaves stale data, and the number of events per operation is small (no subscriber is dropped by a 2,000-file promote). Pinned in Task 7 (`TestPromoteProgressThrottled`), Task 11 (`TestStagingChangedEvent`), Task 12 (`TestPromoteAPI`).
 8. **Selection on both input types.** Desktop: click opens, Ctrl/⌘-click and the checkbox toggle, Shift-click ranges, Esc clears. Phone: long-press starts selecting (no iOS callout or text selection), taps then toggle, a long-press-and-drag in the file grid selects a range without scrolling the page (auto-scroll near the edges), and the click a long press produces is swallowed. The selection bar never covers the last row or the tab bar. Pinned in Task 13 (`selection.test.js`) and the manual checklist in Task 16, Step 5.
 
 ## Decisions
 
-1. **An import holds its folder locks until it ends.** §8 says an operation on "a folder that a card ingest is currently filling" gets 409. Locking per file would make that a coin toss (the gap between two copies is short), so the import keeps each folder it has written into locked until it finishes. Operations never wait (409 at once, so a tap never hangs); the import waits for an operation's folder and then looks its row up again, because the operation may have renamed, merged or promoted it. The rescan skips busy folders and reports how many. Only the import waits while holding locks, so there is no deadlock cycle.
+1. **An import holds its folder locks until it ends.** §8 says an operation on "a folder that a card ingest is currently filling" gets 409. Locking per file would make that a coin toss (the gap between two copies is short), so the import keeps each folder it has written into locked until it finishes. Operations never wait (409 at once, so a tap never hangs); the import waits for an operation's folder and then looks its row up again, because the operation may have renamed, merged or promoted it. The rescan skips busy folders and reports how many. Only the import waits while holding locks, so there is no deadlock cycle. Operations that create a directory name (rename, merge, move to a new folder, promote) also lock that name, and the rescan locks a directory's name before adopting it, so it can't adopt a directory in the instant between an operation's `os.Rename` and its catalog write (pre-flight D2).
 2. **Locks live in `internal/staging`** (PLAN §4), and `internal/ingest` imports staging for them (`ingest.Config.Locks`, shared with `staging.Config.Locks` in `main`). Staging imports neither ingest nor the reverse cycle.
-3. **Merge and promote move every file, catalogued or not, keeping its path inside the folder** (`Capture/x.ARW` stays in `Capture/`), so CameraImport's layout (top-level JPGs, `Capture/`, `Videos/`) and any sidecar or note the owner added survive. Move files moves only the selected (catalogued) files, also keeping their sub-path. Promoting into an existing archive folder never touches files already there (Capture One's `Selects/`, `Output/`, `.cosessiondb`); a clash gets `-1`, `-2`, and identical content just drops the staging copy.
+3. **Merge and promote move every file, catalogued or not, keeping its path inside the folder** (`Capture/x.ARW` stays in `Capture/`), so CameraImport's layout (top-level JPGs, `Capture/`, `Videos/`) and any sidecar or note the owner added survive. Move files moves only the selected (catalogued) files, also keeping their sub-path. Promoting into an existing archive folder never touches files already there (Capture One's `Selects/`, `Output/`, `.cosessiondb`); a clash gets `-1`, `-2`, and identical content just drops the staging copy. A move is `os.Rename` after `media.FreeName`; a hard link plus unlink (which can't overwrite) was rejected because hard links aren't dependable on Unraid user shares (the shfs "support hard links" tunable) or over SMB, so an SMB client creating the exact chosen name in that instant is an accepted gap.
 4. **Discard and cull delete only catalogued files.** A folder still holding untracked files after a discard keeps its row and directory, and the answer lists what kept it ("rescan, then discard again"). OS junk (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `._*`) and stale `*.partial` never keep a folder alive.
 5. **Folder naming.** Rename asks only for the title and keeps the date prefix; a folder whose name has no date (adopted from SMB) takes its earliest covered date as the prefix, or no prefix if it has none. Merge names the result `<earliest date> - <title>`; if one source already has that name it is the target (so its id survives), else the source with the earliest date. Move to "New folder…" requires a title and uses the earliest source folder's date (what the mockup previews). A name already used by another folder row or by a directory in `Staging/` is a 409 `name_taken`, never an automatic merge. Titles may not contain characters Windows can't use over SMB.
 6. **Dates and age.** Merge unions the sources' dates; move adds to the destination the folder dates of the moved files (capture time with today's day cutoff, else the source folder's date). Merged and new folders take the oldest `created_at` of their sources, so "in staging for N days" stays honest. Age is counted from `created_at`; a folder adopted by the rescan starts counting at adoption.
 7. **Files deleted over SMB become `culled`** (the owner deleted them on purpose, so they shouldn't come back from the card; "Re-import anyway" can still bring them back). M5 owns `missing` for vanished archive files.
 8. **Reconcile runs at startup and from a "Rescan staging" button** (`POST /api/staging/rescan`), not on a timer: SMB edits are occasional and the owner knows when he made one. It hashes new files while checking their size and modified time don't change during the read (a file still being copied over SMB is skipped and picked up next time), ignores non-media files and `*.partial`, never follows content into another folder that is busy, and leaves copies of content that is already tracked elsewhere alone (counted as duplicates). Content edited in place in Staging is not detected (M5 handles that for the archive).
-9. **Promote is one job at a time** (409 `promote_running` for a second); the UI disables Promote while one runs. All its folders are locked when it starts (so busy folders fail the request at once) and each is released as soon as it is done. Tracked files missing on disk are culled first, so the archive index never claims a file it doesn't have. If the catalog write after a successful folder rename fails, the files are in the archive but the rows aren't; a rescan would then cull them, which still keeps them from being re-imported, and M5's indexer must turn a culled hash it finds in `Archive/` into `archived` (follow-up recorded in Task 18). The pattern is sent with each request; the UI remembers the last one per device in `localStorage` (no server setting until a settings page exists).
-10. **Forget an import** deletes the `staged` and `culled` assets linked to that import — those it brought in (`first_ingest`) and those any of its file rows names (so forgetting the second import of a card works too) — with their fingerprints, aliases and clock warnings, in one transaction, after deleting their files when `deleteFiles` is set. `archived` (and `missing`) rows are never deleted. The ingest row and its `ingest_files` stay, with `forgotten_at` set. It is refused while any import runs or waits, and `ingest.Manager.Exclusive` keeps a newly submitted import queued until the forget is done. Without `deleteFiles` the files stay in `Staging/` untracked: the next import of that card or the next rescan picks them up again. The UI's "also delete" checkbox starts unticked.
-11. **"Re-import anyway"** (`POST /api/ingest/{id}/reimport-culled`): the card may be long gone, so it forgets that the import's "seen before" files whose asset is still `culled` were culled (the same deletion as forget, for those rows only), then, if the card's folder is still mounted, starts an import of it at once; otherwise the next time the card goes in brings them back. It never touches files.
+9. **Promotes queue** (owner: "I'd like to queue them"). `POST /api/staging/promote` always enqueues; jobs run one after another (FIFO), and the Promote button stays enabled. A job's folders and its `Archive/<target>` name keys are locked at enqueue with holder `promote`, so a waiting folder can't be renamed, merged, moved, discarded or queued twice (409 "is waiting to be promoted."), and busy folders or a bad pattern fail the enqueue at once. The target path is expanded at enqueue (a locked folder's name can't change, so it is the path the job will use); whether that archive folder exists — one rename, or a file-by-file merge with the collision loop — is decided when the folder's turn comes, so an archive folder created meanwhile goes through the merge path. Each folder is released as soon as it is done. A queued job can be cancelled, releasing its locks; a running one can't, from the UI. On shutdown the running job stops between files and the queue is dropped (its folders stay in Staging untouched) with a log line. **An import that wants a folder a queued job holds waits**, as for any operation's lock: within the share a promote is a rename that takes moments, the folder is gone once promoted (the import then makes a new folder for that date), and refusing to queue folders an import might target would mean predicting capture dates. A long wait only happens behind cross-filesystem copies, and the import never fails because of it. Tracked files missing on disk are culled first, so the archive index never claims a file it doesn't have. If the catalog write after a successful folder rename fails, the files are in the archive but the rows aren't; a rescan would then cull them, which still keeps them from being re-imported, and M5's indexer must turn a culled hash it finds in `Archive/` into `archived` (follow-up recorded in Task 18). The pattern is sent with each request; the UI remembers the last one per device in `localStorage` (no server setting until a settings page exists).
+10. **Forget an import** deletes the `staged` and `culled` assets linked to that import — those it brought in (`first_ingest`) and those any of its file rows names (so forgetting the second import of a card works too) — with their fingerprints, aliases and clock warnings, in one transaction; then, when `deleteFiles` is set, their files in `Staging/` are deleted (rows first, so a delete that fails half way leaves only untracked files, never staged rows a rescan would cull: pre-flight D6). `archived` (and `missing`) rows are never deleted. The ingest row and its `ingest_files` stay, with `forgotten_at` set. It is refused while any import runs or waits, and `ingest.Manager.Exclusive` keeps a newly submitted import queued until the forget is done. Without `deleteFiles` the files stay in `Staging/` untracked: the next import of that card or the next rescan picks them up again. The UI's "also delete" checkbox starts unticked.
+11. **"Re-import anyway"** (`POST /api/ingest/{id}/reimport-culled`): the card may be long gone, so it forgets that the import's "seen before" files whose asset is still `culled` were culled (the same deletion as forget, for those rows only and only while they are still `culled`, so an asset a rescan restaged meanwhile is kept: pre-flight D7), then, if the card's folder is still mounted, starts an import of it at once; otherwise the next time the card goes in brings them back. It never touches files.
 12. **Thumbnails** are keyed by hash, so moves, merges and promotes keep them. Cull, discard, forget and rescan-culled files have their cached thumbnail and preview deleted (`thumbs.Cache.Remove`, called through `staging.Config.Removed`), so `/config` doesn't grow with culled shots. A render racing the delete can leave one file behind; that is accepted.
 13. **Staging age warnings**: setting `staging_warn_days` (default 30, 0 = off; no settings UI yet). A stale folder shows "In staging for N days" and a pill; the page shows a banner counting them. The daily notification §3 mentions needs the M6 card-script channel and is left for M6.
 14. **Events.** `staging.changed` carries a monotonically increasing `version`; `GET /api/staging` and `…/files` return the version their data reflects, so a page refetches exactly when the event's version differs (and a snapshot on reconnect that matches costs nothing). It is published after each operation, after a rescan that changed something, and when an import finishes (finished hook). `promote.progress` is throttled to 4 per second plus state changes, well under the hub's 16-frame buffer.
@@ -92,14 +92,14 @@ internal/catalog/
                       RestageAsset                                                    (Task 2)
   forget.go           IngestAssets, ForgetAssets, CulledSeenBefore                    (Task 10)
 internal/staging/
-  locks.go            Locks, Holder*, BusyError, ErrBusy                              (Task 3)
+  locks.go            Locks (folder ids + directory names), Holder*, BusyError, ErrBusy (Task 3)
   staging.go          Config, NewService, Status, RescanResult, OnChange, Touch, Close,
                       List/Files gain version and age                            (Tasks 4, 9)
   names.go            CleanTitle, FolderName, ExpandPattern, MaxNameBytes, errors     (Task 4)
   fsops.go            moveFile, copyVerify, removeEmptyTree, folderFiles, hashFile    (Task 4)
   xdev_windows.go, xdev_other.go   crossDevice                                        (Task 4)
   ops.go              Rename, Merge (Task 5); Move, Cull, Discard (Task 6)
-  promote.go          Promote, PromoteJob, OnPromote                                  (Task 7)
+  promote.go          Promote (enqueue), CancelPromote, Promotes, PromoteJob, PromoteQueue, OnPromote (Task 7)
   reconcile.go        Reconcile, StartRescan                                          (Task 8)
   forget.go           ForgetSummary, Forget, ForgetCulled                             (Task 10)
 internal/ingest/
@@ -238,7 +238,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Suggested implementer: sonnet.
 
 **Files:**
-- Modify: `internal/catalog/schema.go`, `internal/catalog/catalog.go`, `internal/catalog/ingests.go`, `internal/catalog/settings.go`, `internal/catalog/settings_test.go`
+- Modify: `internal/catalog/schema.go`, `internal/catalog/catalog.go`, `internal/catalog/ingests.go`, `internal/catalog/settings.go`, `internal/catalog/settings_test.go`, `internal/catalog/catalog_test.go`
 - Create: `internal/catalog/stagingops.go`, `internal/catalog/stagingops_test.go`
 
 **Interfaces:**
@@ -294,6 +294,7 @@ func pathState(t *testing.T, d *DB, sha string) (string, AssetState) {
 Tests:
 - `TestMigrateV1ToV2`: write a version-1 database by hand — `sql.Open("sqlite", path)`, `Exec(schemaV1)`, `Exec("PRAGMA user_version = 1")`, `INSERT INTO ingests (card_path, started_at, status) VALUES ('/cards/X', '2026-01-01T12:00:00.000Z', 'done')`, close. `Open(path)` → `Version` is 2; `Ingest(ctx, 1)` has a zero `ForgottenAt`; `SELECT name FROM pragma_index_list('assets')` includes `assets_first_ingest`.
 - `TestMarkIngestForgotten`: `CreateIngest` + `StartIngest` + `FinishIngest` (status done) → `MarkIngestForgotten(id, t0)` → `Ingest(id).ForgottenAt.Equal(t0)` and its JSON contains `"forgotten_at"`; a second call errors (not `ErrNotFound`); a queued ingest errors; id 999 → `ErrNotFound`. An ingest never forgotten marshals without `forgotten_at`.
+- Fix the existing tests the bump breaks (pre-flight S2, S3): in `catalog_test.go`, compare against `SchemaVersion` instead of `1` (lines 21 and 88 today: `v != SchemaVersion`, and drop the `SchemaVersion != 1` clause), and in `TestOpenRefusesNewerSchema` write `PRAGMA user_version = ` `SchemaVersion+1` (via `fmt.Sprintf`) instead of `2`. In `settings_test.go`, turn the positional literal `Settings{4 * time.Hour, VerifyQuick, 50_000_000_000}` into a keyed one that includes `StagingWarnDays: 30`.
 - `TestStagingWarnDaysSetting` (in `settings_test.go`): default 30; `SetSetting(KeyStagingWarnDays, "0")` → 0; `"45"` → 45; `"-1"`, `"x"`, `"3651"` → error.
 - `TestCreateStagingFolder`: `CreateStagingFolder(ctx, "2025-05-30 - Trip", []string{"2025-05-31", "2025-05-30", "2025-05-31"}, t0)` → `Dates` `["2025-05-30","2025-05-31"]`, `CreatedAt` equal to t0; the same name again → `errors.Is(err, ErrNameTaken)`; a bad date `"2025-5-30"` → error; nil dates → `[]string{}`.
 - `TestRenameStagingFolderRewritesPaths` (Review Focus 4): rows `2025-05-30` and `2025-05-30 - Trip` (`insertFolder`); staged `Staging/2025-05-30/a.JPG` and `Staging/2025-05-30/Capture/a.ARW`, the trap `Staging/2025-05-30 - Trip/b.JPG`, and a culled asset without a path. `RenameStagingFolder(ctx, id, "2025-05-30 - Zürich", "Staging/2025-05-30/", "Staging/2025-05-30 - Zürich/", t0)` → `Staging/2025-05-30 - Zürich/a.JPG` and `…/Capture/a.ARW`; the trap is unchanged; the row is renamed. Rename again to `2025-05-30 - Zug` with old prefix `Staging/2025-05-30 - Zürich/` (a two-byte character in the old prefix: `length()` must count characters) → `Staging/2025-05-30 - Zug/Capture/a.ARW`. Renaming to `2025-05-30 - Trip` → `ErrNameTaken` and nothing changed. Renaming to its own name is a no-op. Unknown id → `ErrNotFound`. A prefix without its trailing `/` → error.
@@ -705,16 +706,19 @@ Suggested implementer: sonnet (reviewer: opus — concurrency).
 type Holder string
 const (
 	HolderIngest    Holder = "ingest"    // a card import writing into the folder
-	HolderOperation Holder = "operation" // rename, merge, move, cull, discard, promote, forget
+	HolderOperation Holder = "operation" // rename, merge, move, cull, discard, forget
 	HolderRescan    Holder = "rescan"    // the reconcile pass
+	HolderPromote   Holder = "promote"   // a queued or running promote job
 )
 var ErrBusy = errors.New("staging: folder is busy")
-type BusyError struct{ ID int64; Name string; Holder Holder } // errors.Is(err, ErrBusy); Name may be ""
+type BusyError struct{ ID int64; Name string; Holder Holder; Queued bool } // errors.Is(err, ErrBusy); ID 0 for a directory name
+type LockSet struct{ IDs []int64; Names []string } // folder ids + directory names (slash paths below the photos root, case-insensitive)
 type Locks struct{ /* unexported */ }
 func NewLocks() *Locks
-func (l *Locks) TryLock(h Holder, ids ...int64) (release func(), err error)        // all or none, never waits
-func (l *Locks) TryLockEach(h Holder, ids ...int64) (releases []func(), err error) // same; one release per (distinct) id, in order
-func (l *Locks) Lock(ctx context.Context, h Holder, id int64) (release func(), err error) // waits until free or ctx ends
+func (l *Locks) TryLock(h Holder, ids ...int64) (release func(), err error)              // folders, all or none, never waits
+func (l *Locks) TryLockSet(h Holder, set LockSet) (release func(), err error)           // folders and names, all or none
+func (l *Locks) TryLockGroups(h Holder, groups []LockSet) (releases []func(), err error) // all or none; one release per group
+func (l *Locks) Lock(ctx context.Context, h Holder, id int64) (release func(), err error) // a folder; waits until free or ctx ends
 
 // package ingest — Config gains:
 Locks *staging.Locks // folder locks shared with staging operations; nil: a private set
@@ -725,8 +729,9 @@ Locks *staging.Locks // folder locks shared with staging operations; nil: a priv
 - `TestReleaseIdempotent`: a release called twice is harmless; after the first call another holder takes the id, and the first holder's second call does not free it.
 - `TestLockWaitsForRelease`: A holds 7; a goroutine calls `Lock(ctx, HolderIngest, 7)` and signals on return; it must not return within 100 ms (named negative check) and must return within 10 s of A's release.
 - `TestLockContextCancel`: `Lock` on a held id with a context cancelled while waiting returns `context.Canceled` and holds nothing.
-- `TestTryLockEach`: `TryLockEach(h, 1, 2)` returns two releases; calling the first frees 1 only.
-- `TestLocksConcurrent`: 40 goroutines × 200 iterations pick an id in 1..5 and either `TryLock` or `Lock` (with a 5 ms timeout); while holding, an atomic per-id counter must never exceed 1. Run under `-race` (Step 6).
+- `TestTryLockNames`: `TryLockSet(HolderOperation, LockSet{Names: ["Staging/2025-05-30 - Trip"]})` held → `TryLockSet(HolderRescan, LockSet{Names: ["staging/2025-05-30 - TRIP"]})` fails with `*BusyError{ID: 0, Name: "staging/2025-05-30 - TRIP", Holder: HolderOperation}` (names compare without case); a different name and folder ids are unaffected; a set mixing a free id and a busy name takes nothing.
+- `TestTryLockGroups`: `TryLockGroups(HolderPromote, [{IDs:[1], Names:["Archive/A"]}, {IDs:[2], Names:["Archive/A"]}])` returns two releases; the shared name belongs to the first group, so releasing the first frees 1 and `Archive/A`, not 2; with 2 already held the call takes nothing.
+- `TestLocksConcurrent`: 40 goroutines × 200 iterations pick an id in 1..5 and either `TryLock`, `TryLockSet` with that id plus the name `n<id>`, or `Lock` (with a 5 ms timeout); while holding, an atomic per-id counter must never exceed 1. Run under `-race` (Step 6).
 
 - [ ] **Step 2: Run them and confirm they fail**: `go test ./internal/staging/ -run Lock` → build failure.
 
@@ -740,26 +745,30 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 )
 
-// Holder says who holds a folder lock; the API turns it into the 409 message.
+// Holder says who holds a lock; the API turns it into the 409 message.
 type Holder string
 
 const (
 	HolderIngest    Holder = "ingest"    // a card import writing into the folder
-	HolderOperation Holder = "operation" // rename, merge, move, cull, discard, promote, forget
+	HolderOperation Holder = "operation" // rename, merge, move, cull, discard, forget
 	HolderRescan    Holder = "rescan"    // the reconcile pass
+	HolderPromote   Holder = "promote"   // a queued or running promote job
 )
 
 // ErrBusy is what every *BusyError matches with errors.Is.
 var ErrBusy = errors.New("staging: folder is busy")
 
-// BusyError reports a staging folder whose lock someone else holds.
+// BusyError reports a folder (or a directory name) whose lock someone else
+// holds.
 type BusyError struct {
-	ID     int64
-	Name   string // filled in by the operation when it knows the folder; may be ""
+	ID     int64  // the busy folder's id; 0 when the busy key is a directory name
+	Name   string // the folder's name (filled in by the operation) or the directory name; may be ""
 	Holder Holder
+	Queued bool // HolderPromote only: the job is still waiting (false: it is running)
 }
 
 func (e *BusyError) Error() string {
@@ -771,12 +780,44 @@ func (e *BusyError) Error() string {
 
 func (e *BusyError) Is(target error) bool { return target == ErrBusy }
 
+// LockSet is what one operation (or one folder of a promote job) locks:
+// staging folder ids, and the directory names it is about to create or
+// rename into, as slash paths below the photos root ("Staging/2025-05-30 -
+// Trip", "Archive/2025/05/2025-05-30 - Trip"). Names are compared without
+// case, so a case-only clash on a case-insensitive disk still collides.
+type LockSet struct {
+	IDs   []int64
+	Names []string
+}
+
+// lockKey is one lockable thing: a folder id or a lower-cased name.
+type lockKey struct {
+	id   int64
+	name string
+}
+
+func (s LockSet) keys() ([]lockKey, map[lockKey]string) {
+	shown := map[lockKey]string{} // name keys → the name as the caller wrote it
+	var out []lockKey
+	for _, id := range uniqueIDs(s.IDs) {
+		out = append(out, lockKey{id: id})
+	}
+	for _, n := range s.Names {
+		k := lockKey{name: strings.ToLower(n)}
+		if _, dup := shown[k]; !dup {
+			shown[k] = n
+			out = append(out, k)
+		}
+	}
+	return out, shown
+}
+
 // Locks are §8's folder locks: every operation, and an import while it
-// writes into a folder, holds the lock of each staging folder it touches.
-// Keys are staging_folders ids.
+// writes into a folder, holds the lock of each staging folder it touches
+// and of each directory name it creates (Decision 1).
 type Locks struct {
 	mu   sync.Mutex
-	held map[int64]*lockState
+	held map[lockKey]*lockState
 }
 
 type lockState struct {
@@ -784,7 +825,7 @@ type lockState struct {
 	released chan struct{} // closed on release; waiters then try again
 }
 
-func NewLocks() *Locks { return &Locks{held: map[int64]*lockState{}} }
+func NewLocks() *Locks { return &Locks{held: map[lockKey]*lockState{}} }
 
 func uniqueIDs(ids []int64) []int64 {
 	out := slices.Clone(ids)
@@ -792,47 +833,69 @@ func uniqueIDs(ids []int64) []int64 {
 	return slices.Compact(out)
 }
 
-// TryLock takes the locks of every id at once, or none. It never waits: a
-// held lock fails it with a *BusyError naming that folder.
+// TryLock takes the locks of folders ids at once, or none. It never waits:
+// a held lock fails it with a *BusyError naming that folder.
 func (l *Locks) TryLock(h Holder, ids ...int64) (release func(), err error) {
-	rs, err := l.TryLockEach(h, uniqueIDs(ids)...)
+	return l.TryLockSet(h, LockSet{IDs: ids})
+}
+
+// TryLockSet is TryLock for folder ids and directory names together.
+func (l *Locks) TryLockSet(h Holder, set LockSet) (func(), error) {
+	rs, err := l.TryLockGroups(h, []LockSet{set})
 	if err != nil {
 		return nil, err
 	}
-	return func() {
-		for _, r := range rs {
-			r()
-		}
-	}, nil
+	return rs[0], nil
 }
 
-// TryLockEach is TryLock with one release per id (ids must be distinct), so
-// a long job can give each folder back as soon as it is done with it.
-func (l *Locks) TryLockEach(h Holder, ids ...int64) ([]func(), error) {
+// TryLockGroups takes every key of every group at once, or none, and
+// returns one release per group, so a promote job can give each folder
+// back as soon as it is done with it. A key that appears in several groups
+// belongs to the first.
+func (l *Locks) TryLockGroups(h Holder, groups []LockSet) ([]func(), error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for _, id := range ids {
-		if st, ok := l.held[id]; ok {
-			return nil, &BusyError{ID: id, Holder: st.holder}
+	seen := map[lockKey]bool{}
+	perGroup := make([][]lockKey, len(groups))
+	for i, g := range groups {
+		keys, shown := g.keys()
+		for _, k := range keys {
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			if st, ok := l.held[k]; ok {
+				return nil, &BusyError{ID: k.id, Name: shown[k], Holder: st.holder}
+			}
+			perGroup[i] = append(perGroup[i], k)
 		}
 	}
-	out := make([]func(), len(ids))
-	for i, id := range ids {
-		out[i] = l.take(id, h)
+	out := make([]func(), len(groups))
+	for i, keys := range perGroup {
+		rs := make([]func(), len(keys))
+		for j, k := range keys {
+			rs[j] = l.take(k, h)
+		}
+		out[i] = func() {
+			for _, r := range rs {
+				r()
+			}
+		}
 	}
 	return out, nil
 }
 
-// take records h as id's holder (l.mu held) and returns its release.
-func (l *Locks) take(id int64, h Holder) func() {
+// take records h as k's holder (l.mu held) and returns its release, which
+// is safe to call more than once.
+func (l *Locks) take(k lockKey, h Holder) func() {
 	st := &lockState{holder: h, released: make(chan struct{})}
-	l.held[id] = st
+	l.held[k] = st
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			l.mu.Lock()
-			if l.held[id] == st {
-				delete(l.held, id)
+			if l.held[k] == st {
+				delete(l.held, k)
 			}
 			l.mu.Unlock()
 			close(st.released)
@@ -840,14 +903,15 @@ func (l *Locks) take(id int64, h Holder) func() {
 	}
 }
 
-// Lock takes id's lock, waiting while someone else holds it, until ctx
-// ends. Only an import waits (Decision 1); operations use TryLock.
+// Lock takes folder id's lock, waiting while someone else holds it, until
+// ctx ends. Only an import waits (Decision 1); everything else tries.
 func (l *Locks) Lock(ctx context.Context, h Holder, id int64) (func(), error) {
+	k := lockKey{id: id}
 	for {
 		l.mu.Lock()
-		st, ok := l.held[id]
+		st, ok := l.held[k]
 		if !ok {
-			release := l.take(id, h)
+			release := l.take(k, h)
 			l.mu.Unlock()
 			return release, nil
 		}
@@ -999,6 +1063,8 @@ In `importOne`, replace the `StagingFolderForDate` call and its error check with
 		return fail(fmt.Errorf("staging folder: %w", err))
 	}
 ```
+
+In `copyNew`, the comment on `CopyFailStalePartial` ("Ingest is the only writer of partials in Staging and runs alone") is no longer quite true: a staging move that falls back to copy-verify-delete also writes a partial, into a folder it holds the lock of. Reword it to: "Partials in Staging come from an import (which runs alone) or from a staging move into a folder this import can't hold, so this one was left by an earlier, interrupted copy." (pre-flight D16; nothing else changes.)
 
 In `internal/ingest/partials.go`, let the walk tolerate folders a staging operation renames or removes while it runs:
 
@@ -1178,14 +1244,55 @@ func (e *opsEnv) stage(t *testing.T, f catalog.StagingFolder, rel, content strin
 }
 
 // files lists every regular file below the photos root as sorted slash paths.
-func (e *opsEnv) files(t *testing.T) []string { /* filepath.WalkDir + Rel + ToSlash + sort; nil when none */ }
+func (e *opsEnv) files(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(e.photos, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			rel, err := filepath.Rel(e.photos, p)
+			if err != nil {
+				return err
+			}
+			out = append(out, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(out)
+	return out
+}
 
-func (e *opsEnv) asset(t *testing.T, sha string) catalog.Asset { /* AssetBySHA or t.Fatal */ }
+func (e *opsEnv) asset(t *testing.T, sha string) catalog.Asset {
+	t.Helper()
+	a, err := e.db.AssetBySHA(t.Context(), sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
 
 // version is the last status OnChange saw (0 if none).
-func (e *opsEnv) version() uint64 { /* under e.mu */ }
+func (e *opsEnv) version() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.changes) == 0 {
+		return 0
+	}
+	return e.changes[len(e.changes)-1].Version
+}
 
-func (e *opsEnv) removedHashes() []string { /* sorted copy under e.mu */ }
+func (e *opsEnv) removedHashes() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := slices.Clone(e.removed)
+	slices.Sort(out)
+	return out
+}
 ```
 
 `names_test.go`:
@@ -1199,6 +1306,7 @@ func (e *opsEnv) removedHashes() []string { /* sorted copy under e.mu */ }
 - `TestMoveFileIdentical`: `dir/a.JPG` has the same content → returns `dir/a.JPG`, `src` is removed, one copy remains.
 - `TestMoveFileCrossDevice`: `e.svc.rename = func(o, n string) error { return &os.LinkError{Op: "rename", Old: o, New: n, Err: syscall.EXDEV} }` → the copy lands, `src` is gone, the copy's mtime equals the original's (CopyHashed keeps it), `want` = the right hash passes.
 - `TestMoveFileCrossDeviceMismatch`: EXDEV and a `want` that isn't the content's hash → error, `src` still there, no file (and no `.partial`) in `dir`.
+- `TestMoveFileCancelled`: with a cancelled context `moveFile` returns `context.Canceled`, `src` is untouched and `dir` was **not** created.
 - `TestMoveFileRenameError`: a rename seam returning another error (e.g. `fs.ErrPermission`) → that error, `src` untouched, no copy made.
 - `TestRemoveEmptyTree` (Review Focus 2): `x/Capture/` (empty), `x/Videos/.DS_Store`, `x/Thumbs.db` → gone, true. `y/Capture/a.ARW` plus `y/.DS_Store` → not gone, kept `["Capture/a.ARW"]`, **`.DS_Store` still there** (junk goes only with an otherwise empty folder), the empty `y/Videos/` removed. A missing directory → gone, no error.
 - `TestFolderFiles`: lists regular files below a folder as sorted slash paths, skipping junk (`.DS_Store`, `._a.JPG`, `x.JPG.partial`, `THUMBS.DB`); a missing folder → nil, no error.
@@ -1206,11 +1314,11 @@ func (e *opsEnv) removedHashes() []string { /* sorted copy under e.mu */ }
 
 `service_test.go`:
 - `TestStatusAndTouch`: a new service has `Status{Version: 0}`; `Touch()` twice → version 2, and `OnChange` saw versions 1 and 2 in order.
-- `TestCloseIdempotent`: `Close()` twice returns.
+- `TestCloseIdempotent`: `Close()` twice returns, and after it the service reports closed (`s.closed` is true under `s.mu`). Tasks 5, 7 and 8 add the behavioural checks: an operation, `Promote` and `StartRescan` after `Close` give `ErrClosed` / false (pre-flight S7).
 
 - [ ] **Step 2: Run them and confirm they fail**: `go test ./internal/staging/` → build failure.
 
-- [ ] **Step 3: Service config and status** — in `staging.go` replace `Service`, `New` with:
+- [ ] **Step 3: Service config and status** — in `staging.go` (imports gain `context`, `log/slog`, `sync`) replace `Service`, `New` with:
 
 ```go
 // Config wires a Service.
@@ -1414,7 +1522,9 @@ func checkName(s string) error {
 	}
 	for _, r := range s {
 		if unicode.IsControl(r) || strings.ContainsRune(badNameChars, r) {
-			return fmt.Errorf("contains %q, which can't be used in a folder name", r)
+			// %q of the one-rune string prints "/" (with double quotes), as
+			// naming.js's JSON.stringify does, so the UI and the API agree.
+			return fmt.Errorf("contains %q, which can't be used in a folder name", string(r))
 		}
 	}
 	return nil
@@ -1670,6 +1780,11 @@ var errRetryName = errors.New("destination taken during the copy")
 // verify, delete (copyVerify). want is the hash src must have, "" when it
 // isn't catalogued. It returns the new path.
 func (s *Service) moveFile(ctx context.Context, src, dir, name, want string) (string, error) {
+	// Checked before MkdirAll: a cancelled promote must not leave empty
+	// folders in Archive/ (pre-flight D1).
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return "", err
 	}
@@ -1817,7 +1932,7 @@ func (s *Service) Rename(ctx context.Context, id int64, title string) (Folder, e
 func (s *Service) Merge(ctx context.Context, ids []int64, title string) (Folder, error)
 ```
 
-Unexported, used by Tasks 6, 7, 10: `s.lockFolders(ctx, ids) ([]catalog.StagingFolder, func(), error)`, `s.lockRows(h, rows...)`, `s.nameFree(ctx, name, self...)`, `s.renameFolder(ctx, row, name, touched)`, `s.summary(ctx, id)`, `prefixOf(name)`, `earliestDate(rows)`, `unionDates(rows...)`, `oldestCreated(rows)`.
+Unexported, used by Tasks 6, 7, 8, 10: `s.rows(ctx, ids)`, `s.cullGone(ctx, map[string]catalog.Asset) error`, `s.busyNamed(err, rows)`, `s.lockName(name) (func(), error)`, `s.moveTree(ctx, src, dst, tracked, touched, record) error`, `s.isClosed()`, `s.lockFolders(ctx, ids) ([]catalog.StagingFolder, func(), error)`, `s.lockRows(h, rows...)`, `s.nameFree(ctx, name, self...)`, `s.renameFolder(ctx, row, name, touched)`, `s.summary(ctx, id)`, `prefixOf(name)`, `earliestDate(rows)`, `unionDates(rows...)`, `oldestCreated(rows)`.
 
 - [ ] **Step 1: Write the failing tests** in `internal/staging/ops_test.go` (package `staging`, `newOpsEnv`). Each test also checks that the folders' locks are free afterwards (`e.locks.TryLock(HolderRescan, id)` succeeds) and, for a change, that `e.version()` went up.
 
@@ -1834,7 +1949,7 @@ Rename:
 - `TestRenameCaseOnly`: `2025-05-30 - trip` → `Trip`: succeeds on every OS (on a case-insensitive disk the existing directory is the folder itself).
 
 Merge:
-- `TestMergeMovesFilesAndRemovesSources` (Review Focus 2): `A = 2025-05-30` (staged `a.JPG`, `Capture/a.ARW`; untracked `notes.txt`; junk `.DS_Store`), `B = 2025-05-31` (staged `Videos/v.MP4`; staged `Capture/a.ARW` with *different* content) → `Merge(ctx, [B, A], "Trip")` → result `2025-05-30 - Trip` with id A.ID; on disk: `a.JPG`, `Capture/a.ARW`, `Capture/a-1.ARW` (B's), `Videos/v.MP4`, `notes.txt` under `Staging/2025-05-30 - Trip/`; `Staging/2025-05-31` is gone; B's row is gone (`StagingFolderByID` → `ErrNotFound`); every asset's `RelPath` matches the disk; dates `["2025-05-30","2025-05-31"]`.
+- `TestMergeMovesFilesAndRemovesSources` (Review Focus 2): `A = 2025-05-30` (staged `a.JPG`, `Capture/a.ARW`; untracked `notes.txt`), `B = 2025-05-31` (staged `Videos/v.MP4`; staged `Capture/a.ARW` with *different* content; junk `.DS_Store`, which goes with B and is not moved) → `Merge(ctx, [B, A], "Trip")` → result `2025-05-30 - Trip` with id A.ID; on disk: `a.JPG`, `Capture/a.ARW`, `Capture/a-1.ARW` (B's), `Videos/v.MP4`, `notes.txt` under `Staging/2025-05-30 - Trip/`; `Staging/2025-05-31` is gone; B's row is gone (`StagingFolderByID` → `ErrNotFound`); every asset's `RelPath` matches the disk; dates `["2025-05-30","2025-05-31"]`.
 - `TestMergePicksFolderWithFinalName`: `2025-05-30` (id 1) + `2025-05-30 - Dinner` (id 2), title `Dinner` → the result has id 2 and name `2025-05-30 - Dinner`; folder 1's files are inside it and `Staging/2025-05-30` is gone.
 - `TestMergeIdenticalFile`: both folders hold an untracked `notes.txt` with the same content → one copy left, the source removed.
 - `TestMergeCullsMissingTracked`: a staged asset of B whose file was deleted by hand → culled (`e.asset(t, sha).State == StateCulled`), its hash reported through `Removed`.
@@ -1842,7 +1957,9 @@ Merge:
 - `TestMergeNeedsTwo`: one id (or the same id twice) → `ErrBadRequest`.
 - `TestMergeNameTaken`: a third folder (not merged) already named `2025-05-30 - Trip` → `ErrNameTaken`, nothing moved.
 - `TestMergeBusy`: B locked by an import → `*BusyError` naming B, nothing moved, A's lock free afterwards.
-- `TestMergeKeepsSourceWithSpecialFile` (skip on Windows: symlinks need privileges): a symlink in B → files moved, B's row and directory stay (the symlink is never moved or deleted), and `Merge` returns no error.
+- `TestMergeKeepsSourceWithSpecialFile` (skip on Windows: symlinks need privileges): a symlink in B → files moved, B's row and directory stay (the symlink is never moved or deleted), B's dates are cleared (it covers no files now, so imports of those dates go to the merged folder), and `Merge` returns no error.
+- `TestRenameTakesTheNameKey` (pre-flight D2): with `e.locks.TryLockSet(HolderRescan, LockSet{Names: ["Staging/2025-05-30 - Trip"]})` held, `Rename(f, "Trip")` returns a `*BusyError{ID: 0, Name: "2025-05-30 - Trip", Holder: HolderRescan}` and nothing changed; after release it succeeds. The same for `Merge` into that name.
+- `TestOperationsAfterClose` (pre-flight S7, G11): after `e.svc.Close()`, `Rename`, `Merge`, `Move`, `Cull` and `Discard` all return `ErrClosed` (Task 6 adds the last three to this test).
 
 - [ ] **Step 2: Run them and confirm they fail**: `go test ./internal/staging/ -run 'Rename|Merge'` → build failure.
 
@@ -1885,6 +2002,25 @@ func (s *Service) rows(ctx context.Context, ids []int64) ([]catalog.StagingFolde
 	return out, nil
 }
 
+// busyNamed fills in a *BusyError's display name: the folder's name from
+// rows, or for a directory-name key the name without "Staging/". (Task 7
+// adds whether a promote holding it is still queued.) Other errors pass.
+func (s *Service) busyNamed(err error, rows []catalog.StagingFolder) error {
+	var busy *BusyError
+	if !errors.As(err, &busy) {
+		return err
+	}
+	if busy.ID == 0 {
+		busy.Name = strings.TrimPrefix(busy.Name, Dir+"/")
+	}
+	for _, r := range rows {
+		if busy.ID != 0 && r.ID == busy.ID {
+			busy.Name = r.Name
+		}
+	}
+	return err
+}
+
 // lockRows takes the locks of rows for one operation, or returns the
 // *BusyError of the first busy one with its name filled in.
 func (s *Service) lockRows(h Holder, rows ...catalog.StagingFolder) (func(), error) {
@@ -1893,20 +2029,31 @@ func (s *Service) lockRows(h Holder, rows ...catalog.StagingFolder) (func(), err
 		ids[i] = r.ID
 	}
 	release, err := s.locks.TryLock(h, ids...)
-	var busy *BusyError
-	if errors.As(err, &busy) {
-		for _, r := range rows {
-			if r.ID == busy.ID {
-				busy.Name = r.Name
-			}
-		}
-	}
-	return release, err
+	return release, s.busyNamed(err, rows)
+}
+
+// lockName takes the lock of directory name Staging/<name>, which an
+// operation is about to create or rename into, so the rescan can't adopt it
+// before the catalog knows it (Decision 1, pre-flight D2). Take it after
+// the folders' locks; like them it never waits.
+func (s *Service) lockName(name string) (func(), error) {
+	release, err := s.locks.TryLockSet(HolderOperation, LockSet{Names: []string{Dir + "/" + name}})
+	return release, s.busyNamed(err, nil)
+}
+
+func (s *Service) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 // lockFolders reads, locks and reads again folders ids (an operation that
 // finished just before the lock may have renamed one). The caller releases.
+// Once the service is closing every operation gets ErrClosed (503).
 func (s *Service) lockFolders(ctx context.Context, ids []int64) ([]catalog.StagingFolder, func(), error) {
+	if s.isClosed() {
+		return nil, nil, ErrClosed
+	}
 	rows, err := s.rows(ctx, ids)
 	if err != nil {
 		return nil, nil, err
@@ -2006,6 +2153,11 @@ func (s *Service) Rename(ctx context.Context, id int64, title string) (Folder, e
 		return Folder{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
 	}
 	if name != row.Name {
+		releaseName, err := s.lockName(name)
+		if err != nil {
+			return Folder{}, err
+		}
+		defer releaseName()
 		if err := s.nameFree(ctx, name, row); err != nil {
 			return Folder{}, err
 		}
@@ -2097,6 +2249,11 @@ func (s *Service) Merge(ctx context.Context, ids []int64, title string) (Folder,
 	if err := checkName(name); err != nil {
 		return Folder{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
 	}
+	releaseName, err := s.lockName(name)
+	if err != nil {
+		return Folder{}, err
+	}
+	defer releaseName()
 	if err := s.nameFree(ctx, name, rows...); err != nil {
 		return Folder{}, err
 	}
@@ -2107,8 +2264,16 @@ func (s *Service) Merge(ctx context.Context, ids []int64, title string) (Folder,
 		if src.ID == target.ID {
 			continue
 		}
-		if err := s.mergeInto(ctx, src, target, touched); err != nil {
+		removed, err := s.mergeInto(ctx, src, target, touched)
+		if err != nil {
 			return Folder{}, fmt.Errorf("merge %q into %q: %w", src.Name, target.Name, err)
+		}
+		if !removed {
+			// Kept only for files that can't be moved; it covers no files now,
+			// so its dates move to the target (pre-flight D11).
+			if err := s.db.SetStagingFolderInfo(ctx, src.ID, nil, time.Time{}); err != nil {
+				return Folder{}, err
+			}
 		}
 	}
 	if err := s.db.SetStagingFolderInfo(ctx, target.ID, unionDates(rows), oldestCreated(rows)); err != nil {
@@ -2125,28 +2290,21 @@ func (s *Service) Merge(ctx context.Context, ids []int64, title string) (Folder,
 	return s.summary(ctx, target.ID)
 }
 
-// mergeInto moves every file of src, catalogued or not, to the same path
-// inside dst, then removes src when nothing is left. Catalogued files whose
-// file is already gone are culled, as a rescan would.
-func (s *Service) mergeInto(ctx context.Context, src, dst catalog.StagingFolder, touched map[string]bool) error {
-	srcPrefix := prefixOf(src.Name)
-	assets, err := s.db.AssetsUnder(ctx, srcPrefix, catalog.StateStaged)
-	if err != nil {
-		return err
-	}
-	tracked := map[string]catalog.Asset{} // path inside the folder → asset
-	for _, a := range assets {
-		tracked[strings.TrimPrefix(a.RelPath, srcPrefix)] = a
-	}
-	files, err := folderFiles(s.folderDir(src.Name))
+// moveTree moves every file below src, catalogued or not, to the same
+// path below dst (moveFile: collision loop, EXDEV fallback) and calls
+// record with the new rel_path of each catalogued one. tracked maps paths
+// inside src to their assets; the entries moved are deleted from it, so
+// what is left was not on disk. Merge and promote share it (pre-flight D10).
+func (s *Service) moveTree(ctx context.Context, src, dst string, tracked map[string]catalog.Asset, touched map[string]bool,
+	record func(a catalog.Asset, newRel string) error) error {
+	files, err := folderFiles(src)
 	if err != nil {
 		return err
 	}
 	for _, rel := range files {
 		a, isTracked := tracked[rel]
-		from := filepath.Join(s.folderDir(src.Name), filepath.FromSlash(rel))
-		dir := filepath.Join(s.folderDir(dst.Name), filepath.FromSlash(path.Dir(rel)))
-		to, err := s.moveFile(ctx, from, dir, path.Base(rel), a.SHA256)
+		from := filepath.Join(src, filepath.FromSlash(rel))
+		to, err := s.moveFile(ctx, from, filepath.Join(dst, filepath.FromSlash(path.Dir(rel))), path.Base(rel), a.SHA256)
 		if err != nil {
 			return err
 		}
@@ -2157,26 +2315,57 @@ func (s *Service) mergeInto(ctx context.Context, src, dst catalog.StagingFolder,
 		delete(tracked, rel)
 		newRel, err := s.relOf(to)
 		if err == nil {
-			err = s.db.MoveAsset(ctx, a.SHA256, newRel, s.now())
+			err = record(a, newRel)
 		}
 		if err != nil {
 			return fmt.Errorf("moved %s but could not record it (a rescan repairs this): %w", rel, err)
 		}
 	}
+	return nil
+}
+
+// trackedIn maps the paths inside folder name to its staged assets.
+func (s *Service) trackedIn(ctx context.Context, name string) (map[string]catalog.Asset, error) {
+	prefix := prefixOf(name)
+	assets, err := s.db.AssetsUnder(ctx, prefix, catalog.StateStaged)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]catalog.Asset{}
+	for _, a := range assets {
+		out[strings.TrimPrefix(a.RelPath, prefix)] = a
+	}
+	return out, nil
+}
+
+// mergeInto moves every file of src into dst (moveTree), culls catalogued
+// files that were already gone (as a rescan would), and removes src when
+// nothing is left. It reports whether src was removed.
+func (s *Service) mergeInto(ctx context.Context, src, dst catalog.StagingFolder, touched map[string]bool) (bool, error) {
+	tracked, err := s.trackedIn(ctx, src.Name)
+	if err != nil {
+		return false, err
+	}
+	err = s.moveTree(ctx, s.folderDir(src.Name), s.folderDir(dst.Name), tracked, touched, func(a catalog.Asset, newRel string) error {
+		return s.db.MoveAsset(ctx, a.SHA256, newRel, s.now())
+	})
+	if err != nil {
+		return false, err
+	}
 	if err := s.cullGone(ctx, tracked); err != nil {
-		return err
+		return false, err
 	}
 	gone, kept, err := removeEmptyTree(s.folderDir(src.Name))
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !gone {
 		// Only special files (symlinks, devices) are never moved.
 		s.log.Warn("merged folder kept: it holds files that were not moved", "folder", src.Name, "kept", kept)
-		return nil
+		return false, nil
 	}
 	touched[filepath.Join(s.photosRoot, Dir)] = true
-	return s.db.DeleteStagingFolder(ctx, src.ID)
+	return true, s.db.DeleteStagingFolder(ctx, src.ID)
 }
 
 // cullGone culls catalogued files whose file is no longer on disk.
@@ -2249,14 +2438,14 @@ func (s *Service) Cull(ctx context.Context, shas []string) (CullResult, error)
 func (s *Service) Discard(ctx context.Context, id int64) (DiscardResult, error)
 ```
 
-Unexported, used by Tasks 7, 10: `checkSHAs`, `s.locate(ctx, shas)`, `s.dropIfEmpty(ctx, row, touched) (bool, error)`.
+Unexported, used by Tasks 7, 10: `checkSHAs`, `s.locate(ctx, shas)`, `s.dropIfEmpty(ctx, row, touched) (bool, error)`, `s.cullFiles(ctx, assets, touched) ([]string, error)`.
 
 - [ ] **Step 1: Write the failing tests** (append to `ops_test.go`; captures at 2025-05-30 10:00 local, `at(10)` from `staging_test.go`):
 - `TestMoveToExistingFolder`: A `2025-05-30` holds `a.JPG`, `Capture/a.ARW`, `b.JPG`; B `2025-06-01 - Beach` → `Move({SHAs: [a.JPG, a.ARW], ToID: B})` → `Staging/2025-06-01 - Beach/a.JPG` and `…/Capture/a.ARW`; `Moved` 2; `Removed` empty (A still has b.JPG); B's dates now include `2025-05-30`; A's dates unchanged; result `Folder.ID == B`.
 - `TestMoveDatesUseDayCutoff`: a file captured 2025-05-31 01:30 local moved into B adds `2025-05-30` (default cutoff 04:00); a file with no capture time adds the source folder's date.
 - `TestMoveLastFilesRemovesSource`: moving A's every staged file (A also has `.DS_Store` and an empty `Videos/`) → A's directory and row gone, `Removed == [A.ID]`.
-- `TestMoveToNewFolder`: `Move({SHAs: [b.JPG], NewTitle: " Picks "})` → a new folder `2025-05-30 - Picks` holding `b.JPG`, dates `["2025-05-30"]`, `CreatedAt` = A's.
-- `TestMoveNewFolderRules`: `NewTitle` blank → `ErrBadTitle`; both `ToID` and `NewTitle` → `ErrBadRequest`; neither → `ErrBadRequest`; a `NewTitle` whose name exists → `ErrNameTaken`; `ToID` 999 → `ErrNotFound`.
+- `TestMoveToNewFolder`: `Move({SHAs: [b.JPG], NewTitle: " Picks "})` → a new folder `2025-05-30 - Picks` holding `b.JPG`, dates `["2025-05-30"]`, `CreatedAt` = A's. With the name key `Staging/2025-05-30 - Picks` held by a rescan → `*BusyError`, and neither a directory nor a row was created (pre-flight D2).
+- `TestMoveNewFolderRules`: `NewTitle: "   "` (whitespace only) → `ErrBadTitle`; both `ToID` and `NewTitle` → `ErrBadRequest`; neither → `ErrBadRequest`; a `NewTitle` whose name exists → `ErrNameTaken`; `ToID` 999 → `ErrNotFound`.
 - `TestMoveCollision` (Review Focus 2): B already has a different `a.JPG` → lands as `a-1.JPG`, the asset's `RelPath` says so.
 - `TestMoveToSameFolderIsNoop`: moving A's file to A → `Moved` 0, nothing changed.
 - `TestMoveRejectsBadHashes`: an unknown hash, an archived asset's hash, a culled asset's hash, `"xyz"`, an empty list, `MaxFiles+1` hashes → `ErrBadRequest`; a duplicate hash in the list is moved once.
@@ -2269,6 +2458,7 @@ Unexported, used by Tasks 7, 10: `checkSHAs`, `s.locate(ctx, shas)`, `s.dropIfEm
 - `TestDiscardRemovesFolder`: A with staged files, junk and empty subfolders → `Discard(A)` → `{Culled: 3, Removed: true, Kept: []}`, directory and row gone, hashes reported.
 - `TestDiscardKeepsUntrackedFiles` (Review Focus 2, Decision 4): A also holds untracked `notes.txt` and an untracked `c.JPG` → `{Culled: n, Removed: false, Kept: ["c.JPG", "notes.txt"]}`; both files still on disk; the row stays (0 files).
 - `TestDiscardBusy`: A held by a rescan → `*BusyError{Holder: HolderRescan}`; nothing deleted.
+- Extend `TestOperationsAfterClose` (Task 5) with `Move`, `Cull` and `Discard` → `ErrClosed`.
 
 - [ ] **Step 2: Run them and confirm they fail**: `go test ./internal/staging/ -run 'Move|Cull|Discard'` → build failure.
 
@@ -2450,10 +2640,22 @@ func (s *Service) Move(ctx context.Context, req MoveRequest) (MoveResult, error)
 		if err := checkName(name); err != nil {
 			return MoveResult{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
 		}
+		releaseName, err := s.lockName(name)
+		if err != nil {
+			return MoveResult{}, err
+		}
+		defer releaseName()
 		if err := s.nameFree(ctx, name); err != nil {
 			return MoveResult{}, err
 		}
+		// The directory first, then the row (filesystem first, pre-flight G7).
+		if err := os.MkdirAll(s.folderDir(name), 0o777); err != nil {
+			return MoveResult{}, err
+		}
 		if dest, err = s.db.CreateStagingFolder(ctx, name, nil, oldestCreated(sources)); err != nil {
+			if rmErr := os.Remove(s.folderDir(name)); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+				err = errors.Join(err, rmErr)
+			}
 			return MoveResult{}, err
 		}
 		releaseNew, err := s.lockRows(HolderOperation, dest) // nobody else knows it yet
@@ -2461,9 +2663,6 @@ func (s *Service) Move(ctx context.Context, req MoveRequest) (MoveResult, error)
 			return MoveResult{}, err
 		}
 		defer releaseNew()
-		if err := os.MkdirAll(s.folderDir(name), 0o777); err != nil {
-			return MoveResult{}, err
-		}
 	}
 	res := MoveResult{Removed: []int64{}}
 	touched := map[string]bool{filepath.Join(s.photosRoot, Dir): true}
@@ -2524,20 +2723,16 @@ func (s *Service) Cull(ctx context.Context, shas []string) (CullResult, error) {
 	defer release()
 	defer s.changed()
 	res := CullResult{Removed: []int64{}}
-	var culled []string
-	defer func() { s.removed(culled) }()
 	touched := map[string]bool{}
-	for _, f := range files {
-		p := s.abs(f.asset.RelPath)
-		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return res, fmt.Errorf("culled %d of %d files: %w", res.Culled, len(files), err)
-		}
-		touched[filepath.Dir(p)] = true
-		if err := s.db.CullAsset(ctx, f.asset.SHA256, s.now()); err != nil {
-			return res, fmt.Errorf("deleted %s but could not record it (a rescan repairs this): %w", f.asset.RelPath, err)
-		}
-		culled = append(culled, f.asset.SHA256)
-		res.Culled++
+	assets := make([]catalog.Asset, len(files))
+	for i, f := range files {
+		assets[i] = f.asset
+	}
+	culled, err := s.cullFiles(ctx, assets, touched)
+	s.removed(culled)
+	res.Culled = len(culled)
+	if err != nil {
+		return res, err
 	}
 	for _, row := range sortedRows(locked) {
 		removed, err := s.dropIfEmpty(ctx, row, touched)
@@ -2549,6 +2744,25 @@ func (s *Service) Cull(ctx context.Context, shas []string) (CullResult, error) {
 		}
 	}
 	return res, syncDirs(touched)
+}
+
+// cullFiles deletes the files of staged assets and records each as culled,
+// one by one, and returns the hashes it culled (also on error). Cull and
+// Discard share it (pre-flight D10).
+func (s *Service) cullFiles(ctx context.Context, assets []catalog.Asset, touched map[string]bool) ([]string, error) {
+	var culled []string
+	for _, a := range assets {
+		p := s.abs(a.RelPath)
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return culled, fmt.Errorf("culled %d of %d files: %w", len(culled), len(assets), err)
+		}
+		touched[filepath.Dir(p)] = true
+		if err := s.db.CullAsset(ctx, a.SHA256, s.now()); err != nil {
+			return culled, fmt.Errorf("deleted %s but could not record it (a rescan repairs this): %w", a.RelPath, err)
+		}
+		culled = append(culled, a.SHA256)
+	}
+	return culled, nil
 }
 
 func sortedRows(m map[int64]catalog.StagingFolder) []catalog.StagingFolder {
@@ -2576,20 +2790,12 @@ func (s *Service) Discard(ctx context.Context, id int64) (DiscardResult, error) 
 	}
 	defer s.changed()
 	res := DiscardResult{Kept: []string{}}
-	var culled []string
-	defer func() { s.removed(culled) }()
 	touched := map[string]bool{filepath.Join(s.photosRoot, Dir): true}
-	for _, a := range assets {
-		p := s.abs(a.RelPath)
-		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return res, fmt.Errorf("discarded %d of %d files: %w", res.Culled, len(assets), err)
-		}
-		touched[filepath.Dir(p)] = true
-		if err := s.db.CullAsset(ctx, a.SHA256, s.now()); err != nil {
-			return res, fmt.Errorf("deleted %s but could not record it (a rescan repairs this): %w", a.RelPath, err)
-		}
-		culled = append(culled, a.SHA256)
-		res.Culled++
+	culled, err := s.cullFiles(ctx, assets, touched)
+	s.removed(culled)
+	res.Culled = len(culled)
+	if err != nil {
+		return res, err
 	}
 	gone, kept, err := removeEmptyTree(s.folderDir(row.Name))
 	if err != nil {
@@ -2620,33 +2826,36 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 7: Promote as a background job
+### Task 7: The promote queue
 
 Suggested implementer: sonnet (reviewer: opus — concurrency and data safety).
 
 **Files:**
 - Create: `internal/staging/promote.go`, `internal/staging/promote_test.go`
-- Modify: `internal/staging/staging.go` (the job fields on `Service`)
+- Modify: `internal/staging/staging.go` (the queue fields on `Service`; `Close` drops the queue), `internal/staging/ops.go` (`busyNamed` learns about queued promotes)
 
 **Interfaces:**
-- Consumes: Tasks 3–6 (`TryLockEach`, `BusyError`, `rows`, `prefixOf`, `moveFile`, `folderFiles`, `removeEmptyTree`, `syncDirs`, `cullGone`, `ExpandPattern`, `DefaultPattern`, `crossDevice`, `s.wg`, `s.bgCtx`, `s.mu`, `s.closed`, `s.changed`); `catalog.DB.AssetsUnder`, `ArchiveFolder`, `ArchiveAsset`, `DeleteStagingFolder`.
+- Consumes: Tasks 3–6 (`TryLockGroups`, `LockSet`, `BusyError`, `HolderPromote`, `rows`, `busyNamed`, `isClosed`, `prefixOf`, `moveFile`, `moveTree`, `removeEmptyTree`, `syncDirs`, `cullGone`, `ExpandPattern`, `DefaultPattern`, `crossDevice`, `ErrChanged`, `ErrClosed`, `s.wg`, `s.bgCtx`, `s.mu`, `s.closed`, `s.changed`); `catalog.DB.AssetsUnder`, `ArchiveFolder`, `ArchiveAsset`, `DeleteStagingFolder`.
 - Produces:
 
 ```go
 const ArchiveDir = "Archive"
-var ErrPromoteRunning = errors.New("staging: a promote is already running")
+var ErrNoSuchJob = errors.New("staging: no such promote job")                       // 404
+var ErrJobStarted = errors.New("staging: that promote has already started or finished") // 409 promote_started
 const (
-	PromoteRunning = "running" // job
-	PromoteWaiting = "waiting" // folder
-	PromoteMoving  = "moving"  // folder
-	PromoteDone    = "done"    // folder or job
-	PromoteFailed  = "failed"  // folder, or a job where some folder failed
+	PromoteQueued    = "queued"    // job
+	PromoteRunning   = "running"   // job
+	PromoteCancelled = "cancelled" // job
+	PromoteWaiting   = "waiting"   // folder
+	PromoteMoving    = "moving"    // folder
+	PromoteDone      = "done"      // folder or job
+	PromoteFailed    = "failed"    // folder, or a job where some folder failed
 )
 type PromoteFolder struct {
 	ID     int64  `json:"id"`
 	Name   string `json:"name"`
-	Target string `json:"target"`           // "Archive/…"
-	Files  int    `json:"files"`            // catalogued files when the job started
+	Target string `json:"target"`           // "Archive/…", expanded at enqueue
+	Files  int    `json:"files"`            // catalogued files when the job was queued
 	Done   int    `json:"done"`             // of those, moved so far
 	State  string `json:"state"`
 	Merged bool   `json:"merged,omitempty"` // the target existed: merged file by file
@@ -2657,7 +2866,8 @@ type PromoteJob struct {
 	ID         int64           `json:"id"`
 	State      string          `json:"state"`
 	Pattern    string          `json:"pattern"`
-	StartedAt  time.Time       `json:"started_at"`
+	QueuedAt   time.Time       `json:"queued_at"`
+	StartedAt  time.Time       `json:"started_at,omitzero"`
 	FinishedAt time.Time       `json:"finished_at,omitzero"`
 	FilesTotal int             `json:"files_total"`
 	FilesDone  int             `json:"files_done"`
@@ -2665,61 +2875,101 @@ type PromoteJob struct {
 	BytesDone  int64           `json:"bytes_done"`
 	Folders    []PromoteFolder `json:"folders"`
 }
-func (s *Service) Promote(ctx context.Context, ids []int64, pattern string) (PromoteJob, error) // validates, locks, starts; returns the first snapshot
-func (s *Service) LastPromote() (PromoteJob, bool)  // the running or last job; false before the first
-func (s *Service) OnPromote(fn func(PromoteJob))    // call before serving; fn runs under a lock and must not block
+// PromoteQueue is the GET /api/staging/promote body and the promote.progress data.
+type PromoteQueue struct {
+	Running *PromoteJob  `json:"running"`
+	Queued  []PromoteJob `json:"queued"` // FIFO order; never null
+	Last    *PromoteJob  `json:"last"`   // the last finished (done or failed) job
+}
+func (s *Service) Promote(ctx context.Context, ids []int64, pattern string) (PromoteJob, error) // enqueue; locks at once
+func (s *Service) CancelPromote(id int64) (PromoteJob, error) // a queued job only; releases its locks
+func (s *Service) Promotes() PromoteQueue
+func (s *Service) OnPromote(fn func(PromoteQueue)) // call before serving; fn runs under a lock and must not block
 ```
+
+Unexported, used by Task 12: `s.promoteQueued(id, name) bool`.
 
 - [ ] **Step 1: Write the failing tests** in `internal/staging/promote_test.go` (`newOpsEnv`). Helpers:
 
 ```go
-// waitPromote polls LastPromote until the job is no longer running.
-func waitPromote(t *testing.T, s *Service) PromoteJob {
+// waitIdle polls Promotes until nothing runs or waits, and returns the
+// last finished job.
+func waitIdle(t *testing.T, s *Service) PromoteJob {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		j, ok := s.LastPromote()
-		if ok && j.State != PromoteRunning {
-			return j
+		q := s.Promotes()
+		if q.Running == nil && len(q.Queued) == 0 && q.Last != nil {
+			return *q.Last
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("promote still running: %+v", j)
+			t.Fatalf("promote queue not idle: %+v", q)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-// blockRename makes s.rename wait for release when old ends with suffix.
-func blockRename(s *Service, suffix string) (entered <-chan struct{}, release func()) { /* channels + sync.Once; then calls os.Rename */ }
+// blockRename makes s.rename, for an old path ending in suffix, close
+// entered and wait for release; then it fails with errno when errno isn't
+// nil, else renames. Other paths rename at once. Set it before promoting
+// and register t.Cleanup(release) after newOpsEnv, so a failing test never
+// leaves Close waiting.
+func blockRename(s *Service, suffix string, errno error) (entered <-chan struct{}, release func()) {
+	in, out := make(chan struct{}), make(chan struct{})
+	var onceIn, onceOut sync.Once
+	s.rename = func(o, n string) error {
+		if strings.HasSuffix(o, suffix) {
+			onceIn.Do(func() { close(in) })
+			<-out
+			if errno != nil {
+				return &os.LinkError{Op: "rename", Old: o, New: n, Err: errno}
+			}
+		}
+		return os.Rename(o, n)
+	}
+	return in, func() { onceOut.Do(func() { close(out) }) }
+}
+
+func waitEntered(t *testing.T, ch <-chan struct{}) { /* select with a 10 s deadline */ }
 ```
 
 Tests (Review Focus 5):
-- `TestPromoteRenamesIntoArchive`: folder `2025-05-30 - Trip` with staged `a.JPG`, `Capture/a.ARW`, `Videos/v.MP4`, untracked `notes.txt` → `Promote(ctx, [id], "")` returns a job with `State: running`, `FilesTotal: 3`, the folder `waiting` and `Target: "Archive/2025-05-30 - Trip"`; `waitPromote` → `done`, `FilesDone: 3`, `BytesDone` = the sizes; on disk `Archive/2025-05-30 - Trip/a.JPG`, `…/Capture/a.ARW`, `…/Videos/v.MP4`, `…/notes.txt`, nothing under `Staging/`; the three assets are `archived` at those paths; the row is gone; the lock is free; `OnPromote` saw a first report `running` and a last `done`; the staging version went up.
+- `TestPromoteRenamesIntoArchive`: folder `2025-05-30 - Trip` with staged `a.JPG`, `Capture/a.ARW`, `Videos/v.MP4`, untracked `notes.txt` → `Promote(ctx, [id], "")` returns a job with `State` `queued` or `running`, `FilesTotal: 3`, the folder `Target: "Archive/2025-05-30 - Trip"`; `waitIdle` → `done`, `FilesDone: 3`, `BytesDone` = the sizes; on disk `Archive/2025-05-30 - Trip/a.JPG`, `…/Capture/a.ARW`, `…/Videos/v.MP4`, `…/notes.txt`, nothing under `Staging/`; the three assets are `archived` at those paths; the row is gone; the folder's lock and the name `Archive/2025-05-30 - Trip` are free; `OnPromote` saw a queue holding the job (queued or running) and finally one with `Running: nil` and `Last.State: done`; the staging version went up.
 - `TestPromotePattern`: `"{year}/{month}/{name}"` → `Archive/2025/05/2025-05-30 - Trip/…`.
-- `TestPromoteMergesIntoExistingTarget` (Review Focus 2): `Archive/2025-05-30 - Trip/` already holds `Capture/a.ARW` (different content), `Selects/x.ARW` and `2025-05-30 - Trip.cosessiondb` → the folder ends `merged`, `Merged: true`; staged `Capture/a.ARW` lands as `Capture/a-1.ARW`; the existing three files are byte-for-byte unchanged; `Staging/2025-05-30 - Trip` and its row are gone.
+- `TestPromoteMergesIntoExistingTarget` (Review Focus 2): `Archive/2025-05-30 - Trip/` already holds `Capture/a.ARW` (different content), `Selects/x.ARW` and `2025-05-30 - Trip.cosessiondb` → the folder ends `done` with `Merged: true`; staged `Capture/a.ARW` lands as `Capture/a-1.ARW`; the existing three files are byte-for-byte unchanged; `Staging/2025-05-30 - Trip` and its row are gone.
+- `TestPromoteTargetCreatedWhileQueued`: block job 1 (folder A); queue job 2 (folder B, target `Archive/B`); while it waits, create `Archive/B/` with an unrelated file; release → job 2's folder ends `done` with `Merged: true` (the existence check happens at the folder's turn, Decision 9).
 - `TestPromoteIdenticalInTarget`: the archive already has the same content at `a.JPG` → the staging copy is removed and the asset is `archived` at `Archive/…/a.JPG`.
 - `TestPromoteCrossDevice`: `e.svc.rename` always returns EXDEV → done, `Copied: true`, every file copied with its content and mtime, originals gone, assets archived.
-- `TestPromoteCrossDeviceVerifyFails`: EXDEV, and a staged file whose content was changed on disk after it was recorded (the catalog hash no longer matches) → that folder `failed` with an error mentioning "does not match"; the job `failed`; the changed source file is still in Staging; no copy of it in Archive; the row stays; the lock is free.
+- `TestPromoteCrossDeviceVerifyFails`: EXDEV, and a staged file whose content was changed on disk after it was recorded → that folder `failed` with an error mentioning "does not match"; the job `failed`; the changed source file is still in Staging; no copy of it in Archive; the row stays; the lock is free.
 - `TestPromoteCullsMissingTracked`: a staged file deleted by hand → culled before the move (`State == culled`, reported through `Removed`), the rest promoted.
-- `TestPromoteBadPattern`: `"{day}"` → `ErrBadPattern`, no job started (`LastPromote` false), the folder's lock free.
+- `TestPromoteBadPattern`: `"{day}"` → `ErrBadPattern`; `Promotes()` is empty (no job, no id used); the folder's lock is free.
 - `TestPromoteBusy`: the folder held by an import → `*BusyError{Holder: HolderIngest, Name: …}`; no job.
-- `TestPromoteOneAtATime`: `blockRename` on the first folder; `Promote([A])`; wait for `entered`; `Promote([B])` → `ErrPromoteRunning` and B's lock free; release; `waitPromote` done; `Promote([B])` now works.
-- `TestPromoteReleasesEachFolder` (Review Focus 1): A and B in one job, `blockRename` on B; once B's rename is entered, A is done and `e.locks.TryLock(HolderRescan, A.ID)` succeeds while `TryLock(…, B.ID)` is busy; release; done.
-- `TestPromoteStopsOnClose`: `blockRename` on A returning EXDEV after release (wrap: wait, then return EXDEV); `Promote([A])`; wait for `entered`; call `e.svc.Close()` in a goroutine; release → `Close` returns within 10 s; the job is `failed`; every file of A is still in `Staging/`; nothing under `Archive/` (no empty folder either).
-- `TestPromoteProgressThrottled` (Review Focus 7): an existing target (merge mode) and 60 staged files → at most 8 `OnPromote` calls in all, and the last has `FilesDone: 60`, `State: done`.
+- `TestPromoteQueueFIFO`: `blockRename(A)`; `Promote([A])` → job 1; `waitEntered`; `Promote([B])` → job 2 and `Promote([C])` → job 3, both `queued`; `Promotes()` has `Running.ID == 1` and `Queued` ids `[2, 3]` in that order; release; `waitIdle` → `Last.ID == 3`; the rename seam saw A, then B, then C (record the order it was called in).
+- `TestPromoteEnqueueLocksAtOnce` (Review Focus 1): A running (blocked), job 2 queued with B → right away `Rename(B, "x")`, `Discard(B)` and `Promote([B])` each return `*BusyError{ID: B.ID, Name: B.Name, Holder: HolderPromote, Queued: true}`; `Rename(A, "x")` returns one with `Queued: false`; `e.locks.TryLockSet(HolderRescan, LockSet{Names: [B's target]})` is busy. Release; after `waitIdle` every lock is free.
+- `TestPromoteCancelQueued`: A running (blocked), job 2 queued with B → `CancelPromote(2)` returns the job with `State: cancelled`; B's folder lock and target name are free at once; `Promotes().Queued` is empty; `CancelPromote(1)` (running) → `ErrJobStarted`; `CancelPromote(2)` again → `ErrJobStarted`; `CancelPromote(99)` → `ErrNoSuchJob`; after release and `waitIdle`, B is still in `Staging/` with its row and files.
+- `TestPromoteReleasesEachFolder` (Review Focus 1): A and B in one job, `blockRename(B)`; once B's rename is entered, A is done and `e.locks.TryLock(HolderRescan, A.ID)` succeeds while `TryLock(…, B.ID)` is busy; release; done.
+- `TestPromoteStopsOnClose` (deterministic, pre-flight D5): `blockRename(A, syscall.EXDEV)`; `Promote([A])`; `waitEntered`; start `e.svc.Close()` in a goroutine; poll (10 s) until `e.svc.bgCtx.Err() != nil` — only then release; `Close` returns within 10 s; `Promotes().Last.State` is `failed`; every file of A is still in `Staging/`; `Archive/` holds no entries (no empty folder either); `Promote` afterwards → `ErrClosed` (pre-flight S7).
+- `TestPromoteCloseDropsQueue`: build this test's service with `NewService(Config{DB: e.db, PhotosRoot: e.photos, Locks: e.locks, Log: slog.New(slog.NewTextHandler(&buf, nil))})` (a mutex-guarded buffer) and its own `blockRename(A)`; A running, job 2 queued with B; start `Close()` in a goroutine; poll until the context is cancelled; release → `Close` returns; `Promotes().Queued` is empty; B's folder, row and files are untouched in `Staging/` and its locks are free; the log contains `dropped queued promotes`.
+- `TestPromoteProgressThrottled` (Review Focus 7): an existing target (merge mode) and 60 staged files → at most 8 `OnPromote` calls in all, and the last has `Last.FilesDone: 60`, `Last.State: done`.
 
 - [ ] **Step 2: Run them and confirm they fail**: `go test ./internal/staging/ -run Promote` → build failure.
 
-- [ ] **Step 3: Add the job fields to `Service`** (in `staging.go`):
+- [ ] **Step 3: Add the queue to `Service`** (in `staging.go`):
 
 ```go
-	pmu        sync.Mutex // guards the promote fields below
-	job        *PromoteJob
+	pmu        sync.Mutex // guards the promote fields below; take s.mu first when both are needed
+	queue      []*queuedJob
+	running    *queuedJob
+	last       *PromoteJob
 	jobSeq     int64
-	promoting  bool
-	promoteFn  func(PromoteJob)
+	working    bool // a worker goroutine is draining the queue
+	promoteFn  func(PromoteQueue)
 	lastReport time.Time
 ```
+
+and make `Close` drop the queue after cancelling: `s.bgCancel(); s.dropQueue(); s.wg.Wait()`.
+
+In `busyNamed` (Task 5, `ops.go`), after the name is filled in: `if busy.Holder == HolderPromote { busy.Queued = s.promoteQueued(busy.ID, busy.Name) }`.
 
 - [ ] **Step 4: Implement `internal/staging/promote.go`**
 
@@ -2732,7 +2982,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -2747,17 +2996,20 @@ const ArchiveDir = "Archive"
 // promoteReportEvery throttles promote.progress (Decision 14).
 const promoteReportEvery = 250 * time.Millisecond
 
-var ErrPromoteRunning = errors.New("staging: a promote is already running")
-
-const (
-	PromoteRunning = "running"
-	PromoteWaiting = "waiting"
-	PromoteMoving  = "moving"
-	PromoteDone    = "done"
-	PromoteFailed  = "failed"
+var (
+	ErrNoSuchJob  = errors.New("staging: no such promote job")
+	ErrJobStarted = errors.New("staging: that promote has already started or finished")
 )
 
-// …PromoteFolder and PromoteJob exactly as in Produces…
+// …the state constants, PromoteFolder, PromoteJob and PromoteQueue exactly as in Produces…
+
+// queuedJob is a job with its folders and their locks (one release per
+// folder: its id and its target's name).
+type queuedJob struct {
+	job      *PromoteJob
+	rows     []catalog.StagingFolder
+	releases []func()
+}
 
 func (j *PromoteJob) clone() PromoteJob {
 	c := *j
@@ -2765,41 +3017,69 @@ func (j *PromoteJob) clone() PromoteJob {
 	return c
 }
 
-// OnPromote registers fn to receive the job's progress. Call it before
-// serving. fn runs with the job's lock held and must not block.
-func (s *Service) OnPromote(fn func(PromoteJob)) {
+// OnPromote registers fn to receive the queue after every change. Call it
+// before serving. fn runs with the queue's lock held and must not block.
+func (s *Service) OnPromote(fn func(PromoteQueue)) {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
 	s.promoteFn = fn
 }
 
-// LastPromote returns the running or last promote job.
-func (s *Service) LastPromote() (PromoteJob, bool) {
+// Promotes returns the running job, the queue and the last finished job.
+func (s *Service) Promotes() PromoteQueue {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
-	if s.job == nil {
-		return PromoteJob{}, false
-	}
-	return s.job.clone(), true
+	return s.queueLocked()
 }
 
-// busyNamed fills a *BusyError's folder name from rows.
-func busyNamed(err error, rows []catalog.StagingFolder) error {
-	var busy *BusyError
-	if errors.As(err, &busy) {
-		for _, r := range rows {
-			if r.ID == busy.ID {
-				busy.Name = r.Name
+func (s *Service) queueLocked() PromoteQueue {
+	q := PromoteQueue{Queued: []PromoteJob{}}
+	if s.running != nil {
+		j := s.running.job.clone()
+		q.Running = &j
+	}
+	for _, qj := range s.queue {
+		q.Queued = append(q.Queued, qj.job.clone())
+	}
+	if s.last != nil {
+		j := s.last.clone()
+		q.Last = &j
+	}
+	return q
+}
+
+// promoteQueued reports whether folder id (or, for id 0, target name) is
+// held by a job still waiting in the queue, for the 409 message.
+func (s *Service) promoteQueued(id int64, name string) bool {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	for _, qj := range s.queue {
+		for _, f := range qj.job.Folders {
+			if (id != 0 && f.ID == id) || (id == 0 && strings.EqualFold(f.Target, name)) {
+				return true
 			}
 		}
 	}
-	return err
+	return false
 }
 
-// Promote checks the request, locks every folder and starts moving them
-// into Archive/<pattern> in the background (§8). Busy folders, a bad
-// pattern or another running promote fail the request before anything
-// moves. Each folder's lock is released as soon as it is done.
+// promoteTargets expands pattern for each row, as rel_paths under Archive/.
+func promoteTargets(pattern string, rows []catalog.StagingFolder) ([]string, error) {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		t, err := ExpandPattern(pattern, r)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = ArchiveDir + "/" + t
+	}
+	return out, nil
+}
+
+// Promote queues a job moving folders ids into Archive/<pattern> (§8,
+// Decision 9). The folders and their target names are locked now (holder
+// promote), so busy folders or a bad pattern fail the request before
+// anything is queued; jobs run one after another.
 func (s *Service) Promote(ctx context.Context, ids []int64, pattern string) (PromoteJob, error) {
 	ids = uniqueIDs(ids)
 	if len(ids) == 0 {
@@ -2809,46 +3089,44 @@ func (s *Service) Promote(ctx context.Context, ids []int64, pattern string) (Pro
 	if pattern == "" {
 		pattern = DefaultPattern
 	}
-	s.pmu.Lock()
-	if s.promoting {
-		s.pmu.Unlock()
-		return PromoteJob{}, ErrPromoteRunning
+	if s.isClosed() {
+		return PromoteJob{}, ErrClosed
 	}
-	s.promoting = true
-	s.pmu.Unlock()
-	started := false
-	defer func() {
-		if !started {
-			s.pmu.Lock()
-			s.promoting = false
-			s.pmu.Unlock()
-		}
-	}()
-
 	rows, err := s.rows(ctx, ids)
 	if err != nil {
 		return PromoteJob{}, err
 	}
-	releases, err := s.locks.TryLockEach(HolderOperation, ids...)
+	targets, err := promoteTargets(pattern, rows)
 	if err != nil {
-		return PromoteJob{}, busyNamed(err, rows)
+		return PromoteJob{}, err
 	}
+	groups := make([]LockSet, len(rows))
+	for i, row := range rows {
+		groups[i] = LockSet{IDs: []int64{row.ID}, Names: []string{targets[i]}}
+	}
+	releases, err := s.locks.TryLockGroups(HolderPromote, groups)
+	if err != nil {
+		return PromoteJob{}, s.busyNamed(err, rows)
+	}
+	queued := false
 	defer func() {
-		if !started {
+		if !queued {
 			for _, r := range releases {
 				r()
 			}
 		}
 	}()
-	if rows, err = s.rows(ctx, ids); err != nil { // again, under the locks
+	// Again under the locks: an operation that finished just before them may
+	// have renamed a folder, which would change its target.
+	again, err := s.rows(ctx, ids)
+	if err != nil {
 		return PromoteJob{}, err
 	}
-	job := &PromoteJob{State: PromoteRunning, Pattern: pattern, StartedAt: s.now(), Folders: make([]PromoteFolder, len(rows))}
-	for i, row := range rows {
-		target, err := ExpandPattern(pattern, row)
-		if err != nil {
-			return PromoteJob{}, err
-		}
+	if t2, err := promoteTargets(pattern, again); err != nil || !slices.Equal(t2, targets) {
+		return PromoteJob{}, errors.Join(ErrChanged, err)
+	}
+	job := &PromoteJob{State: PromoteQueued, Pattern: pattern, QueuedAt: s.now(), Folders: make([]PromoteFolder, len(again))}
+	for i, row := range again {
 		assets, err := s.db.AssetsUnder(ctx, prefixOf(row.Name), catalog.StateStaged)
 		if err != nil {
 			return PromoteJob{}, err
@@ -2857,38 +3135,102 @@ func (s *Service) Promote(ctx context.Context, ids []int64, pattern string) (Pro
 		for _, a := range assets {
 			bytes += a.Size
 		}
-		job.Folders[i] = PromoteFolder{ID: row.ID, Name: row.Name, Target: ArchiveDir + "/" + target, Files: len(assets), State: PromoteWaiting}
+		job.Folders[i] = PromoteFolder{ID: row.ID, Name: row.Name, Target: targets[i], Files: len(assets), State: PromoteWaiting}
 		job.FilesTotal += len(assets)
 		job.BytesTotal += bytes
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
 		return PromoteJob{}, ErrClosed
 	}
-	s.wg.Add(1)
-	s.mu.Unlock()
-	started = true
 	s.pmu.Lock()
+	defer s.pmu.Unlock()
 	s.jobSeq++
 	job.ID = s.jobSeq
-	s.job = job
-	snap := job.clone()
+	s.queue = append(s.queue, &queuedJob{job: job, rows: again, releases: releases})
+	queued = true
+	if !s.working {
+		s.working = true
+		s.wg.Add(1) // under s.mu with closed false, so Close waits for it
+		go s.promoteWorker()
+	}
 	s.reportLocked(true)
-	s.pmu.Unlock()
-	go func() {
-		defer s.wg.Done()
-		s.runPromote(rows, releases)
-	}()
-	return snap, nil
+	return job.clone(), nil
 }
 
-// updateJob changes the job under its lock and reports it (throttled
-// unless force).
+// CancelPromote drops queued job id and releases its folders and names. A
+// running or finished job is ErrJobStarted; an unknown id ErrNoSuchJob.
+func (s *Service) CancelPromote(id int64) (PromoteJob, error) {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	for i, qj := range s.queue {
+		if qj.job.ID != id {
+			continue
+		}
+		s.queue = slices.Delete(s.queue, i, i+1)
+		for _, r := range qj.releases {
+			r()
+		}
+		qj.job.State, qj.job.FinishedAt = PromoteCancelled, s.now()
+		s.reportLocked(true)
+		return qj.job.clone(), nil
+	}
+	if id > 0 && id <= s.jobSeq {
+		return PromoteJob{}, ErrJobStarted
+	}
+	return PromoteJob{}, ErrNoSuchJob
+}
+
+// dropQueue (from Close, after the context is cancelled) drops every queued
+// job: their folders stay in Staging untouched and their locks go.
+func (s *Service) dropQueue() {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	if len(s.queue) == 0 {
+		return
+	}
+	var names []string
+	for _, qj := range s.queue {
+		for _, r := range qj.releases {
+			r()
+		}
+		for _, f := range qj.job.Folders {
+			names = append(names, f.Name)
+		}
+	}
+	s.log.Warn("shutting down: dropped queued promotes; their folders stay in Staging", "jobs", len(s.queue), "folders", names)
+	s.queue = nil
+	s.reportLocked(true)
+}
+
+// promoteWorker runs queued jobs one after another until the queue is
+// empty or the service is closing.
+func (s *Service) promoteWorker() {
+	defer s.wg.Done()
+	for {
+		s.pmu.Lock()
+		if len(s.queue) == 0 || s.bgCtx.Err() != nil {
+			s.working = false
+			s.pmu.Unlock()
+			return
+		}
+		qj := s.queue[0]
+		s.queue = s.queue[1:]
+		s.running = qj
+		qj.job.State, qj.job.StartedAt = PromoteRunning, s.now()
+		s.reportLocked(true)
+		s.pmu.Unlock()
+		s.runPromote(qj)
+	}
+}
+
+// updateJob changes the running job under the queue's lock and reports
+// (throttled unless force).
 func (s *Service) updateJob(force bool, fn func(*PromoteJob)) {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
-	fn(s.job)
+	fn(s.running.job)
 	s.reportLocked(force)
 }
 
@@ -2899,20 +3241,20 @@ func (s *Service) reportLocked(force bool) {
 	}
 	s.lastReport = now
 	if s.promoteFn != nil {
-		s.promoteFn(s.job.clone())
+		s.promoteFn(s.queueLocked())
 	}
 }
 
-func (s *Service) runPromote(rows []catalog.StagingFolder, releases []func()) {
+func (s *Service) runPromote(qj *queuedJob) {
 	ctx := s.bgCtx
 	failed := false
-	for i, row := range rows {
+	for i, row := range qj.rows {
 		err := ctx.Err()
 		if err == nil {
 			s.updateJob(true, func(j *PromoteJob) { j.Folders[i].State = PromoteMoving })
 			err = s.promoteFolder(ctx, i, row, s.targetOf(i))
 		}
-		releases[i]()
+		qj.releases[i]()
 		s.changed()
 		if err != nil {
 			failed = true
@@ -2931,21 +3273,26 @@ func (s *Service) runPromote(rows []catalog.StagingFolder, releases []func()) {
 	}
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
-	s.job.State = PromoteDone
+	j := qj.job
+	j.State = PromoteDone
 	if failed {
-		s.job.State = PromoteFailed
+		j.State = PromoteFailed
 	}
-	s.job.FinishedAt = s.now()
-	s.promoting = false
+	j.FinishedAt = s.now()
+	s.last, s.running = j, nil
 	s.reportLocked(true)
 }
 
 func (s *Service) targetOf(i int) string {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
-	return s.job.Folders[i].Target
+	return s.running.job.Folders[i].Target
 }
+```
 
+`promoteFolder` (below) decides, at the folder's turn, between one rename (the target doesn't exist), a file-by-file merge (it does — for example created by hand while the job waited) and the cross-filesystem copy:
+
+```go
 // promoteFolder moves folder row to target (a rel_path under Archive/): one
 // rename when target doesn't exist, else file by file (Decision 3). Files
 // move on ctx, so shutdown stops between files; the catalog is written on
@@ -3002,8 +3349,9 @@ func (s *Service) promoteFolder(ctx context.Context, i int, row catalog.StagingF
 		if !crossDevice(err) {
 			return err
 		}
-		// moveFile creates the target folders as files arrive, so a stop
-		// before the first file leaves nothing behind in Archive/.
+		// moveFile creates the target folders as files arrive and checks the
+		// context first, so a stop before the first file leaves nothing in
+		// Archive/.
 		s.updateJob(false, func(j *PromoteJob) { j.Folders[i].Copied = true })
 	case err != nil:
 		return err
@@ -3013,36 +3361,21 @@ func (s *Service) promoteFolder(ctx context.Context, i int, row catalog.StagingF
 	return s.promoteFiles(ctx, i, row, present, dst, touched)
 }
 
-// promoteFiles moves every file of row, catalogued or not, to the same path
-// inside dst (collision loop; EXDEV → copy, verify, delete), then removes
+// promoteFiles moves every file of row to the same path inside dst
+// (moveTree: collision loop; EXDEV → copy, verify, delete), then removes
 // the emptied staging folder and its row.
 func (s *Service) promoteFiles(ctx context.Context, i int, row catalog.StagingFolder, present map[string]catalog.Asset, dst string, touched map[string]bool) error {
 	dbctx := context.WithoutCancel(ctx)
 	src := s.folderDir(row.Name)
-	files, err := folderFiles(src)
-	if err != nil {
-		return err
-	}
-	for _, rel := range files {
-		a, tracked := present[rel]
-		from := filepath.Join(src, filepath.FromSlash(rel))
-		to, err := s.moveFile(ctx, from, filepath.Join(dst, filepath.FromSlash(path.Dir(rel))), path.Base(rel), a.SHA256)
-		if err != nil {
+	err := s.moveTree(ctx, src, dst, present, touched, func(a catalog.Asset, newRel string) error {
+		if err := s.db.ArchiveAsset(dbctx, a.SHA256, newRel, s.now()); err != nil {
 			return err
 		}
-		touched[filepath.Dir(from)], touched[filepath.Dir(to)] = true, true
-		if !tracked {
-			continue
-		}
-		newRel, err := s.relOf(to)
-		if err == nil {
-			err = s.db.ArchiveAsset(dbctx, a.SHA256, newRel, s.now())
-		}
-		if err != nil {
-			return fmt.Errorf("moved %s but could not record it: %w", rel, err)
-		}
-		size := a.Size
-		s.updateJob(false, func(j *PromoteJob) { j.Folders[i].Done++; j.FilesDone++; j.BytesDone += size })
+		s.updateJob(false, func(j *PromoteJob) { j.Folders[i].Done++; j.FilesDone++; j.BytesDone += a.Size })
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	gone, kept, err := removeEmptyTree(src)
 	if err != nil {
@@ -3058,7 +3391,7 @@ func (s *Service) promoteFiles(ctx context.Context, i int, row catalog.StagingFo
 }
 ```
 
-Make `lockRows` (Task 5) use `busyNamed` too, so the name-filling lives in one place.
+Lock order: `s.mu` before `s.pmu` (only `Promote` takes both), and the folder locks' own mutex is only ever taken inside either (`CancelPromote` and `dropQueue` release locks under `s.pmu`; nothing takes `s.pmu` while holding the locks' mutex).
 
 - [ ] **Step 5: Run the tests, the full set and the race run**: `go test ./internal/staging/` → PASS; `gofmt -l .`, `go vet ./...`, `go test ./...`, the Linux command and the **race** command → PASS.
 
@@ -3066,7 +3399,7 @@ Make `lockRows` (Task 5) use `busyNamed` too, so the name-filling lives in one p
 
 ```bash
 git add internal/staging/
-git commit -m "Promote staging folders into the archive as a background job
+git commit -m "Queue promotes of staging folders into the archive
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3079,9 +3412,10 @@ Suggested implementer: sonnet (reviewer: opus — data safety).
 
 **Files:**
 - Create: `internal/staging/reconcile.go`, `internal/staging/reconcile_test.go`
+- Modify: `internal/staging/staging.go` (the `afterHash` test seam on `Service`)
 
 **Interfaces:**
-- Consumes: `RescanResult`, `Status` (Task 4); `cullGone`, `prefixOf`, `unionDates` (Task 5); `folderFiles`, `hashFile`, `safeName` (Task 4); `diskFolders` (M3); `catalog.DB.CreateStagingFolder`, `InsertAsset`, `AssetBySHA`, `MoveAsset`, `RestageAsset`, `AddFingerprint`, `SetStagingFolderInfo`, `DeleteStagingFolder`, `AssetsUnder`, `Settings`; `media.QuickFingerprint`, `media.CaptureTime`, `media.FolderDate`; test fixtures from `internal/media/mediatest` (`JPEG`, `ExifSpec`).
+- Consumes: `RescanResult`, `Status` (Task 4); `LockSet`, `TryLockSet` (Task 3); `cullGone`, `prefixOf`, `unionDates` (Task 5); `waitEntered` (Task 7's test helpers); `folderFiles`, `hashFile`, `safeName` (Task 4); `diskFolders` (M3); `catalog.DB.CreateStagingFolder`, `InsertAsset`, `AssetBySHA`, `MoveAsset`, `RestageAsset`, `AddFingerprint`, `SetStagingFolderInfo`, `DeleteStagingFolder`, `AssetsUnder`, `Settings`; `media.QuickFingerprint`, `media.CaptureTime`, `media.FolderDate`; test fixtures from `internal/media/mediatest` (`JPEG`, `ExifSpec`).
 - Produces:
 
 ```go
@@ -3103,6 +3437,7 @@ func (s *Service) StartRescan() bool                                    // runs 
 - `TestReconcileIgnoresPartialsAndOtherFiles`: `x.JPG.partial`, `readme.txt` and a file directly in `Staging/` → nothing added.
 - `TestReconcileSkipsFileBeingWritten`: set the unexported hook `e.svc.afterHash` (nil in production; see Step 3) to append a byte to the file it is given, as an SMB copy still running would → the file is not added, and `Errors` mentions "changed while it was read"; with the hook removed, the next pass adds it.
 - `TestReconcileNoChangesNoBump`: a second pass on a reconciled tree → nothing changed, `changed()` not called (version unchanged).
+- `TestRescanDoesNotAdoptDirectoryBeingRenamed` (pre-flight D2, Review Focus 1): set `e.svc.rename` to a seam that calls `os.Rename`, then closes `entered` and waits for `release` before returning (so the directory already has its new name while the catalog doesn't yet); start `Rename(f, "Trip")` in a goroutine; `waitEntered`; `Reconcile` → `AdoptedFolders 0`, `BusyFolders 1` (the name key), no row named `2025-05-30 - Trip`; release → `Rename` succeeds and `StagingFolders` holds exactly one row, `2025-05-30 - Trip`, with its files; a second `Reconcile` changes nothing.
 - `TestStartRescan`: `StartRescan()` → true; `Status().Rescanning` true until it finishes (poll until false, 10 s); then `LastRescan` is set, and `OnChange` saw a status with `Rescanning: true` and a later one with `false` and `LastRescan`. After `Close`, `StartRescan()` → false.
 
 - [ ] **Step 2: Run them and confirm they fail**: `go test ./internal/staging/ -run 'Reconcile|Rescan'` → build failure.
@@ -3179,17 +3514,29 @@ func (s *Service) reconcile(ctx context.Context, r *RescanResult) error {
 	for _, row := range rows {
 		known[row.Name] = true
 	}
+	busyNames := 0
 	for _, name := range slices.Sorted(maps.Keys(onDisk)) {
 		if known[name] {
 			continue
+		}
+		// An operation renaming or creating this directory holds its name
+		// until the catalog knows it (pre-flight D2): leave it for next time.
+		release, err := s.locks.TryLockSet(HolderRescan, LockSet{Names: []string{Dir + "/" + name}})
+		if errors.Is(err, ErrBusy) {
+			busyNames++
+			continue
+		}
+		if err != nil {
+			return err
 		}
 		var dates []string
 		if d, _ := SplitName(name); d != "" {
 			dates = []string{d}
 		}
 		row, err := s.db.CreateStagingFolder(ctx, name, dates, s.now())
+		release()
 		if errors.Is(err, catalog.ErrNameTaken) {
-			continue // an import created it meanwhile
+			continue // an import or an operation recorded it meanwhile
 		}
 		if err != nil {
 			return err
@@ -3218,7 +3565,7 @@ func (s *Service) reconcile(ctx context.Context, r *RescanResult) error {
 	if err := s.reconcileOrphans(ctx, r); err != nil {
 		return err
 	}
-	r.BusyFolders = len(busy)
+	r.BusyFolders = len(busy) + busyNames
 	return nil
 }
 
@@ -3409,8 +3756,12 @@ func (s *Service) reconcileRemovals(ctx context.Context, row catalog.StagingFold
 	if errors.Is(err, catalog.ErrNotFound) {
 		return nil
 	}
-	if err != nil || safeName(row.Name) != nil {
+	if err != nil {
 		return err
+	}
+	if err := safeName(row.Name); err != nil {
+		r.errorf("%v", err) // the additions pass reported it too; skipped either way
+		return nil
 	}
 	assets, err := s.db.AssetsUnder(ctx, prefixOf(row.Name), catalog.StateStaged)
 	if err != nil {
@@ -3607,7 +3958,7 @@ Suggested implementer: sonnet (reviewer: opus — destructive).
 ```go
 // package catalog
 func (d *DB) IngestAssets(ctx context.Context, ingestID int64) ([]Asset, error)   // first_ingest = id, or named by one of its ingest_files rows; by sha
-func (d *DB) ForgetAssets(ctx context.Context, shas []string) ([]string, error)    // deletes staged|culled ones (+ fingerprints, aliases, clock warnings); returns those deleted
+func (d *DB) ForgetAssets(ctx context.Context, shas []string, states []AssetState) ([]string, error) // deletes those in states (only staged and/or culled are allowed) + fingerprints, aliases, clock warnings; returns those deleted
 func (d *DB) CulledSeenBefore(ctx context.Context, ingestID int64) ([]string, error) // its seen_before files whose asset is still culled, sorted
 
 // package ingest
@@ -3638,19 +3989,32 @@ func (s *Service) ForgetCulled(ctx context.Context, ingestID int64) (int, error)
 
 - [ ] **Step 1: Write the failing catalog tests** in `internal/catalog/forget_test.go`. Fixture: ingest 1 (done) with `RecordNew` of staged A and B (outcome new), an `ingest_files` row `seen_before` naming culled asset C, one `in_archive` naming archived asset D, one `in_staging` naming staged E whose `first_ingest` is another ingest 2, and one `failed` row without a hash; a clock warning for A; an alias row whose target is B.
 - `TestIngestAssets`: ingest 1 → A, B, C, D, E (sorted by hash, each once); ingest 2 → E; ingest 99 → empty.
-- `TestForgetAssets` (Review Focus 6): `ForgetAssets([A, B, C, D, unknown])` returns `[A, B, C]` (in the given order); A, B, C are `ErrNotFound`; `AssetsByFingerprint` of their fingerprints is empty; the alias to B and A's clock warning are gone; D is unchanged (archived is never forgotten); the `ingest_files` rows are all still there. A bad hash → `ErrBadHash`, nothing deleted (transaction).
+- `TestForgetAssets` (Review Focus 6): `ForgetAssets([A, B, C, D, unknown], [staged, culled])` returns `[A, B, C]` (in the given order); A, B, C are `ErrNotFound`; `AssetsByFingerprint` of their fingerprints is empty; the alias to B and A's clock warning are gone; D is unchanged (archived is never forgotten); the `ingest_files` rows are all still there. A bad hash → `ErrBadHash`, nothing deleted (transaction). With states `[culled]` only C goes (A and B stay: pre-flight D7). States including `archived` or `missing` → an error, nothing deleted.
 - `TestCulledSeenBefore`: ingest 1 → `[C]`; after `RestageAsset(C)` → empty.
 
 - [ ] **Step 2: Write the failing manager test** in `internal/ingest/manager_test.go`:
 - `TestManagerExclusive`: idle → `Exclusive()` succeeds; a second `Exclusive()` also succeeds (holds nest); `Submit` the SONY card → it stays queued (`Current()` running nil, queued 1) and isn't done within 200 ms (named negative check); `Exclusive()` now fails with `ErrBusy` (queued); release both holds (releasing twice is harmless) → `waitDone`. Then `started, release := gate(e)`, submit the GOPRO card, `waitStarted` → `Exclusive()` fails with `ErrBusy` (running); `release()`; `waitDone`; idle again → `Exclusive()` succeeds.
 
-- [ ] **Step 3: Write the failing staging tests** in `internal/staging/forget_test.go` (`newOpsEnv`). Helper `importOf(t, e, files ...)` creates a finished ingest whose `RecordNew` rows stage the given files into folder `2025-05-30` (written with `e.write`), plus optional culled/archived rows linked by `AddIngestFiles`.
+- [ ] **Step 3: Write the failing staging tests** in `internal/staging/forget_test.go` (`newOpsEnv`). Helper (concrete, pre-flight S16):
+
+```go
+// importOf records a finished ingest that staged files (path inside folder
+// 2025-05-30 → content; written with e.write and recorded with RecordNew,
+// outcome new) and saw culled and archived ones (assets inserted directly
+// in that state, linked by AddIngestFiles rows with outcome seen_before and
+// in_archive). It returns the ingest id, the folder, and the hashes of
+// each group in the order given.
+func importOf(t *testing.T, e *opsEnv, staged map[string]string, culled, archived []string) (id int64, folder catalog.StagingFolder, stagedSHAs, culledSHAs, archivedSHAs []string)
+```
+
+(Iterate `staged` in sorted key order so the hashes come back in a stable order.)
 - `TestForgetSummary`: 2 staged (sizes 3 and 5), 1 culled seen-before, 1 archived → `{Staged: 2, StagedBytes: 8, Culled: 1, Archived: 1, Reimportable: 1}`.
 - `TestForgetDeletesFiles`: `Forget(id, true)` → both staged files gone from disk; A, B, C rows gone; D kept; `DeletedFiles 2`, `Forgotten 3`, `KeptArchived 1`; the folder's directory and row removed (`Removed == [id]`); the ingest's `ForgottenAt` set; hashes reported through `Removed`; version up.
 - `TestForgetKeepsFiles`: `Forget(id, false)` → rows gone, files still on disk, the folder row stays, `DeletedFiles 0`.
 - `TestForgetRefuses`: a running ingest → `ErrIngestRunning`; a forgotten one → `ErrAlreadyForgotten`; id 99 → `catalog.ErrNotFound`.
 - `TestForgetBusyFolder`: the folder held by an import → `*BusyError`, nothing deleted, ingest not marked.
-- `TestForgetCulled`: → 1; C is gone; nothing on disk changed; a second call → 0.
+- `TestForgetCulled`: → 1; C is gone; nothing on disk changed; a second call → 0. (That a staged asset is never forgotten here is pinned by `TestForgetAssets`' culled-only case.)
+- `TestForgetBusyPromote`: a folder of the import queued for promote (`e.locks.TryLock(HolderPromote, id)` stands in) → `*BusyError{Holder: HolderPromote}`, nothing changed.
 
 - [ ] **Step 4: Run them and confirm they fail**: `go test ./internal/catalog/ ./internal/ingest/ ./internal/staging/` → build failures.
 
@@ -3693,12 +4057,20 @@ func (d *DB) IngestAssets(ctx context.Context, ingestID int64) ([]Asset, error) 
 	return out, nil
 }
 
-// ForgetAssets deletes the staged or culled assets among shas, with their
+// ForgetAssets deletes the assets among shas whose state is in states
+// (staged and/or culled; anything else is refused), with their
 // fingerprints, aliases and clock warnings, in one transaction, so a card
 // holding that content imports it as new again (§8 "Forget an import").
 // Archived and missing assets are never deleted; unknown hashes are
 // skipped. It returns the hashes it deleted, in the order given.
-func (d *DB) ForgetAssets(ctx context.Context, shas []string) ([]string, error) {
+func (d *DB) ForgetAssets(ctx context.Context, shas []string, states []AssetState) ([]string, error) {
+	allowed := map[string]bool{}
+	for _, st := range states {
+		if st != StateStaged && st != StateCulled {
+			return nil, fmt.Errorf("forget assets: %s assets are never forgotten", st)
+		}
+		allowed[string(st)] = true
+	}
 	var out []string
 	err := d.tx(ctx, func(tx *sql.Tx) error {
 		out = nil
@@ -3715,7 +4087,7 @@ func (d *DB) ForgetAssets(ctx context.Context, shas []string) ([]string, error) 
 			if err != nil {
 				return err
 			}
-			if state != string(StateStaged) && state != string(StateCulled) {
+			if !allowed[state] {
 				continue
 			}
 			for _, q := range []string{
@@ -3909,25 +4281,15 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 	}
 	defer release()
 	defer s.changed()
-	touched := map[string]bool{}
-	if deleteFiles {
-		for _, a := range staged {
-			p := s.abs(a.RelPath)
-			if !strings.HasPrefix(a.RelPath, Dir+"/") {
-				continue // never delete outside Staging/
-			}
-			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return res, fmt.Errorf("deleted %d files of the import: %w", res.DeletedFiles, err)
-			}
-			touched[filepath.Dir(p)] = true
-			res.DeletedFiles++
-		}
-	}
+	// The rows go first, then the files (pre-flight D6): a delete that fails
+	// half way then leaves untracked files (harmless: the next import of the
+	// card or a rescan picks them up), never staged rows that a rescan would
+	// cull, which would keep the card from bringing them back.
 	shas := make([]string, len(forget))
 	for i, a := range forget {
 		shas[i] = a.SHA256
 	}
-	gone, err := s.db.ForgetAssets(ctx, shas)
+	gone, err := s.db.ForgetAssets(ctx, shas, []catalog.AssetState{catalog.StateStaged, catalog.StateCulled})
 	if err != nil {
 		return res, err
 	}
@@ -3936,7 +4298,19 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 	if err := s.db.MarkIngestForgotten(ctx, ingestID, s.now()); err != nil {
 		return res, err
 	}
+	touched := map[string]bool{}
 	if deleteFiles {
+		for _, a := range staged {
+			p := s.abs(a.RelPath)
+			if !strings.HasPrefix(a.RelPath, Dir+"/") {
+				continue // never delete outside Staging/
+			}
+			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return res, fmt.Errorf("forgot the import but deleted only %d of its files: %w", res.DeletedFiles, err)
+			}
+			touched[filepath.Dir(p)] = true
+			res.DeletedFiles++
+		}
 		for _, row := range rows {
 			removed, err := s.dropIfEmpty(ctx, row, touched)
 			if err != nil {
@@ -3966,7 +4340,9 @@ func (s *Service) ForgetCulled(ctx context.Context, ingestID int64) (int, error)
 	if err != nil {
 		return 0, err
 	}
-	gone, err := s.db.ForgetAssets(ctx, shas)
+	// Culled only: a rescan may have restaged one of them meanwhile, and a
+	// staged asset must not be forgotten here (pre-flight D7).
+	gone, err := s.db.ForgetAssets(ctx, shas, []catalog.AssetState{catalog.StateCulled})
 	if err != nil {
 		return 0, err
 	}
@@ -3997,7 +4373,7 @@ Suggested implementer: sonnet (reviewer: opus — the 409 mapping and events).
 - Create: `internal/api/stagingops_test.go`
 
 **Interfaces:**
-- Consumes: `staging.Service` and its `Rename`, `Merge`, `Move`, `Cull`, `Discard`, `Status`, `OnChange`, `Touch`, `Close`, `NewService`, `Config`, `NewLocks`, `BusyError`, `Holder*`, `ErrBad*`, `ErrChanged`, `ErrPromoteRunning`, `ErrIngestRunning`, `ErrAlreadyForgotten`, `ErrClosed`, `Reconcile` (tests); `catalog.ErrNameTaken`, `ErrNotFound`; `ingest.ErrBusy`, `ingest.Config.Locks`; existing `writeJSON`, `writeError`, `positiveInt`, `Server.addFinishedHook`, `s.hub`, `s.closers`; test helpers `newFullServer`, `post`, `cardBody`, `decodeInto`, `wantJSONError`, `pollUntil`, `getFull`, `writeJPEG` (thumbs_test.go), `thumbPath`, `sseFrames`, `nextFrame`, `eventsServer`.
+- Consumes: `staging.Service` and its `Rename`, `Merge`, `Move`, `Cull`, `Discard`, `Status`, `OnChange`, `Touch`, `Close`, `NewService`, `Config`, `NewLocks`, `BusyError` (with `Queued`), `Holder*`, `ErrBad*`, `ErrChanged`, `ErrJobStarted`, `ErrNoSuchJob`, `ErrIngestRunning`, `ErrAlreadyForgotten`, `ErrClosed`, `Reconcile` (tests); `catalog.ErrNameTaken`, `ErrNotFound`; `ingest.ErrBusy`, `ingest.Config.Locks`; existing `writeJSON`, `writeError`, `positiveInt`, `Server.addFinishedHook`, `s.hub`, `s.closers`; test helpers `newFullServer`, `post`, `cardBody`, `decodeInto`, `wantJSONError`, `pollUntil`, `getFull`, `writeJPEG` (thumbs_test.go), `thumbPath`, `sseFrames`, `nextFrame`, `eventsServer`.
 - Produces:
 
 ```go
@@ -4005,7 +4381,7 @@ Suggested implementer: sonnet (reviewer: opus — the 409 mapping and events).
 const EventStagingChanged = "staging.changed"
 // MountStaging(svc) now also registers PATCH/DELETE /api/staging/{id}, POST /api/staging/merge|move|cull,
 // the staging.changed snapshot and publisher, a finished-ingest hook calling svc.Touch, and svc.Close as a closer.
-// Unexported, used by Task 12: writeOpError(w, log, what, err), decodeBody(w, r, v, max), opError.
+// Unexported, used by Task 12: writeOpError(w, log, subject, what, err), decodeBody(w, r, v, limit), opError, busyMessage, collectFrames (test).
 
 // package thumbs
 func (c *Cache) Remove(sha string) error // deletes sha's cached thumbnail and preview; missing files are fine
@@ -4051,7 +4427,15 @@ func (c *Cache) Remove(sha string) error {
 
 ```go
 // send makes a guarded request (X-SD2NAS: 1) with an optional JSON body.
+// (For the one request without the header, build it with
+// httptest.NewRequest directly: pre-flight S17.)
 func send(t *testing.T, s *Server, method, url, body string) *httptest.ResponseRecorder { … }
+
+// collectFrames subscribes to s's hub and drains it in the background, so
+// a burst of events never fills the 16-frame buffer and drops the test
+// (pre-flight E8); frames returns what has arrived so far. It unsubscribes
+// at cleanup.
+func collectFrames(t *testing.T, s *Server) (frames func() []string) { … }
 
 // ingested runs the SONY card import and returns its one folder.
 func ingested(t *testing.T, f fullServer) staging.Folder { … POST ?wait=1, then GET /api/staging … }
@@ -4061,14 +4445,15 @@ func wantCode(t *testing.T, rec *httptest.ResponseRecorder, status int, code str
 ```
 
 Tests:
-- `TestStagingRenameAPI`: `PATCH /api/staging/{id}` `{"title":"Trip"}` → 200, `folder.name` `2025-05-30 - Trip`; `GET /api/staging` lists that name; the files are on disk under it. `{}` → 400 (title required); `{"title":"a/b"}` → 400; `{"title":"x","extra":1}` → 400; `PATCH /api/staging/999` → 404; `PATCH /api/staging/abc` → 400; without `X-SD2NAS` → 403 (the guard).
+- `TestStagingRenameAPI`: `PATCH /api/staging/{id}` `{"title":"Trip"}` → 200, `folder.name` `2025-05-30 - Trip`; `GET /api/staging` lists that name; the files are on disk under it. `{}` → 400 (title required); `{"title":"a/b"}` → 400; `{"title":"x","extra":1}` → 400; `PATCH /api/staging/999` → 404; `PATCH /api/staging/abc` → 400; a 400's `error` is a plain sentence (e.g. starts with `The title contains`, no `staging:` prefix); 404's is `That folder no longer exists.`; without `X-SD2NAS` (a request built with `httptest.NewRequest`) → 403 (the guard).
 - `TestStagingRenameBusy409` (Review Focus 1): `f.locks.TryLock(staging.HolderIngest, id)` held → PATCH → 409, `Content-Type: application/json`, `code` `folder_busy`, `holder` `ingest`, `folder_id` id, `error` exactly `2025-05-30 is being imported into. Try again when the import finishes.`; with `HolderOperation` held → the "busy with another change" message.
-- `TestStagingRenameNameTaken`: an untracked `Staging/2025-05-30 - Trip/` directory → PATCH `{"title":"Trip"}` → 409 `name_taken`.
+- `TestBusyMessages`: `busyMessage` for each holder — ingest, operation, rescan, promote with `Queued: true` (`2025-05-30 is waiting to be promoted.`) and with `Queued: false` (`2025-05-30 is being promoted.`) — matches the Global Constraints verbatim; a name key (`ID: 0`) gives no `folder_id` in the JSON body.
+- `TestStagingRenameNameTaken`: an untracked `Staging/2025-05-30 - Trip/` directory → PATCH `{"title":"Trip"}` → 409 `name_taken` with `error` exactly `A folder with that name already exists in Staging. Pick another title.`
 - `TestStagingMergeAPI`: write a JPEG (`writeJPEG`) at `Staging/2025-06-01 - Beach/a.JPG`, `f.svc.Reconcile(ctx)` adopts it → `POST /api/staging/merge` `{"ids":[A,B],"title":"Trip"}` → 200 `folder.name` `2025-05-30 - Trip`, 3 files; the listing has one folder. `{"ids":[A]}` → 400.
 - `TestStagingMoveAndCullAPI`: `GET …/files` → the JPG and ARW hashes; `POST /api/staging/move` `{"fileShas":[arw],"newTitle":"Raw"}` → 200, `folder.name` `2025-05-30 - Raw`, `moved` 1, `removed` []; fetch `/api/thumbs/{jpg}` (creates the cache file), then `POST /api/staging/cull` `{"fileShas":[jpg]}` → 200 `{"culled":1,"removed":[A]}` (A emptied), and the JPG's cache file is gone (`thumbPath`). Move with both `toId` and `newTitle`, or neither → 400; a `fileShas` entry `"nope"` → 400; an unknown hash → 400; 20001 hashes → 400; a body over 4 MiB → 400.
 - `TestStagingDiscardAPI`: `DELETE /api/staging/{id}` → 200 `{"culled":2,"removed":true,"kept":[]}`; then `GET …/files` → 404; with an untracked `notes.txt` in a second folder → `removed:false`, `kept:["notes.txt"]`.
-- `TestStagingChangedEvent` (Review Focus 7): `ch, unsub := f.s.hub.subscribe()`; PATCH → a frame `event: staging.changed` whose data has a `version` greater than the listing's `version` before the PATCH, `rescanning:false`; and over real HTTP (`eventsServer` + `sseFrames`) the connect snapshot includes a `staging.changed` frame with the current version.
-- `TestStagingTouchedWhenImportFinishes`: subscribe, then `POST /api/ingest?wait=1` → a `staging.changed` frame arrives within 10 s (the feed's finished hook).
+- `TestStagingChangedEvent` (Review Focus 7): `frames := collectFrames(t, f.s)`; PATCH → a frame `event: staging.changed` whose data has a `version` greater than the listing's `version` before the PATCH, `rescanning:false`; and over real HTTP (`eventsServer` + `sseFrames`) the connect snapshot includes a `staging.changed` frame with the current version.
+- `TestStagingTouchedWhenImportFinishes`: `collectFrames`, then `POST /api/ingest?wait=1` → a `staging.changed` frame arrives within 10 s (the feed's finished hook).
 
 - [ ] **Step 4: Run them and confirm they fail**: `go test ./internal/api/ -run 'Staging'` → failures (405/404 for the new routes).
 
@@ -4076,7 +4461,7 @@ Tests:
 
 In `events.go` add `EventStagingChanged = "staging.changed"` to the constants (and update the comment above them).
 
-In `staging.go` (imports gain `context`, `encoding/json`, `strings` and `internal/ingest`):
+In `staging.go` (imports gain `context`, `encoding/json`, `strings`, `unicode`, `unicode/utf8` and `internal/ingest`):
 
 ```go
 type stagingHandlers struct {
@@ -4128,32 +4513,57 @@ func busyMessage(b *staging.BusyError) string {
 		return name + " is being imported into. Try again when the import finishes."
 	case staging.HolderRescan:
 		return name + " is being rescanned. Try again in a moment."
+	case staging.HolderPromote:
+		if b.Queued {
+			return name + " is waiting to be promoted."
+		}
+		return name + " is being promoted."
 	}
 	return name + " is busy with another change. Try again in a moment."
 }
 
-// writeOpError answers a failed staging operation; only unexpected
-// failures are logged.
-func writeOpError(w http.ResponseWriter, log *slog.Logger, what string, err error) {
+// plainReason turns a 400 error into a sentence for the UI: the text after
+// the last staging sentinel ("staging: bad folder title: "), capitalised,
+// with a full stop (pre-flight D8).
+func plainReason(err error) string {
+	msg := err.Error()
+	for _, sentinel := range []error{staging.ErrBadTitle, staging.ErrBadPattern, staging.ErrBadRequest} {
+		if i := strings.LastIndex(msg, sentinel.Error()+": "); i >= 0 {
+			msg = msg[i+len(sentinel.Error())+2:]
+		}
+	}
+	r, size := utf8.DecodeRuneInString(msg)
+	msg = string(unicode.ToUpper(r)) + msg[size:]
+	if !strings.HasSuffix(msg, ".") {
+		msg += "."
+	}
+	return msg
+}
+
+// writeOpError answers a failed staging operation on subject (folder,
+// import) with a plain sentence; only unexpected failures are logged.
+func writeOpError(w http.ResponseWriter, log *slog.Logger, subject, what string, err error) {
 	var busy *staging.BusyError
 	conflict := func(code, msg string) { writeJSON(w, http.StatusConflict, opError{Error: msg, Code: code}) }
 	switch {
 	case errors.As(err, &busy):
 		writeJSON(w, http.StatusConflict, opError{Error: busyMessage(busy), Code: "folder_busy", FolderID: busy.ID, Holder: string(busy.Holder)})
 	case errors.Is(err, catalog.ErrNameTaken):
-		conflict("name_taken", err.Error())
+		conflict("name_taken", "A folder with that name already exists in Staging. Pick another title.")
 	case errors.Is(err, staging.ErrChanged):
 		conflict("changed", "Some files moved while you were choosing. Reload and try again.")
-	case errors.Is(err, staging.ErrPromoteRunning):
-		conflict("promote_running", "Another promote is running. Wait for it to finish.")
+	case errors.Is(err, staging.ErrJobStarted):
+		conflict("promote_started", "That promote has already started or finished, so it can't be cancelled.")
 	case errors.Is(err, staging.ErrIngestRunning), errors.Is(err, ingest.ErrBusy):
 		conflict("ingest_running", "An import is running or waiting. Try again when it finishes.")
 	case errors.Is(err, staging.ErrAlreadyForgotten):
 		conflict("already_forgotten", "This import was already forgotten.")
+	case errors.Is(err, staging.ErrNoSuchJob):
+		writeError(w, http.StatusNotFound, "That promote no longer exists.")
 	case errors.Is(err, catalog.ErrNotFound):
-		writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, "That "+subject+" no longer exists.")
 	case errors.Is(err, staging.ErrBadTitle), errors.Is(err, staging.ErrBadPattern), errors.Is(err, staging.ErrBadRequest):
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, plainReason(err))
 	case errors.Is(err, staging.ErrClosed):
 		writeError(w, http.StatusServiceUnavailable, "SD2NAS is shutting down")
 	default:
@@ -4162,10 +4572,10 @@ func writeOpError(w http.ResponseWriter, log *slog.Logger, what string, err erro
 	}
 }
 
-// decodeBody reads a JSON body of at most max bytes into v, refusing
+// decodeBody reads a JSON body of at most limit bytes into v, refusing
 // unknown fields and trailing data.
-func decodeBody(w http.ResponseWriter, r *http.Request, v any, max int64) error {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, max))
+func decodeBody(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("bad request body: %w", err)
@@ -4207,7 +4617,7 @@ func (h *stagingHandlers) rename(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := h.svc.Rename(opContext(r), id, *body.Title)
 	if err != nil {
-		writeOpError(w, h.log, "rename staging folder", err)
+		writeOpError(w, h.log, "folder", "rename staging folder", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"folder": f})
@@ -4220,7 +4630,7 @@ func (h *stagingHandlers) discard(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := h.svc.Discard(opContext(r), id)
 	if err != nil {
-		writeOpError(w, h.log, "discard staging folder", err)
+		writeOpError(w, h.log, "folder", "discard staging folder", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -4237,7 +4647,7 @@ func (h *stagingHandlers) merge(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := h.svc.Merge(opContext(r), body.IDs, body.Title)
 	if err != nil {
-		writeOpError(w, h.log, "merge staging folders", err)
+		writeOpError(w, h.log, "folder", "merge staging folders", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"folder": f})
@@ -4273,7 +4683,7 @@ func (h *stagingHandlers) move(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := h.svc.Move(opContext(r), req)
 	if err != nil {
-		writeOpError(w, h.log, "move staged files", err)
+		writeOpError(w, h.log, "folder", "move staged files", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -4289,7 +4699,7 @@ func (h *stagingHandlers) cull(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := h.svc.Cull(opContext(r), body.FileShas)
 	if err != nil {
-		writeOpError(w, h.log, "cull staged files", err)
+		writeOpError(w, h.log, "folder", "cull staged files", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -4358,12 +4768,13 @@ Suggested implementer: sonnet (reviewer: opus).
 - Create: `internal/api/forget.go`, `internal/api/promote_test.go`, `internal/api/forget_test.go`
 
 **Interfaces:**
-- Consumes: Task 11's `writeOpError`, `decodeBody`, `opContext`, `stagingHandlers`; `staging.Service.Promote`, `LastPromote`, `OnPromote`, `StartRescan`, `ForgetSummary`, `Forget`, `ForgetCulled`; `ingest.Manager.Exclusive`, `Submit`, `ErrBadCardPath`, `CardName`; `viewOf`, `ingestView`, `s.feed` (`watch`).
+- Consumes: Task 11's `writeOpError`, `decodeBody`, `opContext`, `stagingHandlers`, `collectFrames`; `staging.Service.Promote`, `CancelPromote`, `Promotes`, `OnPromote`, `PromoteQueue`, `HolderPromote`, `StartRescan`, `ForgetSummary`, `Forget`, `ForgetCulled`; `ingest.Manager.Exclusive`, `Submit`, `ErrBadCardPath`, `CardName`; `viewOf`, `ingestView`, `s.feed` (`watch`).
 - Produces:
 
 ```go
 const EventPromoteProgress = "promote.progress"
-// MountStaging also registers POST/GET /api/staging/promote and POST /api/staging/rescan, and the promote.progress snapshot/publisher.
+// MountStaging also registers POST/GET /api/staging/promote, DELETE /api/staging/promote/{jobId} and POST /api/staging/rescan,
+// and the promote.progress snapshot/publisher (data: the PromoteQueue).
 // MountForget registers GET/POST /api/ingest/{id}/forget and POST /api/ingest/{id}/reimport-culled. Call it after MountIngest.
 func (s *Server) MountForget(m *ingest.Manager, db *catalog.DB, svc *staging.Service)
 ```
@@ -4371,10 +4782,11 @@ func (s *Server) MountForget(m *ingest.Manager, db *catalog.DB, svc *staging.Ser
 - [ ] **Step 1: Write the failing tests.** In `full_test.go`, `newFullServer` also calls `s.MountForget(m, db, svc)`.
 
 `promote_test.go`:
-- `TestPromoteAPI` (Review Focus 5, 7): subscribe to the hub; ingest; `POST /api/staging/promote` `{"ids":[id],"pattern":""}` → 202 with `job.state` `running` and `job.folders[0].target` `Archive/2025-05-30`; poll `GET /api/staging/promote` until `job.state` is `done`; `Archive/2025-05-30/<jpg>` and `…/Capture/<arw>` exist; `GET /api/staging` lists no folders; `GET /api/thumbs/{jpg}` still answers 200 (the thumbnail follows the hash); the frames include `promote.progress` with `running` and later `done`, and fewer than 12 `promote.progress` frames in all.
-- `TestPromoteAPIErrors`: `{"ids":[]}` → 400; `{"ids":[999]}` → 404; `{"ids":[id],"pattern":"{day}"}` → 400; the folder held by an import → 409 `folder_busy`; `GET /api/staging/promote` before any job → `{"job":null}`.
-- `TestPromoteSnapshot`: after a finished promote, a new SSE connection's snapshot includes a `promote.progress` frame with that job; before any promote, its data is `null`.
-- `TestRescanAPI`: write a JPEG into the imported folder (as if over SMB) → `POST /api/staging/rescan` → 202 `{"started":true}`; poll `f.svc.Status()` until `rescanning` is false; the listing shows 3 files; the `staging.changed` frames include `rescanning:true` and later one with `last_rescan.added_files` 1.
+- `TestPromoteAPI` (Review Focus 5, 7): `collectFrames`; ingest; `POST /api/staging/promote` `{"ids":[id],"pattern":""}` → 202 with `job.state` `queued` or `running` and `job.folders[0].target` `Archive/2025-05-30`; poll `GET /api/staging/promote` until `running` is null, `queued` is `[]` and `last.state` is `done`; `Archive/2025-05-30/<jpg>` and `…/Capture/<arw>` exist; `GET /api/staging` lists no folders; `GET /api/thumbs/{jpg}` still answers 200 (the thumbnail follows the hash); the `promote.progress` frames carry the queue shape (`running`, `queued`, `last`), one shows the job running and a later one has it as `last` with `done`, and there are fewer than 12 of them in all.
+- `TestPromoteAPIErrors`: `{"ids":[]}` → 400; `{"ids":[999]}` → 404; `{"ids":[id],"pattern":"{day}"}` → 400; the folder held by an import → 409 `folder_busy`; held by `HolderPromote` (stand-in for a promote job) → 409 `folder_busy`, `holder` `promote`, `error` `2025-05-30 is being promoted.`; `GET /api/staging/promote` before any job → `{"running":null,"queued":[],"last":null}`.
+- `TestPromoteQueueAPI` (Review Focus 5): after a finished promote (job 1), `DELETE /api/staging/promote/1` → 409 `promote_started`; `DELETE /api/staging/promote/999` → 404 `That promote no longer exists.`; `DELETE /api/staging/promote/abc` → 400; without `X-SD2NAS` → 403. (Queue order, enqueue locking and cancelling a queued job need a blocked rename and are pinned in Task 7.)
+- `TestPromoteSnapshot`: after a finished promote, a new SSE connection's snapshot includes a `promote.progress` frame whose `last` is that job; before any promote, its data is `{"running":null,"queued":[],"last":null}`.
+- `TestRescanAPI`: write a JPEG into the imported folder (as if over SMB) → `POST /api/staging/rescan` → 202 `{"started":true}`; poll `f.svc.Status()` until `rescanning` is false; the listing shows 3 files; the `staging.changed` frames (`collectFrames`) include `rescanning:true` and later one with `last_rescan.added_files` 1.
 
 `forget_test.go` (Review Focus 6):
 - `TestForgetAPIRetestsCard`: ingest (2 new) → `GET /api/ingest/{id}/forget` → `{"staged":2,…,"forgotten":false}`; `POST /api/ingest/{id}/forget` `{"deleteFiles":true}` → 200, `result.deleted_files` 2, `result.forgotten` 2, `ingest.forgotten_at` set; `Staging/` holds no files; `GET /api/ingests` shows `forgotten_at` on that row; a second `POST …/forget` → 409 `already_forgotten`; the card imported again → `2 new`.
@@ -4393,15 +4805,11 @@ In `MountStaging` add:
 ```go
 	s.mux.HandleFunc("POST /api/staging/promote", h.promote)
 	s.mux.HandleFunc("GET /api/staging/promote", h.promoteStatus)
+	s.mux.HandleFunc("DELETE /api/staging/promote/{jobId}", h.cancelPromote) // no clash: DELETE /api/staging/{id} has one segment fewer
 	s.mux.HandleFunc("POST /api/staging/rescan", h.rescan)
-	s.hub.AddSnapshot(func() (string, any, error) {
-		if j, ok := svc.LastPromote(); ok {
-			return EventPromoteProgress, j, nil
-		}
-		return EventPromoteProgress, nil, nil // "null": no promote since SD2NAS started
-	})
-	svc.OnPromote(func(j staging.PromoteJob) {
-		if err := s.hub.Publish(EventPromoteProgress, j); err != nil {
+	s.hub.AddSnapshot(func() (string, any, error) { return EventPromoteProgress, svc.Promotes(), nil })
+	svc.OnPromote(func(q staging.PromoteQueue) {
+		if err := s.hub.Publish(EventPromoteProgress, q); err != nil {
 			s.log.Error("publish promote.progress", "err", err)
 		}
 	})
@@ -4421,18 +4829,28 @@ func (h *stagingHandlers) promote(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := h.svc.Promote(opContext(r), body.IDs, body.Pattern)
 	if err != nil {
-		writeOpError(w, h.log, "promote staging folders", err)
+		writeOpError(w, h.log, "folder", "promote staging folders", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
 }
 
 func (h *stagingHandlers) promoteStatus(w http.ResponseWriter, r *http.Request) {
-	if j, ok := h.svc.LastPromote(); ok {
-		writeJSON(w, http.StatusOK, map[string]any{"job": j})
+	writeJSON(w, http.StatusOK, h.svc.Promotes())
+}
+
+func (h *stagingHandlers) cancelPromote(w http.ResponseWriter, r *http.Request) {
+	id, err := positiveInt(r.PathValue("jobId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "jobId: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"job": nil})
+	job, err := h.svc.CancelPromote(id)
+	if err != nil {
+		writeOpError(w, h.log, "promote", "cancel promote", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
 func (h *stagingHandlers) rescan(w http.ResponseWriter, r *http.Request) {
@@ -4489,7 +4907,7 @@ func (h *forgetHandlers) summary(w http.ResponseWriter, r *http.Request) {
 	}
 	sum, err := h.svc.ForgetSummary(r.Context(), id)
 	if err != nil {
-		writeOpError(w, h.log, "forget summary", err)
+		writeOpError(w, h.log, "import", "forget summary", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, sum)
@@ -4513,19 +4931,19 @@ func (h *forgetHandlers) forget(w http.ResponseWriter, r *http.Request) {
 	}
 	release, err := h.m.Exclusive()
 	if err != nil {
-		writeOpError(w, h.log, "forget import", err)
+		writeOpError(w, h.log, "import", "forget import", err)
 		return
 	}
 	defer release()
 	ctx := opContext(r)
 	res, err := h.svc.Forget(ctx, id, *body.DeleteFiles)
 	if err != nil {
-		writeOpError(w, h.log, "forget import", err)
+		writeOpError(w, h.log, "import", "forget import", err)
 		return
 	}
 	row, err := h.db.Ingest(ctx, id)
 	if err != nil {
-		writeOpError(w, h.log, "forget import", err)
+		writeOpError(w, h.log, "import", "forget import", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"result": res, "ingest": viewOf(row, nil)})
@@ -4538,19 +4956,19 @@ func (h *forgetHandlers) reimport(w http.ResponseWriter, r *http.Request) {
 	}
 	release, err := h.m.Exclusive()
 	if err != nil {
-		writeOpError(w, h.log, "re-import culled files", err)
+		writeOpError(w, h.log, "import", "re-import culled files", err)
 		return
 	}
 	ctx := opContext(r)
 	n, err := h.svc.ForgetCulled(ctx, id)
 	release() // before Submit, so the new import can start
 	if err != nil {
-		writeOpError(w, h.log, "re-import culled files", err)
+		writeOpError(w, h.log, "import", "re-import culled files", err)
 		return
 	}
 	row, err := h.db.Ingest(ctx, id)
 	if err != nil {
-		writeOpError(w, h.log, "re-import culled files", err)
+		writeOpError(w, h.log, "import", "re-import culled files", err)
 		return
 	}
 	name := ingest.CardName(row)
@@ -4647,6 +5065,7 @@ export function joinList(parts)        // "a", "a and b", "a, b and c"
 export function describeError(err)     // sentence for an ApiError (or any Error)
 export function rescanSummary(r)       // RescanResult → sentence
 export function promoteSummary(job)    // PromoteJob → sentence
+export function promoteStates(queue)   // PromoteQueue|null → Map(folder id → { job, state: 'waiting'|'moving', cancellable })
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -4773,7 +5192,7 @@ test('auto-scroll speeds up towards the edges', () => {
 ```js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { plural, joinList, describeError, rescanSummary, promoteSummary } from './messages.js';
+import { plural, joinList, describeError, rescanSummary, promoteSummary, promoteStates } from './messages.js';
 import { ApiError } from './api.js';
 
 const scan = (o) => ({ adopted_folders: 0, added_files: 0, moved_files: 0, restored_files: 0, culled_files: 0, removed_folders: 0,
@@ -4811,6 +5230,20 @@ test('promoteSummary', () => {
     'Promoted 2 folders (40 files) to the archive.');
   assert.equal(promoteSummary({ state: 'failed', folders: [{ state: 'done' }, { state: 'failed' }], files_done: 20, files_total: 40 }),
     '1 of 2 folders could not be promoted.');
+});
+
+test('promoteStates marks the folders of the running job and the queue', () => {
+  assert.equal(promoteStates(null).size, 0);
+  const queue = {
+    running: { id: 1, folders: [{ id: 10, state: 'done' }, { id: 11, state: 'moving' }, { id: 12, state: 'waiting' }] },
+    queued: [{ id: 2, folders: [{ id: 20, state: 'waiting' }] }],
+    last: null,
+  };
+  const m = promoteStates(queue);
+  assert.equal(m.has(10), false); // done: it has left staging
+  assert.deepEqual(m.get(11), { job: 1, state: 'moving', cancellable: false });
+  assert.deepEqual(m.get(12), { job: 1, state: 'waiting', cancellable: false });
+  assert.deepEqual(m.get(20), { job: 2, state: 'waiting', cancellable: true });
 });
 ```
 
@@ -5000,6 +5433,22 @@ export function rescanSummary(r) {
   return s;
 }
 
+// promoteStates maps the id of every folder still waiting or moving in the
+// running job or the queue to its job; only a queued job can be cancelled.
+export function promoteStates(queue) {
+  const out = new Map();
+  if (!queue) return out;
+  if (queue.running) {
+    for (const f of queue.running.folders) {
+      if (f.state === 'waiting' || f.state === 'moving') out.set(f.id, { job: queue.running.id, state: f.state, cancellable: false });
+    }
+  }
+  for (const job of queue.queued) {
+    for (const f of job.folders) out.set(f.id, { job: job.id, state: 'waiting', cancellable: true });
+  }
+  return out;
+}
+
 export function promoteSummary(job) {
   const n = job.folders.length;
   if (job.state === 'running') {
@@ -5040,7 +5489,7 @@ Suggested implementer: sonnet.
 ```js
 // live.svelte.js — live gains:
 staging: { version: 0, rescanning: false, last_rescan: null }, // the last staging.changed
-promote: null,                                               // the last promote.progress (a job) or null
+promote: null,                                               // the last promote.progress: { running, queued, last } (null until the first)
 // toast.svelte.js
 export const toasts; // $state({ items: [{ id, text, kind }] })
 export function toast(text, kind = 'ok', ms = 4000) // kind: ok | warn | bad
@@ -5059,7 +5508,7 @@ export function longPressSelect(node, { onlong, ondrag, ondragend })
 
 ```js
   staging: { version: 0, rescanning: false, last_rescan: null }, // the last staging.changed
-  promote: null, // the last promote.progress (a promote job), null if none since SD2NAS started
+  promote: null, // the last promote.progress: { running, queued: [...], last }; null until it arrives
 ```
 
 and in `connectEvents`:
@@ -5115,7 +5564,7 @@ export function dismiss(id) {
 </style>
 ```
 
-Mount `<Toast />` once in `App.svelte`, after `</div>` of `.app`.
+Mount `<Toast />` once in `App.svelte`, after `</div>` of `.app`. Known limit (pre-flight D15): a toast raised while a modal `<dialog>` is open sits under the dialog's top layer; every call site closes its dialog before toasting, and a later one that doesn't should show its message inside the dialog instead.
 
 - [ ] **Step 3: `Dialog.svelte`** — the native `<dialog>` gives the focus trap, Escape and an inert page for free (iOS 15.4+):
 
@@ -5136,12 +5585,22 @@ Mount `<Toast />` once in `App.svelte`, after `</div>` of `.app`.
     e.preventDefault(); // Escape: we decide
     if (!busy) onclose();
   }
-  function onclick(e) {
+  // The browser can close a modal on its own: Chrome's close watcher lets a
+  // second Escape through even after cancel was prevented. Keep `open` in
+  // step: tell the parent, or show it again while a request runs.
+  function onnativeclose() {
+    if (!open) return;
+    if (busy) el.showModal();
+    else onclose();
+  }
+  function onbackdrop(e) {
     if (e.target === el && !busy) onclose(); // the backdrop, not the box
   }
 </script>
 
-<dialog bind:this={el} {oncancel} {onclick} aria-labelledby={id} class:danger>
+<!-- Escape is handled by the cancel event; the click is only the backdrop shortcut. -->
+<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+<dialog bind:this={el} {oncancel} onclose={onnativeclose} onclick={onbackdrop} aria-labelledby={id} class:danger>
   <div class="box">
     <h2 {id}>{title}</h2>
     {@render children?.()}
@@ -5166,15 +5625,21 @@ Mount `<Toast />` once in `App.svelte`, after `</div>` of `.app`.
 </style>
 ```
 
-(On a phone the dialog is a bottom sheet with full-width buttons; the primary action ends up on top of Cancel.)
+(On a phone the dialog is a bottom sheet with full-width buttons; the primary action ends up on top of Cancel.) Check by hand once (Task 16, Step 5): open a dialog, press Escape twice quickly, then open it again — it must open.
 
 - [ ] **Step 4: `SelectionBar.svelte`**
 
 ```svelte
 <script>
   // While anything is selected: a sticky toolbar under the page header on a
-  // desktop, a bar above the tab bar on a phone (Global Constraints).
+  // desktop, a bar above the tab bar on a phone (Global Constraints). On a
+  // phone it also gives the page more bottom padding (body.selecting, in
+  // app.css), so the last row scrolls clear of the bar (pre-flight D4).
   let { count, total, onclear, onall, children } = $props();
+  $effect(() => {
+    document.body.classList.add('selecting');
+    return () => document.body.classList.remove('selecting');
+  });
 </script>
 
 <div class="selbar" role="toolbar" aria-label="Selection">
@@ -5184,21 +5649,18 @@ Mount `<Toast />` once in `App.svelte`, after `</div>` of `.app`.
   <span class="spacer"></span>
   <div class="acts">{@render children()}</div>
 </div>
-<div class="room" aria-hidden="true"></div>
 
 <style>
   .selbar { position: sticky; top: env(safe-area-inset-top); z-index: 6; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     background: var(--bg); padding: 10px 0; margin-bottom: 10px; border-bottom: 1px solid var(--accent); }
   .count { font-weight: 600; }
   .acts { display: flex; gap: 8px; flex-wrap: wrap; }
-  .room { display: none; }
   @media (max-width: 760px) {
     .selbar { position: fixed; top: auto; left: 0; right: 0; bottom: calc(var(--tabbar) + env(safe-area-inset-bottom)); margin: 0;
       padding: 8px calc(12px + env(safe-area-inset-right)) 8px calc(12px + env(safe-area-inset-left));
       background: var(--panel); border-top: 1px solid var(--accent); border-bottom: 0; flex-wrap: nowrap; overflow-x: auto; }
     .spacer { display: none; }
     .acts { flex-wrap: nowrap; }
-    .room { display: block; height: 64px; } /* so the bar never covers the last row */
   }
 </style>
 ```
@@ -5351,11 +5813,16 @@ label.f { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 12
 .field-error { color: var(--bad); font-size: 12px; margin-top: 4px; }
 /* Long-press selects on touch: no text selection, callout or image drag. */
 .selectable { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+/* While the phone selection bar shows (SelectionBar), the page ends below it.
+   This beats App.svelte's scoped main padding on specificity. */
+@media (max-width: 760px) {
+  body.selecting main { padding-bottom: calc(var(--tabbar) + 88px + env(safe-area-inset-bottom)); }
+}
 ```
 
 - [ ] **Step 7: `Thumb.svelte`**: add `draggable="false"` to the `<img>` (a long press must not start an image drag).
 
-- [ ] **Step 8: Check**: in `web/`, `npm test` → pass; `npm run build` → succeeds without new compiler warnings; `git status --short web/dist` prints nothing.
+- [ ] **Step 8: Check**: in `web/`, `npm test` → pass; `npm run build` → succeeds with **zero** Svelte warnings (the two `svelte-ignore` comments in `Dialog.svelte` are deliberate; grep the build output for `warn`); `git status --short web/dist` prints nothing.
 
 - [ ] **Step 9: Commit**
 
@@ -5377,29 +5844,23 @@ Suggested implementer: sonnet.
 - Replace: `web/src/pages/Staging.svelte`
 
 **Interfaces:**
-- Consumes: `api`, `live` (with `staging`, `promote`), `navigate`, `formatBytes`, `formatCount`, `dateRange` (M3); Task 13's `naming.js`, `selection.js`, `messages.js`; Task 14's `Dialog`, `SelectionBar`, `toast`, `longPressSelect`; `Thumb`. The API (Tasks 9, 11, 12): `GET /api/staging` → `{folders, untracked, version, stale_after_days, stale}`; `PATCH /api/staging/{id}`; `POST /api/staging/merge`; `DELETE /api/staging/{id}`; `POST /api/staging/promote`; `POST /api/staging/rescan`.
-- Produces: the page at `/staging`; `PromoteProgress` (`{ job, ondismiss }`), also usable elsewhere.
+- Consumes: `api`, `live` (with `staging`, and `promote` = the queue `{running, queued, last}`), `navigate`, `formatBytes`, `formatCount`, `dateRange` (M3); Task 13's `naming.js`, `selection.js`, `messages.js`; Task 14's `Dialog`, `SelectionBar`, `toast`, `longPressSelect`; `Thumb`. The API (Tasks 9, 11, 12): `GET /api/staging` → `{folders, untracked, version, stale_after_days, stale}`; `PATCH /api/staging/{id}`; `POST /api/staging/merge`; `DELETE /api/staging/{id}`; `POST /api/staging/promote` (enqueue), `GET /api/staging/promote`, `DELETE /api/staging/promote/{jobId}` (cancel a queued job); `POST /api/staging/rescan`; `promoteStates` (Task 13).
+- Produces: the page at `/staging`; `PromoteProgress` (`{ queue, showLast, oncancel, ondismiss, cancelling }`).
 
-- [ ] **Step 1: `PromoteProgress.svelte`**
+- [ ] **Step 1: `PromoteProgress.svelte`** — the running job, the queue (each queued job with Cancel) and the last finished job:
 
 ```svelte
 <script>
-  import { formatBytes } from '../lib/format.js';
-  import { promoteSummary } from '../lib/messages.js';
-  let { job, ondismiss } = $props();
-  const running = $derived(job.state === 'running');
-  const pct = $derived(job.files_total ? Math.round((job.files_done / job.files_total) * 100) : running ? 0 : 100);
+  import { formatBytes, formatCount } from '../lib/format.js';
+  import { promoteSummary, plural } from '../lib/messages.js';
+  // queue: the promote.progress data { running, queued, last }.
+  // showLast: whether the last finished job is still worth showing.
+  let { queue, showLast, oncancel, ondismiss, cancelling = 0 } = $props();
   const icon = { waiting: '○', moving: '●', done: '✓', failed: '✗' };
+  const pct = (j) => (j.files_total ? Math.round((j.files_done / j.files_total) * 100) : 0);
 </script>
 
-<div class="card promote" class:failed={job.state === 'failed'} role="status">
-  <div class="row">
-    <h2>{running ? 'Promoting to the archive' : job.state === 'failed' ? 'Promote finished with problems' : 'Promoted to the archive'}</h2>
-    <span class="spacer"></span>
-    {#if !running}<button class="btn link" onclick={ondismiss}>Dismiss</button>{/if}
-  </div>
-  <p class="muted small" style="margin:0">{promoteSummary(job)}{#if job.bytes_total} · {formatBytes(job.bytes_done)} of {formatBytes(job.bytes_total)}{/if}</p>
-  <div class="bar" aria-hidden="true"><i style="width:{pct}%"></i></div>
+{#snippet folderList(job)}
   <ul>
     {#each job.folders as f (f.id)}
       <li class={f.state}>
@@ -5412,19 +5873,59 @@ Suggested implementer: sonnet.
       </li>
     {/each}
   </ul>
+{/snippet}
+
+<div class="card promote" role="status">
+  {#if queue.running}
+    {@const j = queue.running}
+    <h2>Promoting to the archive</h2>
+    <p class="muted small">{promoteSummary(j)}{#if j.bytes_total} · {formatBytes(j.bytes_done)} of {formatBytes(j.bytes_total)}{/if}</p>
+    <div class="bar" aria-hidden="true"><i style="width:{pct(j)}%"></i></div>
+    {@render folderList(j)}
+  {/if}
+  {#if queue.queued.length}
+    <h3>Waiting ({plural(queue.queued.length, 'promote', 'promotes')})</h3>
+    {#each queue.queued as j (j.id)}
+      <div class="queued">
+        <div class="row">
+          <span class="muted small">{plural(j.folders.length, 'folder', 'folders')} · {formatCount(j.files_total)} files</span>
+          <span class="spacer"></span>
+          <button class="btn" disabled={cancelling === j.id} onclick={() => oncancel(j)}>{cancelling === j.id ? 'Cancelling…' : 'Cancel'}</button>
+        </div>
+        {@render folderList(j)}
+      </div>
+    {/each}
+  {/if}
+  {#if showLast && queue.last}
+    {@const j = queue.last}
+    <div class="last" class:failed={j.state === 'failed'}>
+      <div class="row">
+        <h3>{j.state === 'failed' ? 'Last promote finished with problems' : 'Last promote'}</h3>
+        <span class="spacer"></span>
+        <button class="btn link" onclick={() => ondismiss(j)}>Dismiss</button>
+      </div>
+      <p class="muted small">{promoteSummary(j)}</p>
+      {#if j.state === 'failed'}{@render folderList(j)}{/if}
+    </div>
+  {/if}
 </div>
 
 <style>
-  .promote h2 { margin: 0; }
+  h2 { margin: 0 0 2px; }
+  h3 { font-size: 13px; margin: 12px 0 4px; }
+  .muted.small { margin: 0; }
+  .queued, .last { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 6px; }
+  .last.failed h3 { color: var(--bad); }
   ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
   li { display: flex; gap: 8px; align-items: baseline; }
   .icon { width: 1.2em; flex: none; color: var(--muted); }
   li.done .icon { color: var(--ok); } li.failed .icon { color: var(--bad); } li.moving .icon { color: var(--accent); }
   .what { min-width: 0; overflow-wrap: anywhere; }
   .err { display: block; color: var(--bad); font-size: 12px; }
-  .failed { border-color: rgba(229,99,107,.5); }
 </style>
 ```
+
+It works the same on both widths: one column, wrapping names, 44 px buttons; on a phone the card sits above the folder list like the other notes.
 
 - [ ] **Step 2: `Staging.svelte`** (replace the file; M3's load/refetch pattern is kept and extended):
 
@@ -5437,7 +5938,7 @@ Suggested implementer: sonnet.
   import { formatBytes, formatCount, dateRange } from '../lib/format.js';
   import { clickAction, toggleKey, selectRange, prune } from '../lib/selection.js';
   import { splitName, folderName, folderDate, earliestDate, checkTitle, promoteTarget, DEFAULT_PATTERN } from '../lib/naming.js';
-  import { describeError, rescanSummary, plural } from '../lib/messages.js';
+  import { describeError, rescanSummary, plural, promoteStates } from '../lib/messages.js';
   import { longPressSelect } from '../lib/press.js';
   import { toast } from '../lib/toast.svelte.js';
   import Thumb from '../components/Thumb.svelte';
@@ -5460,7 +5961,8 @@ Suggested implementer: sonnet.
   let dialogError = $state('');
   let title = $state('');
   let pattern = $state(DEFAULT_PATTERN);
-  let dismissedJob = $state(0);
+  let dismissedJob = $state(0); // the last finished job the user dismissed
+  let cancelling = $state(0); // the queued job being cancelled
   let rescanAsked = false;
   let rescanSeen = null; // finished_at of the last rescan already handled
 
@@ -5517,15 +6019,24 @@ Suggested implementer: sonnet.
     });
   });
 
+  // Folders a promote holds (queued or moving) can't be renamed, merged or
+  // discarded (the server would answer 409), so they aren't selectable.
+  const queue = $derived(live.promote);
+  const held = $derived(promoteStates(queue));
   const folders = $derived(data?.folders ?? []);
-  const order = $derived(folders.map((f) => String(f.id)));
+  const order = $derived(folders.filter((f) => !held.has(f.id)).map((f) => String(f.id)));
   const chosen = $derived(folders.filter((f) => selected.has(String(f.id))));
   const totals = $derived({ files: folders.reduce((s, f) => s + f.files, 0), bytes: folders.reduce((s, f) => s + f.bytes, 0) });
-  const job = $derived(live.promote);
-  const promoting = $derived(job?.state === 'running');
-  const showJob = $derived(job && (promoting || (job.id !== dismissedJob && Date.now() - Date.parse(job.finished_at) < RECENT_MS)));
+  const showLast = $derived(!!queue?.last && queue.last.id !== dismissedJob && Date.now() - Date.parse(queue.last.finished_at) < RECENT_MS);
+  const showQueue = $derived(!!queue && (queue.running || queue.queued.length > 0 || showLast));
+  // A held folder leaves the selection as soon as its promote is queued.
+  $effect(() => {
+    const ids = order;
+    untrack(() => (selected = prune(selected, ids)));
+  });
 
   function toggle(key) {
+    if (!order.includes(key)) return; // held by a promote
     selected = toggleKey(selected, key);
     anchor = key;
   }
@@ -5543,8 +6054,9 @@ Suggested implementer: sonnet.
   function onFolderClick(e, f) {
     if (e.target.closest('.check')) return; // the checkbox handles itself
     const key = String(f.id);
-    const act = clickAction({ selecting: selected.size > 0, shift: e.shiftKey, toggle: e.ctrlKey || e.metaKey });
+    const act = held.has(f.id) ? 'open' : clickAction({ selecting: selected.size > 0, shift: e.shiftKey, toggle: e.ctrlKey || e.metaKey });
     if (act === 'open') {
+      if (selected.size && held.has(f.id)) return; // selecting: a held folder does nothing
       if (!e.target.closest('a')) navigate(`/staging/${f.id}`); // a click on the name is a link click already
       return;
     }
@@ -5668,10 +6180,26 @@ Suggested implementer: sonnet.
     const p = pattern.trim() || DEFAULT_PATTERN;
     run(async () => {
       const res = await api('/api/staging/promote', { method: 'POST', body: { ids: chosen.map((f) => f.id), pattern: p } });
-      live.promote = res.job; // show it now; promote.progress events take over
       savePattern(p);
       clear();
+      if (res.job.state === 'queued') toast(`Queued: ${plural(res.job.folders.length, 'folder waits', 'folders wait')} for the promote ahead of ${res.job.folders.length === 1 ? 'it' : 'them'}.`);
+      // Show the queue now; promote.progress events take over.
+      live.promote = await api('/api/staging/promote');
     });
+  }
+
+  // Cancel a queued promote: its folders stay in staging and can be changed again.
+  async function cancelPromote(job) {
+    cancelling = job.id;
+    try {
+      const res = await api(`/api/staging/promote/${job.id}`, { method: 'DELETE' });
+      toast(`Cancelled the promote of ${res.job.folders.map((f) => `“${f.name}”`).join(', ')}.`);
+      live.promote = await api('/api/staging/promote');
+    } catch (err) {
+      toast(describeError(err), 'bad');
+    } finally {
+      cancelling = 0;
+    }
   }
 
   async function rescan() {
@@ -5702,8 +6230,8 @@ Suggested implementer: sonnet.
   <p class="muted">Loading…</p>
 {:else}
   <p class="sub">{plural(folders.length, 'folder', 'folders')} · {formatCount(totals.files)} files · {formatBytes(totals.bytes)}</p>
-  {#if showJob}
-    <PromoteProgress {job} ondismiss={() => (dismissedJob = job.id)} />
+  {#if showQueue}
+    <PromoteProgress {queue} {showLast} {cancelling} oncancel={cancelPromote} ondismiss={(j) => (dismissedJob = j.id)} />
   {/if}
   {#if data.stale}
     <div class="note warn">{plural(data.stale, 'folder has', 'folders have')} been in staging longer than {data.stale_after_days} days. Promote or discard {data.stale === 1 ? 'it' : 'them'}.</div>
@@ -5722,10 +6250,10 @@ Suggested implementer: sonnet.
   {:else}
     {#if selected.size}
       <SelectionBar count={selected.size} total={folders.length} onclear={clear} onall={selectAll}>
-        <button class="btn" disabled={selected.size < 2 || promoting} onclick={() => openDialog('merge')}>Merge</button>
-        <button class="btn" disabled={selected.size !== 1 || promoting} onclick={() => openDialog('rename')}>Rename</button>
-        <button class="btn danger" disabled={promoting} onclick={() => openDialog('discard')}>Discard</button>
-        <button class="btn primary" disabled={promoting} title={promoting ? 'A promote is running' : ''} onclick={() => openDialog('promote')}>Promote →</button>
+        <button class="btn" disabled={selected.size < 2} onclick={() => openDialog('merge')}>Merge</button>
+        <button class="btn" disabled={selected.size !== 1} onclick={() => openDialog('rename')}>Rename</button>
+        <button class="btn danger" onclick={() => openDialog('discard')}>Discard</button>
+        <button class="btn primary" onclick={() => openDialog('promote')}>Promote →</button>
       </SelectionBar>
     {:else}
       <div class="toolbar row">
@@ -5740,10 +6268,11 @@ Suggested implementer: sonnet.
         {@const key = String(f.id)}
         <!-- The name link is the keyboard path; a click anywhere on the card is a mouse/touch shortcut. -->
         <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-        <div class="folder selectable" class:sel={selected.has(key)} data-key={key} onclick={(e) => onFolderClick(e, f)}>
+        {@const hold = held.get(f.id)}
+        <div class="folder selectable" class:sel={selected.has(key)} class:held={!!hold} data-key={key} onclick={(e) => onFolderClick(e, f)}>
           <div class="top">
-            <label class="check" title="Select">
-              <input type="checkbox" checked={selected.has(key)} onchange={() => toggle(key)} aria-label="Select {f.name}" />
+            <label class="check" title={hold ? 'Waiting for its promote' : 'Select'}>
+              <input type="checkbox" checked={selected.has(key)} disabled={!!hold} onchange={() => toggle(key)} aria-label="Select {f.name}" />
             </label>
             <div class="title">
               <a class="name" href="/staging/{f.id}">{f.name}</a>
@@ -5751,6 +6280,14 @@ Suggested implementer: sonnet.
             </div>
             {#if f.stale}<span class="pill warn" title="In staging for {f.age_days} days">{f.age_days} days</span>{/if}
           </div>
+          {#if hold}
+            <div class="row small hold">
+              <span class="pill live">{hold.state === 'moving' ? 'Promoting…' : 'Waiting to promote'}</span>
+              {#if hold.cancellable}
+                <button class="btn" disabled={cancelling === hold.job} onclick={(e) => { e.stopPropagation(); cancelPromote(queue.queued.find((j) => j.id === hold.job)); }}>Cancel</button>
+              {/if}
+            </div>
+          {/if}
           {#if f.samples.length}
             <div class="strip">
               {#each f.samples as s (s.sha256)}<Thumb sha={s.sha256} kind={s.kind} />{/each}
@@ -5779,7 +6316,7 @@ Suggested implementer: sonnet.
       {#if folderDate(renaming)}<span class="mono">{folderDate(renaming)} -</span>{/if}
       <!-- svelte-ignore a11y_autofocus -->
       <input id="rename-title" type="text" bind:value={title} placeholder="e.g. Yosemite" autofocus
-        onkeydown={(e) => e.key === 'Enter' && !titleCheck.error && renameName && renameName !== renaming.name && doRename()} />
+        onkeydown={(e) => e.key === 'Enter' && !busy && !titleCheck.error && renameName && renameName !== renaming.name && doRename()} />
     </div>
     {#if titleCheck.error}<div class="field-error">{titleCheck.error}</div>{/if}
     <p class="muted small">The date stays at the front so the archive stays sorted, e.g. <span class="mono">2007-11-10 - SMU Homecoming</span>.</p>
@@ -5835,7 +6372,7 @@ Suggested implementer: sonnet.
   {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
   {#snippet actions()}
     <button class="btn" onclick={closeDialog} disabled={busy}>Cancel</button>
-    <button class="btn primary" onclick={doPromote} disabled={busy || !!patternError}>{busy ? 'Starting…' : 'Promote'}</button>
+    <button class="btn primary" onclick={doPromote} disabled={busy || !!patternError}>{busy ? 'Queueing…' : queue?.running || queue?.queued.length ? 'Add to the queue' : 'Promote'}</button>
   {/snippet}
 </Dialog>
 
@@ -5847,6 +6384,8 @@ Suggested implementer: sonnet.
     padding: 8px 12px 12px; color: var(--text); min-width: 0; cursor: pointer; transition: border-color .1s; }
   .folder:hover { border-color: #41567a; }
   .folder.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .folder.held { opacity: .75; }
+  .hold { margin: 2px 0 4px; }
   .top { display: flex; gap: 4px; align-items: flex-start; }
   .check { display: grid; place-items: center; width: 44px; height: 44px; margin: -2px 0 0 -10px; flex: none; cursor: pointer; }
   .title { flex: 1; min-width: 0; padding-top: 10px; }
@@ -5864,7 +6403,8 @@ Suggested implementer: sonnet.
 
 Notes for the implementer:
 - `undated` flags names that are only a date (`2025-05-30`) or only a title (an adopted `Holiday`), matching §8 "Promoting a folder with no title shows a warning but is allowed".
-- `live.promote = res.job` mutates the shared store on purpose: the progress card shows at once even if the first `promote.progress` event is a moment away.
+- Assigning `live.promote` from `GET /api/staging/promote` after an enqueue or a cancel is on purpose: the card shows at once even if the next `promote.progress` event is a moment away.
+- Promote is never disabled (the queue takes it, Decision 9). A folder held by a promote (queued or moving) shows "Waiting to promote" or "Promoting…", can't be selected, and a queued one has a Cancel button (on the card and in the progress card) that cancels its whole job.
 - Keep the M3 refetch pattern exactly (one AbortController, last good data stays on screen).
 
 - [ ] **Step 3: Check**: in `web/`, `npm test` and `npm run build` → pass, no new compiler warnings (the two `svelte-ignore` comments are deliberate). Then a short manual check against a dev server (Task 16, Step 5 covers the full checklist).
@@ -6095,12 +6635,13 @@ Suggested implementer: sonnet.
 
   function doMove() {
     const shas = [...selected];
+    const fid = data.folder.id; // a refetch may clear data while the request runs (pre-flight D13)
     const body = dest === 'new' ? { fileShas: shas, newTitle: titleCheck.title } : { fileShas: shas, toId: Number(dest) };
     run(async () => {
       const res = await api('/api/staging/move', { method: 'POST', body });
       toast(`Moved ${plural(res.moved, 'file', 'files')} to “${res.folder.name}”`);
       clear();
-      if (res.removed.includes(data.folder.id)) {
+      if (res.removed.includes(fid)) {
         navigate('/staging', { replace: true });
         return true;
       }
@@ -6110,11 +6651,12 @@ Suggested implementer: sonnet.
 
   function doCull() {
     const shas = [...selected];
+    const fid = data.folder.id;
     run(async () => {
       const res = await api('/api/staging/cull', { method: 'POST', body: { fileShas: shas } });
       toast(`Culled ${plural(res.culled, 'file', 'files')}`);
       clear();
-      if (res.removed.includes(data.folder.id)) {
+      if (res.removed.includes(fid)) {
         navigate('/staging', { replace: true });
         return true;
       }
@@ -6264,7 +6806,9 @@ Notes:
   - Rename keeps the date prefix and previews the new name; a bad character shows the error and disables Rename; a 409 (hold the lock by starting an import of the GOPRO card with a large file, or trust Task 11's test) shows the server's sentence in the dialog.
   - Merge previews `<earliest date> - <title>`; afterwards one folder remains and it is selected.
   - Discard asks in red and lists the folders; the toast reports the result.
-  - Promote previews `Archive/<target>/` per folder, warns for date-only names, rejects `{day}`; the progress card appears at once, fills, and turns into the done summary; Promote is disabled while it runs.
+  - Promote previews `Archive/<target>/` per folder, warns for date-only names, rejects `{day}`; the progress card appears at once, fills, and turns into the done summary. Promote stays enabled while one runs: promoting more folders then (best seen with the EXDEV-free dev setup and a big folder, or by promoting several folders in quick succession) adds a job to the queue, whose folders show "Waiting to promote" with Cancel; Cancel releases them (they can be renamed again); jobs run in the order queued.
+  - Dialogs: press Escape twice quickly in an open dialog, then open it again — it opens (pre-flight D3). The build printed no Svelte warnings.
+  - Phone: with a selection active, scroll to the bottom of the folder list and the file grid — the last row is fully visible above the selection bar (pre-flight D4).
   - Folder grid, desktop: hover shows the tick; clicking it selects; Ctrl/Shift-click work; clicking a thumbnail with nothing selected opens the preview (←/→/Esc still work).
   - Folder grid, phone: long-press a tile then drag across others → they select without the page scrolling; dragging back unselects the overshoot; dragging near the bottom edge auto-scrolls; lifting the finger doesn't open the preview; tapping then toggles.
   - Move to a new folder and to an existing one; moving every file away returns to the staging list; Cull asks in red and the culled files' thumbnails stop loading (404).
@@ -6444,20 +6988,26 @@ Suggested implementer: haiku.
 ```markdown
 Implementation plan: `docs/plans/m4-staging-ops.md`. Imports hold the lock
 of every staging folder they write into until they end; operations take
-their locks without waiting and answer 409 (`folder_busy`, naming who holds
-it) when a folder is busy; the rescan skips busy folders. Merge and promote
+their locks (folder ids, plus the directory names they create) without
+waiting and answer 409 (`folder_busy`, naming who holds it) when one is
+busy; the rescan skips busy folders and names. Merge and promote
 move every file of a folder, keeping its path inside the folder (so
 `Capture/`, `Videos/` and any sidecars survive); discard and cull delete only
-catalogued files, so a folder holding untracked files stays. Promote is one
-background job at a time (`promote.progress`), an instant rename when the
-archive folder doesn't exist, a file-by-file merge with the collision loop
-when it does, copy-verify-delete across filesystems. The startup reconcile
+catalogued files, so a folder holding untracked files stays. Promotes
+queue: each request adds a job that locks its folders at once (a waiting
+folder can't be changed, and the job can be cancelled until it starts),
+jobs run one after another (`promote.progress` carries the queue), and each
+folder is an instant rename when the archive folder doesn't exist, a
+file-by-file merge with the collision loop when it does, copy-verify-delete
+across filesystems. Shutdown drops the queue (its folders stay in Staging). The startup reconcile
 also runs from "Rescan staging": it adopts untracked folders and media,
 follows files moved by hand, culls files deleted by hand, and does nothing
 when `Staging/` is missing. "Forget this import" deletes the import's
 staged and culled assets with their fingerprints, aliases and clock
 warnings (optionally its files in Staging/); the ingest row gets
-`forgotten_at` (schema version 2). "Re-import anyway" forgets the culls of
+`forgotten_at` (schema version 2). An import's assets are the ones it
+brought in and the ones any of its file rows names, so forgetting the second
+import of a card forgets what the first brought in too. "Re-import anyway" forgets the culls of
 an import's seen-before files and starts an import if the card is still
 mounted. Culled, discarded and forgotten files lose their cached
 thumbnails. Folders older than `staging_warn_days` (default 30) are
@@ -6476,10 +7026,13 @@ warnings need the content hash). The reconcile pass, at startup and from
 directories with no row and media files the catalog doesn't know, follows
 files moved by hand, culls files deleted by hand, and drops rows whose
 directory is gone. Non-media files are left alone, and nothing is changed
-when `Staging/` itself is missing.
+when `Staging/` itself is missing. "Forget an import" covers the assets the
+import brought in and the ones any of its file rows names (so forgetting a
+card's second import also forgets what its first brought in); archived ones
+are never forgotten.
 ```
 
-4. In §10, change the event sentence to: ``Event types: `ingest.current` and `ingest.finished` (M3); `staging.changed` and `promote.progress` (M4); `indexer.progress` is reserved for M5.`` Add these lines to the endpoint block, next to their neighbours: `GET    /api/ingest/{id}/forget           what forgetting would do (M4)`, `GET    /api/staging/promote              the running or last promote job`, `POST   /api/staging/rescan               reconcile Staging/ with the disk`.
+4. In §10, change the event sentence to: ``Event types: `ingest.current` and `ingest.finished` (M3); `staging.changed` and `promote.progress` (M4); `indexer.progress` is reserved for M5.`` Add these lines to the endpoint block, next to their neighbours: `GET    /api/ingest/{id}/forget           what forgetting would do (M4)`, `GET    /api/staging/promote              the running job, the queue and the last finished job`, `DELETE /api/staging/promote/{jobId}     cancel a queued promote`, `POST   /api/staging/rescan               reconcile Staging/ with the disk`.
 5. In §3, after "The threshold is a setting.", add: ``It is `staging_warn_days` (default 30, 0 turns it off); the daily notification comes with M6's card script.``
 6. Add these follow-ups as unchecked items:
    - Under **M5**: ``- [ ] When the indexer finds content in `Archive/` whose asset is `culled` (a promote interrupted between the rename and the catalog write), mark it `archived` at that path``
@@ -6493,7 +7046,7 @@ when `Staging/` itself is missing.
 - `go vet ./...` and `go test ./...` pass on Windows.
 - The Linux command and the race command from the Global Constraints pass.
 - In `web/`: `npm ci && npm test && npm run build`, then `SD2NAS_REQUIRE_UI=1 go test ./web/ -v` passes.
-- Image smoke run: `docker build -f deploy/Dockerfile -t sd2nas:m4 .`; run it with `testdata/cards` read-only at `/cards`, temp dirs at `/photos` and `/config`, `-p 18080:8080`; `POST /api/ingest?wait=1&format=text` with `{"path":"/cards/SONY_A7IV"}` → "2 new … Card safe to format."; `PATCH /api/staging/1` `{"title":"Smoke"}` → 200; `POST /api/staging/promote` `{"ids":[1],"pattern":""}` → 202; `GET /api/staging/promote` soon says `done` and `/photos/Archive/2025-05-30 - Smoke/` holds the files; `POST /api/ingest/1/forget` `{"deleteFiles":true}` → 200 (`kept_archived` 2, nothing forgotten: they are archived); `docker stop` exits within 2 s. Remove the container and image afterwards.
+- Image smoke run: `docker build -f deploy/Dockerfile -t sd2nas:m4 .`; run it with `testdata/cards` read-only at `/cards`, temp dirs at `/photos` and `/config`, `-p 18080:8080`; `POST /api/ingest?wait=1&format=text` with `{"path":"/cards/SONY_A7IV"}` → "2 new … Card safe to format."; `PATCH /api/staging/1` `{"title":"Smoke"}` → 200; `POST /api/staging/promote` `{"ids":[1],"pattern":""}` → 202; `GET /api/staging/promote` soon has `running: null`, `queued: []` and `last.state` `done` and `/photos/Archive/2025-05-30 - Smoke/` holds the files; `POST /api/ingest/1/forget` `{"deleteFiles":true}` → 200 (`kept_archived` 2, nothing forgotten: they are archived); `docker stop` exits within 2 s. Remove the container and image afterwards.
 - `git status --short` shows only `HANDOFF.md` untracked.
 - `git log --format=%B main..HEAD | grep -c 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>'` equals `git rev-list --count main..HEAD`, and `git log --format=%B main..HEAD | grep -ci 'co-authored-by'` equals the same number.
 
