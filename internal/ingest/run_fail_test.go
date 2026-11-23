@@ -1,8 +1,10 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,6 +106,11 @@ func TestRunCardRemovedMidCopy(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
 	calls := 0
+	defer func() {
+		if calls != 2 {
+			t.Errorf("copyFile calls = %d, want 2 (a missing source must not be retried)", calls)
+		}
+	}()
 	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
 		calls++
 		if calls == 2 {
@@ -187,9 +194,7 @@ func TestRunRetriesTakenName(t *testing.T) {
 	if err != nil || string(b) != "someone else" {
 		t.Errorf("intruder = %q, %v", b, err)
 	}
-	want, _ := os.ReadFile(cardPath(card, cardARW))
-	got, _ := os.ReadFile(filepath.Join(e.photos, filepath.FromSlash(alt)))
-	if string(got) != string(want) {
+	if mustHash(t, filepath.Join(e.photos, filepath.FromSlash(alt))) != mustHash(t, cardPath(card, cardARW)) {
 		t.Error("renamed ARW does not hold the card's bytes")
 	}
 }
@@ -293,5 +298,25 @@ func TestRunAdoptsUnrecordedCopy(t *testing.T) {
 	}
 	if a.State != catalog.StateStaged || a.RelPath != sonyJPEG || a.FirstIngest != out.ID {
 		t.Errorf("asset = %+v", a)
+	}
+}
+
+func TestRunLogsCancelledCopyError(t *testing.T) {
+	e := newEnv(t)
+	var buf bytes.Buffer
+	e.r.cfg.Log = slog.New(slog.NewTextHandler(&buf, nil))
+	card := e.fixtureCard(t, "SONY_A7IV")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	e.r.copyFile = func(context.Context, string, string) (string, error) {
+		cancel()
+		return "", errors.Join(context.Canceled, errors.New("remove partial: boom"))
+	}
+	out := e.runCtx(t, ctx, card)
+	if out.Status != catalog.StatusCancelled {
+		t.Fatalf("status %q", out.Status)
+	}
+	if log := buf.String(); !strings.Contains(log, "copy cancelled") || !strings.Contains(log, "remove partial: boom") {
+		t.Errorf("log does not show the cancelled copy's error: %s", log)
 	}
 }

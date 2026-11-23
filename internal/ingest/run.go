@@ -459,6 +459,8 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 	j.copyDur += time.Since(start)
 	if err != nil {
 		if media.ClassifyCopyError(err, f.Path, dst) == media.CopyFailCanceled {
+			// The error may carry a failed partial removal or close; keep it visible.
+			j.log.Warn("copy cancelled", "file", f.Rel, "err", err)
 			return fileResult{canceled: true}
 		}
 		return fail(err)
