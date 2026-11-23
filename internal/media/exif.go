@@ -121,7 +121,7 @@ func offsetTimeOriginal(x *exif.Exif) (string, error) {
 		}
 		s, err := t.StringVal()
 		if err != nil {
-			return "", fmt.Errorf("OffsetTimeOriginal: %w", err)
+			return "", err // ReadExif adds the "OffsetTimeOriginal: " prefix
 		}
 		return strings.TrimSpace(s), nil
 	}

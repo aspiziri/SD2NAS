@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -218,5 +219,52 @@ func TestReadExifCorruptExifIFDIsWarning(t *testing.T) {
 	}
 	if d.OffsetTime != "" {
 		t.Errorf("OffsetTime = %q, want empty", d.OffsetTime)
+	}
+}
+
+// offsetTimeNotASCII returns a copy of a little-endian TIFF whose
+// OffsetTimeOriginal (0x9011) entry in the Exif sub-IFD is retyped from
+// ASCII to SHORT, so it decodes but can't be read as a string.
+func offsetTimeNotASCII(t *testing.T, tiff []byte) []byte {
+	t.Helper()
+	le := binary.LittleEndian
+	ifd0 := int(le.Uint32(tiff[4:]))
+	for i := 0; i < int(le.Uint16(tiff[ifd0:])); i++ {
+		e := ifd0 + 2 + 12*i
+		if le.Uint16(tiff[e:]) != 0x8769 {
+			continue
+		}
+		exifIFD := int(le.Uint32(tiff[e+8:]))
+		for j := 0; j < int(le.Uint16(tiff[exifIFD:])); j++ {
+			f := exifIFD + 2 + 12*j
+			if le.Uint16(tiff[f:]) == 0x9011 {
+				out := append([]byte(nil), tiff...)
+				le.PutUint16(out[f+2:], 3) // SHORT
+				le.PutUint32(out[f+4:], 3) // 3 shorts: still out of line
+				return out
+			}
+		}
+	}
+	t.Fatal("no OffsetTimeOriginal in the Exif IFD")
+	return nil
+}
+
+func TestReadExifOffsetTimeNotStringIsWarning(t *testing.T) {
+	b := offsetTimeNotASCII(t, mt.TIFF(binary.LittleEndian, mt.SonyExif))
+	d, err := ReadExif(writeBytes(t, t.TempDir(), "x.ARW", b))
+	if err != nil {
+		t.Fatalf("ReadExif: %v, want nil error", err)
+	}
+	if d.OffsetTime != "" {
+		t.Errorf("OffsetTime = %q, want empty", d.OffsetTime)
+	}
+	if d.Warning == nil {
+		t.Fatal("Warning = nil, want the OffsetTimeOriginal failure")
+	}
+	if msg := d.Warning.Error(); strings.Count(msg, "OffsetTimeOriginal") != 1 {
+		t.Errorf("Warning = %q, want OffsetTimeOriginal named exactly once", msg)
+	}
+	if d.Camera != "SONY ILCE-7M4" || d.DateTime.IsZero() {
+		t.Errorf("Camera = %q, DateTime = %v", d.Camera, d.DateTime)
 	}
 }
