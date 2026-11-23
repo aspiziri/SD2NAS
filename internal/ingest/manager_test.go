@@ -332,3 +332,61 @@ func TestJobProgress(t *testing.T) {
 		t.Errorf("phase %q", p)
 	}
 }
+
+func TestManagerExclusive(t *testing.T) {
+	e := newEnv(t)
+	m := newManager(t, e)
+	ctx := t.Context()
+
+	release1, err := m.Exclusive()
+	if err != nil {
+		t.Fatalf("Exclusive while idle: %v", err)
+	}
+	release2, err := m.Exclusive()
+	if err != nil {
+		t.Fatalf("second Exclusive (holds nest): %v", err)
+	}
+	j, err := m.Submit(ctx, Request{Path: e.fixtureCard(t, "SONY_A7IV")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Negative check: a held job must not start.
+	select {
+	case <-j.Done():
+		t.Fatal("the job finished while Exclusive was held")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if running, queued := m.Current(); running != nil || len(queued) != 1 {
+		t.Fatalf("Current = %v, %d queued; want none running, 1 queued", running, len(queued))
+	}
+	if _, err := m.Exclusive(); !errors.Is(err, ErrBusy) {
+		t.Fatalf("Exclusive with a queued job: err = %v, want ErrBusy", err)
+	}
+	release1()
+	release1() // twice is harmless
+	select {
+	case <-j.Done():
+		t.Fatal("the job finished while one hold was still held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release2()
+	waitDone(t, j)
+
+	started, release := gate(e)
+	t.Cleanup(release)
+	j2, err := m.Submit(ctx, Request{Path: e.fixtureCard(t, "GOPRO")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	if _, err := m.Exclusive(); !errors.Is(err, ErrBusy) {
+		t.Fatalf("Exclusive while running: err = %v, want ErrBusy", err)
+	}
+	release()
+	waitDone(t, j2)
+	release3, err := m.Exclusive()
+	if err != nil {
+		t.Fatalf("Exclusive when idle again: %v", err)
+	}
+	release3()
+}
