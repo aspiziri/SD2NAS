@@ -1,2 +1,7 @@
 # Shell scripts run inside Linux containers; CRLF line endings break them.
 *.sh text eol=lf
+
+# Go sources must stay LF so gofmt -l is clean on Windows checkouts too.
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
