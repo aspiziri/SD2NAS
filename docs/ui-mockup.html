@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CardIngest Mockup</title>
+<style>
+:root{
+  --bg:#141c27; --nav:#0f151e; --panel:#1b2636; --panel2:#223047; --line:#2e3d55;
+  --text:#e6edf6; --muted:#8d9bb0; --accent:#4f9cf9; --accent2:#3a7fd6;
+  --ok:#3fbf7f; --warn:#e8b04a; --bad:#e5636b; --r:10px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.app{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
+nav{background:var(--nav);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;gap:4px}
+.brand{font-weight:700;font-size:16px;padding:4px 10px 16px;display:flex;align-items:center;gap:8px}
+.brand .dot{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.navbtn{background:none;border:0;color:var(--muted);text-align:left;padding:9px 12px;border-radius:8px;cursor:pointer;font:inherit;display:flex;justify-content:space-between;align-items:center}
+.navbtn:hover{background:var(--panel);color:var(--text)}
+.navbtn.active{background:var(--panel2);color:var(--text)}
+.pill{background:var(--accent);color:#fff;border-radius:999px;font-size:11px;padding:1px 7px}
+.pill.warn{background:var(--warn);color:#1b1b1b}
+.navfoot{margin-top:auto;font-size:12px;color:var(--muted);padding:10px;line-height:1.6}
+main{padding:22px 28px 60px;max-width:1240px;width:100%}
+h1{font-size:20px;margin:0 0 4px}
+h2{font-size:15px;margin:0 0 12px}
+.sub{color:var(--muted);margin:0 0 18px}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:16px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spacer{flex:1}
+.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);padding:7px 13px;border-radius:8px;cursor:pointer;font:inherit;white-space:nowrap}
+.btn:hover:not(:disabled){border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover:not(:disabled){background:var(--accent2)}
+.btn.danger{color:var(--bad)}
+.btn.link{background:none;border:0;color:var(--accent);padding:0}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.stat{background:var(--panel2);border-radius:8px;padding:12px 14px}
+.stat b{display:block;font-size:22px}
+.stat.ok b{color:var(--ok)} .stat.warn b{color:var(--warn)} .stat.acc b{color:var(--accent)}
+.bar{height:8px;background:var(--panel2);border-radius:99px;overflow:hidden;margin:8px 0}
+.bar>i{display:block;height:100%;background:var(--accent);transition:width .15s}
+.waiting{border:2px dashed var(--line);border-radius:var(--r);padding:28px;text-align:center}
+.waiting .icon{font-size:34px;opacity:.6}
+.phases{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 4px;font-size:13px}
+.phase{color:var(--muted)} .phase.cur{color:var(--accent);font-weight:600} .phase.done{color:var(--ok)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:500;font-size:12px}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:0 6px;font-size:11px;color:var(--muted);margin-right:4px}
+.tag.new{background:var(--accent);border-color:var(--accent);color:#fff}
+.tag.added{background:transparent;border-color:var(--accent);color:var(--accent)}
+details{background:var(--panel2);border-radius:8px;padding:10px 12px;margin-top:10px}
+summary{cursor:pointer}
+details ul{margin:8px 0 0;padding-left:18px;color:var(--muted)}
+.toolbar{position:sticky;top:0;z-index:5;background:var(--bg);padding:10px 0;margin-bottom:6px;border-bottom:1px solid var(--line)}
+.folders{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.folder{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:12px;cursor:pointer;transition:border-color .1s}
+.folder:hover{border-color:#41567a}
+.folder.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.folder .head{display:flex;gap:8px;align-items:flex-start}
+.folder .name{font-weight:600;flex:1}
+.folder .name a{color:var(--text);text-decoration:none}
+.folder .name a:hover{color:var(--accent);text-decoration:underline}
+.strip{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin:10px 0}
+.thumb{aspect-ratio:3/2;border-radius:5px;position:relative;overflow:hidden}
+.thumb .b{position:absolute;left:4px;bottom:3px;font-size:9px;font-weight:700;background:rgba(0,0,0,.55);padding:0 4px;border-radius:3px}
+.thumb .play{position:absolute;inset:0;display:grid;place-items:center;font-size:16px;opacity:.85}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
+.tile{cursor:pointer}
+.tile .thumb{outline:2px solid transparent;outline-offset:1px}
+.tile.sel .thumb{outline-color:var(--accent)}
+.tile .fn{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}
+.chips{display:flex;gap:6px}
+.chip{background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:99px;padding:3px 11px;cursor:pointer;font:inherit;font-size:12px}
+.chip.on{color:var(--text);border-color:var(--accent)}
+input[type=text],select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:7px 10px;font:inherit;width:100%}
+input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;margin:2px 0 0}
+label.f{display:block;margin:12px 0 4px;color:var(--muted);font-size:12px}
+.form2{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}
+.toggle{display:flex;gap:10px;align-items:flex-start;margin:10px 0}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.preview{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:8px 10px;margin-top:8px;max-height:160px;overflow:auto}
+#modal{position:fixed;inset:0;background:rgba(5,9,15,.65);display:none;align-items:center;justify-content:center;z-index:20;padding:16px}
+#modal.open{display:flex}
+.dialog{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;width:min(520px,100%);max-height:90vh;overflow:auto}
+.dialog .row.end{justify-content:flex-end;margin-top:18px}
+.note{background:rgba(79,156,249,.1);border:1px solid rgba(79,156,249,.35);border-radius:8px;padding:9px 11px;font-size:12px;color:#b9d6fb;margin-top:10px}
+.note.warn{background:rgba(232,176,74,.1);border-color:rgba(232,176,74,.35);color:#f0d49b}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--ok);color:#06210f;font-weight:600;padding:10px 18px;border-radius:8px;transition:transform .25s;z-index:30}
+#toast.show{transform:translateX(-50%) translateY(0)}
+@media (max-width:760px){
+  .app{grid-template-columns:1fr}
+  nav{flex-direction:row;overflow-x:auto;padding:10px 16px;border-right:0;border-bottom:1px solid var(--line)}
+  .brand,.navfoot{display:none}
+  main{padding:16px}
+  .form2{grid-template-columns:1fr}
+  .folders{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav id="nav"></nav>
+  <main id="main"></main>
+</div>
+<div id="modal"><div class="dialog" id="dialog"></div></div>
+<div id="toast"></div>
+
+<script>
+// ---------- fake data helpers ----------
+const hashStr = s => { let h = 7; for (const c of s) h = (h * 31 + c.charCodeAt(0)) | 0; return Math.abs(h); };
+const pad = n => String(n).padStart(2, '0');
+const fmtN = n => n.toLocaleString('en-US');
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let fid = 0, folderSeq = 0;
+
+function genFiles(date, spec) {
+  const kinds = [];
+  for (let i = 0; i < (spec.raw || 0); i++) kinds.push('raw');
+  for (let i = 0; i < (spec.jpg || 0); i++) kinds.push('jpg');
+  for (let i = 0; i < (spec.video || 0); i++) kinds.push('video');
+  kinds.sort((a, b) => hashStr(date + a + kinds.indexOf(a)) - hashStr(date + b));
+  let t = (spec.start || 8) * 3600 + hashStr(date) % 1800;
+  return kinds.map((k, i) => {
+    t += 4 + hashStr(date + i + k) % 200;
+    const stamp = `${date} ${pad(Math.floor(t / 3600) % 24)}.${pad(Math.floor(t / 60) % 60)}.${pad(t % 60)}`;
+    const h = hashStr(stamp + k);
+    let name, mb, dur = 0, cam = spec.cam;
+    if (k === 'raw') { name = stamp + '.ARW'; mb = 24 + h % 9; }
+    else if (k === 'jpg') { name = stamp + '.JPG'; mb = 7 + h % 6; }
+    else { dur = 6 + h % 160; name = `${stamp} - 3840w - 59.940 - ${dur}sec.MP4`; mb = Math.round(dur * 12.5); cam = spec.videoCam || spec.cam; }
+    return { id: 'f' + (++fid), name, kind: k, mb, dur, cam, hue: h % 360 };
+  });
+}
+
+function makeFolder(date, spec, extra = {}) {
+  return { id: 'd' + (++folderSeq), name: date, dates: [date], files: genFiles(date, spec), isNew: false, added: 0, ...extra };
+}
+
+const counts = f => f.files.reduce((c, x) => (c[x.kind]++, c), { raw: 0, jpg: 0, video: 0 });
+const sizeGB = files => (files.reduce((s, x) => s + x.mb, 0) / 1024);
+const sources = f => [...new Set(f.files.map(x => x.cam))];
+const dateRange = f => { const d = [...f.dates].sort(); return d.length > 1 ? `${d[0]} → ${d[d.length - 1]}` : d[0]; };
+
+// ---------- state ----------
+const state = {
+  view: 'ingest',
+  card: null,            // null | {phase, ...}
+  selected: new Set(),   // folder ids
+  openFolder: null,      // folder id for detail view
+  fileSel: new Set(),
+  filter: 'all',
+  folders: [
+    makeFolder('2026-11-15', { raw: 46, video: 4, cam: 'Sony A7 IV', videoCam: 'GoPro HERO12' }),
+    makeFolder('2026-11-16', { raw: 38, video: 7, cam: 'Sony A7 IV', videoCam: 'GoPro HERO12', start: 7 }),
+    makeFolder('2026-11-18', { raw: 9, jpg: 12, cam: 'Sony A7 IV', start: 16 }),
+    makeFolder('2026-11-21', { raw: 31, video: 2, cam: 'Sony A7 IV', start: 10 }),
+  ],
+  history: [
+    { when: '2026-11-21 19:42', card: 'SONY_A7IV', size: '128 GB', seen: 1043, fresh: 33, inArchive: 988, prev: 22, status: 'Unmounted' },
+    { when: '2026-11-18 08:15', card: 'GOPRO_H12', size: '64 GB',  seen: 152,  fresh: 21, inArchive: 131, prev: 0,  status: 'Unmounted' },
+    { when: '2026-11-16 21:03', card: 'SONY_A7IV', size: '128 GB', seen: 977,  fresh: 95, inArchive: 860, prev: 22, status: 'Unmounted' },
+  ],
+  archive: {
+    files: 48213, tb: 2.14, lastScan: '2026-11-22 03:00', changed: 3, scanning: null,
+    promoted: [
+      { name: '2026-11-14 - Joshua Tree', path: 'Archive/2026-11-14 - Joshua Tree', files: 409, when: '2026-11-15' },
+      { name: '2026-11-08 - Big Sur',     path: 'Archive/2026-11-08 - Big Sur',     files: 612, when: '2026-11-10' },
+    ],
+  },
+  promotePattern: '{name}',
+};
+
+// ---------- nav ----------
+const VIEWS = [
+  ['ingest', 'Card ingest'],
+  ['staging', 'Staging'],
+  ['archive', 'Archive index'],
+  ['settings', 'Settings'],
+];
+function renderNav() {
+  const badge = v => {
+    if (v === 'staging' && state.folders.length) return `<span class="pill">${state.folders.length}</span>`;
+    if (v === 'ingest' && state.card && state.card.phase !== 'done') return `<span class="pill warn">live</span>`;
+    if (v === 'archive' && state.archive.changed) return `<span class="pill warn">${state.archive.changed}</span>`;
+    return '';
+  };
+  document.getElementById('nav').innerHTML =
+    `<div class="brand"><span class="dot"></span>CardIngest</div>` +
+    VIEWS.map(([v, l]) => `<button class="navbtn ${state.view === v ? 'active' : ''}" onclick="go('${v}')">${l}${badge(v)}</button>`).join('') +
+    `<div class="navfoot">Container: running<br>Watching <span class="mono">/mnt/disks</span><br>v0.1 mockup</div>`;
+}
+function go(v) { state.view = v; state.openFolder = null; state.fileSel.clear(); render(); }
+
+// ---------- ingest view ----------
+function renderIngest() {
+  const c = state.card;
+  let panel;
+  if (!c) {
+    panel = `<div class="waiting">
+      <div class="icon">💾</div>
+      <h2 style="margin:8px 0 4px">No card inserted</h2>
+      <p class="muted" style="margin:0 0 16px">Insert an SD card into the NAS. Unassigned Devices mounts it and ingest starts on its own.</p>
+      <button class="btn primary" onclick="simulateInsert()">Simulate inserting a card</button>
+    </div>`;
+  } else {
+    const ph = ['mounted', 'fingerprint', 'copying', 'done'];
+    const labels = { mounted: 'Mounted', fingerprint: 'Checking against catalog', copying: 'Copying new files', done: 'Done' };
+    const idx = ph.indexOf(c.phase);
+    const phases = ph.map((p, i) => `<span class="phase ${i < idx || c.phase === 'done' ? 'done' : i === idx ? 'cur' : ''}">${i < idx || c.phase === 'done' ? '✓' : i === idx ? '●' : '○'} ${labels[p]}</span>`).join('');
+    let body = '';
+    if (c.phase === 'mounted') {
+      body = `<p class="muted">Reading the card's file list…</p><div class="bar"><i style="width:4%"></i></div>`;
+    } else if (c.phase === 'fingerprint') {
+      body = `<div class="row small muted"><span>${fmtN(c.checked)} / ${fmtN(c.total)} files checked</span><span class="spacer"></span><span>quick fingerprint: size + first/last 64 KB</span></div>
+        <div class="bar"><i style="width:${c.checked / c.total * 100}%"></i></div>
+        <div class="stats" style="margin-top:12px">
+          <div class="stat acc"><b>${fmtN(c.fresh)}</b>new so far</div>
+          <div class="stat"><b>${fmtN(c.inArchive)}</b>already in archive</div>
+          <div class="stat"><b>${fmtN(c.prev)}</b>ingested before</div>
+        </div>`;
+    } else if (c.phase === 'copying') {
+      body = `<div class="row small muted"><span>${fmtN(c.copied)} / ${fmtN(c.fresh)} new files copied to staging</span><span class="spacer"></span><span>hashing while copying</span></div>
+        <div class="bar"><i style="width:${c.copied / c.fresh * 100}%"></i></div>
+        <div class="mono muted">→ /staging/${esc(c.currentFile || '')}</div>`;
+    } else {
+      body = `<div class="stats">
+          <div class="stat ok"><b>${fmtN(c.fresh)}</b>new files → staging</div>
+          <div class="stat"><b>${fmtN(c.inArchive)}</b>already in archive (skipped)</div>
+          <div class="stat warn"><b>${fmtN(c.prev)}</b>ingested before, not in archive</div>
+          <div class="stat"><b>${fmtN(c.total)}</b>files on card</div>
+        </div>
+        <details>
+          <summary>Where the ${fmtN(c.inArchive)} skipped files already are</summary>
+          <ul>
+            <li>609 → <span class="mono">Archive/2026-11-08 - Big Sur</span></li>
+            <li>379 → <span class="mono">Archive/2026-11-14 - Joshua Tree</span></li>
+            <li>33 → <span class="mono">Staging/2026-11-21</span> (still in staging)</li>
+          </ul>
+        </details>
+        <details>
+          <summary>${c.prev} files were ingested before but aren't in the archive (probably culled)</summary>
+          <p class="muted small" style="margin:8px 0">They were imported on 2026-11-16 and later deleted from staging or the archive. They're skipped so deleted shots don't come back.</p>
+          <button class="btn" onclick="toast('Would re-import 22 files into staging')">Re-import these anyway</button>
+        </details>
+        <div class="note">✓ Every file on this card is now in staging or the archive. <b>Safe to format the card.</b></div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn primary" onclick="go('staging')">Review in staging</button>
+          <button class="btn" onclick="ejectCard()">Unmount card</button>
+        </div>`;
+    }
+    panel = `<div class="row"><h2 style="margin:0">💾 ${c.label} <span class="muted small">· ${c.size} · /mnt/disks/${c.label}</span></h2></div>
+      <div class="phases">${phases}</div>${body}`;
+  }
+
+  const rows = state.history.map(h => `<tr>
+      <td>${h.when}</td><td>${h.card} <span class="muted small">${h.size}</span></td>
+      <td class="num">${fmtN(h.seen)}</td><td class="num" style="color:var(--ok)">${fmtN(h.fresh)}</td>
+      <td class="num">${fmtN(h.inArchive)}</td><td class="num">${fmtN(h.prev)}</td><td class="muted">${h.status}</td></tr>`).join('');
+
+  return `<h1>Card ingest</h1><p class="sub">Imports start automatically when a card is mounted. Nothing is ever deleted from the card.</p>
+    <div class="card">${panel}</div>
+    <div class="card"><h2>Recent ingests</h2>
+      <div style="overflow-x:auto"><table>
+        <tr><th>When</th><th>Card</th><th class="num">On card</th><th class="num">New</th><th class="num">In archive</th><th class="num">Seen before</th><th>Status</th></tr>
+        ${rows}
+      </table></div>
+    </div>`;
+}
+
+function simulateInsert() {
+  state.card = { label: 'SONY_A7IV', size: '128 GB', phase: 'mounted', total: 1155, checked: 0, fresh: 0, inArchive: 0, prev: 0, copied: 0 };
+  state.view = 'ingest';
+  render();
+  setTimeout(() => {
+    const c = state.card; c.phase = 'fingerprint'; render();
+    const final = { fresh: 112, inArchive: 1021, prev: 22 };
+    const iv = setInterval(() => {
+      c.checked = Math.min(c.total, c.checked + 47);
+      const r = c.checked / c.total;
+      c.inArchive = Math.round(final.inArchive * r); c.prev = Math.round(final.prev * r);
+      c.fresh = c.checked - c.inArchive - c.prev;
+      if (c.checked >= c.total) {
+        clearInterval(iv); Object.assign(c, final); c.phase = 'copying';
+        const newFiles = genFiles('2026-11-22', { raw: 86, video: 8, cam: 'Sony A7 IV', videoCam: 'Sony A7 IV', start: 7 });
+        const extra = genFiles('2026-11-21', { raw: 18, cam: 'Sony A7 IV', start: 17 });
+        const all = [...extra, ...newFiles];
+        const iv2 = setInterval(() => {
+          c.copied = Math.min(c.fresh, c.copied + 4);
+          c.currentFile = (all[c.copied - 1] || all[0]).name;
+          if (c.copied >= c.fresh) {
+            clearInterval(iv2); c.phase = 'done';
+            const f21 = state.folders.find(f => f.dates.includes('2026-11-21'));
+            if (f21) { f21.files.push(...extra); f21.added = extra.length; }
+            state.folders.push({ id: 'd' + (++folderSeq), name: '2026-11-22', dates: ['2026-11-22'], files: newFiles, isNew: true, added: 0 });
+            state.history.unshift({ when: '2026-11-22 18:07', card: 'SONY_A7IV', size: '128 GB', seen: 1155, fresh: 112, inArchive: 1021, prev: 22, status: 'Mounted' });
+          }
+          render();
+        }, 110);
+      }
+      render();
+    }, 110);
+  }, 900);
+}
+function ejectCard() {
+  state.card = null;
+  if (state.history[0]) state.history[0].status = 'Unmounted';
+  toast('Card unmounted, safe to remove');
+  render();
+}
+
+// ---------- staging view ----------
+function thumbHTML(x) {
+  const bg = `linear-gradient(135deg,hsl(${x.hue} 42% 40%),hsl(${(x.hue + 50) % 360} 48% 20%))`;
+  const label = x.kind === 'raw' ? 'ARW' : x.kind === 'jpg' ? 'JPG' : `MP4 ${x.dur}s`;
+  return `<div class="thumb" style="background:${bg}">${x.kind === 'video' ? '<div class="play">▶</div>' : ''}<span class="b">${label}</span></div>`;
+}
+
+function renderStaging() {
+  if (state.openFolder) return renderFolderDetail();
+  const sel = state.selected.size;
+  const totalFiles = state.folders.reduce((s, f) => s + f.files.length, 0);
+  const totalGB = sizeGB(state.folders.flatMap(f => f.files));
+  const cards = state.folders.length ? state.folders.map(f => {
+    const c = counts(f);
+    const strip = f.files.slice(0, 5).map(thumbHTML).join('');
+    return `<div class="folder ${state.selected.has(f.id) ? 'sel' : ''}" onclick="toggleFolder('${f.id}')">
+      <div class="head">
+        <input type="checkbox" ${state.selected.has(f.id) ? 'checked' : ''} onclick="event.stopPropagation();toggleFolder('${f.id}')">
+        <div class="name"><a href="#" onclick="event.preventDefault();event.stopPropagation();openFolder('${f.id}')">${esc(f.name)}</a>
+          <div class="muted small">${dateRange(f)}</div></div>
+        ${f.isNew ? '<span class="tag new">NEW</span>' : ''}${f.added ? `<span class="tag added">+${f.added}</span>` : ''}
+      </div>
+      <div class="strip">${strip}</div>
+      <div class="row small">
+        <span>${c.raw ? `<span class="tag">${c.raw} RAW</span>` : ''}${c.jpg ? `<span class="tag">${c.jpg} JPG</span>` : ''}${c.video ? `<span class="tag">${c.video} video</span>` : ''}</span>
+        <span class="spacer"></span><span class="muted">${f.files.length} files · ${sizeGB(f.files).toFixed(1)} GB</span>
+      </div>
+      <div class="muted small" style="margin-top:4px">${sources(f).join(' · ')}</div>
+    </div>`;
+  }).join('') : `<div class="waiting" style="grid-column:1/-1"><div class="icon">✨</div><h2>Staging is empty</h2><p class="muted">Everything has been promoted to the archive.</p></div>`;
+
+  return `<h1>Staging</h1><p class="sub">${state.folders.length} folders · ${fmtN(totalFiles)} files · ${totalGB.toFixed(1)} GB on <span class="mono">/mnt/cache/photo-staging</span></p>
+    <div class="toolbar row">
+      <span class="muted">${sel ? `${sel} selected` : 'Select folders to act on them'}</span>
+      ${sel ? `<button class="btn link" onclick="state.selected.clear();render()">Clear</button>` : `<button class="btn link" onclick="state.folders.forEach(f=>state.selected.add(f.id));render()">Select all</button>`}
+      <span class="spacer"></span>
+      <button class="btn" ${sel < 2 ? 'disabled' : ''} onclick="mergeDialog()">Merge</button>
+      <button class="btn" ${sel !== 1 ? 'disabled' : ''} onclick="renameDialog()">Rename</button>
+      <button class="btn danger" ${!sel ? 'disabled' : ''} onclick="discardDialog()">Discard</button>
+      <button class="btn primary" ${!sel ? 'disabled' : ''} onclick="promoteDialog()">Promote to archive →</button>
+    </div>
+    <div class="folders">${cards}</div>`;
+}
+
+function toggleFolder(id) { state.selected.has(id) ? state.selected.delete(id) : state.selected.add(id); render(); }
+function openFolder(id) { state.openFolder = id; state.fileSel.clear(); state.filter = 'all'; const f = getFolder(id); if (f) { f.isNew = false; f.added = 0; } render(); window.scrollTo(0, 0); }
+const getFolder = id => state.folders.find(f => f.id === id);
+const selFolders = () => state.folders.filter(f => state.selected.has(f.id));
+
+function renderFolderDetail() {
+  const f = getFolder(state.openFolder);
+  if (!f) { state.openFolder = null; return renderStaging(); }
+  const c = counts(f);
+  const shown = f.files.filter(x => state.filter === 'all' || x.kind === state.filter);
+  const n = state.fileSel.size;
+  const others = state.folders.filter(o => o.id !== f.id);
+  const chip = (k, l) => `<button class="chip ${state.filter === k ? 'on' : ''}" onclick="state.filter='${k}';render()">${l}</button>`;
+  return `<div class="row" style="margin-bottom:10px"><button class="btn" onclick="state.openFolder=null;render()">← Staging</button></div>
+    <h1>${esc(f.name)}</h1>
+    <p class="sub">${dateRange(f)} · ${f.files.length} files · ${sizeGB(f.files).toFixed(1)} GB · ${sources(f).join(', ')}</p>
+    <div class="toolbar row">
+      <div class="chips">${chip('all', 'All ' + f.files.length)}${c.raw ? chip('raw', 'RAW ' + c.raw) : ''}${c.jpg ? chip('jpg', 'JPG ' + c.jpg) : ''}${c.video ? chip('video', 'Video ' + c.video) : ''}</div>
+      <span class="spacer"></span>
+      <span class="muted">${n ? n + ' selected' : 'Click to select files'}</span>
+      <select style="width:auto" id="moveTarget" ${!n ? 'disabled' : ''}>
+        <option value="">Move to…</option>
+        ${others.map(o => `<option value="${o.id}">${esc(o.name)}</option>`).join('')}
+        <option value="__new">New folder…</option>
+      </select>
+      <button class="btn" ${!n ? 'disabled' : ''} onclick="moveFiles()">Move</button>
+      <button class="btn danger" ${!n ? 'disabled' : ''} onclick="cullFiles()">Cull</button>
+    </div>
+    <div class="grid">${shown.map(x => `<div class="tile ${state.fileSel.has(x.id) ? 'sel' : ''}" onclick="toggleFile('${x.id}')">${thumbHTML(x)}<div class="fn" title="${esc(x.name)}">${esc(x.name)}</div></div>`).join('')}</div>`;
+}
+function toggleFile(id) { state.fileSel.has(id) ? state.fileSel.delete(id) : state.fileSel.add(id); render(); }
+function moveFiles() {
+  const f = getFolder(state.openFolder), target = document.getElementById('moveTarget').value;
+  if (!target) return toast('Pick a destination folder first');
+  const moving = f.files.filter(x => state.fileSel.has(x.id));
+  let dest;
+  if (target === '__new') {
+    const title = prompt(`Title for the new folder (it will be named "${f.dates[0]} - …")`, '');
+    if (title === null) return;
+    const name = folderName(f.dates[0], title);
+    dest = { id: 'd' + (++folderSeq), name, dates: [...f.dates], files: [], isNew: false, added: 0 };
+    state.folders.push(dest);
+  } else dest = getFolder(target);
+  dest.files.push(...moving);
+  dest.dates = [...new Set([...dest.dates, ...f.dates])];
+  f.files = f.files.filter(x => !state.fileSel.has(x.id));
+  state.fileSel.clear();
+  if (!f.files.length) { state.folders = state.folders.filter(o => o !== f); state.openFolder = null; }
+  toast(`Moved ${moving.length} files to ${dest.name}`);
+  render();
+}
+function cullFiles() {
+  const f = getFolder(state.openFolder), n = state.fileSel.size;
+  dialog(`<h2>Cull ${n} file${n > 1 ? 's' : ''}?</h2>
+    <p class="muted">These are deleted from staging.</p>
+    <div class="note">They stay in the ingest history, so they won't be re-imported the next time this card goes in.</div>
+    <div class="row end"><button class="btn" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" style="background:var(--bad);border-color:var(--bad)" onclick="doCull()">Cull</button></div>`);
+}
+function doCull() {
+  const f = getFolder(state.openFolder), n = state.fileSel.size;
+  f.files = f.files.filter(x => !state.fileSel.has(x.id));
+  state.fileSel.clear(); closeModal();
+  if (!f.files.length) { state.folders = state.folders.filter(o => o !== f); state.openFolder = null; }
+  toast(`Culled ${n} files`); render();
+}
+
+// ---------- dialogs ----------
+function dialog(html) { document.getElementById('dialog').innerHTML = html; document.getElementById('modal').classList.add('open'); }
+function closeModal() { document.getElementById('modal').classList.remove('open'); }
+document.getElementById('modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+
+function mergeDialog() {
+  const fs = selFolders().sort((a, b) => a.dates[0].localeCompare(b.dates[0]));
+  const files = fs.reduce((s, f) => s + f.files.length, 0);
+  dialog(`<h2>Merge ${fs.length} folders</h2>
+    <ul class="muted" style="margin:0;padding-left:18px">${fs.map(f => `<li>${esc(f.name)} <span class="small">(${f.files.length} files)</span></li>`).join('')}</ul>
+    ${titleField('mergeName', fs[0].dates[0], '')}
+    <div class="note">${files} files end up in one folder, still sorted into <span class="mono">Videos/</span> and <span class="mono">Capture/</span> subfolders. Filenames keep their timestamps; if two names clash, the second gets a -1 suffix.</div>
+    <div class="row end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="doMerge()">Merge</button></div>`);
+  setTimeout(() => focusEnd('mergeName'), 0);
+}
+function doMerge() {
+  const fs = selFolders().sort((a, b) => a.dates[0].localeCompare(b.dates[0]));
+  const name = folderName(fs[0].dates[0], document.getElementById('mergeName').value);
+  const merged = { id: 'd' + (++folderSeq), name, dates: [...new Set(fs.flatMap(f => f.dates))].sort(),
+    files: fs.flatMap(f => f.files).sort((a, b) => a.name.localeCompare(b.name)), isNew: false, added: 0 };
+  const firstIdx = state.folders.indexOf(fs[0]);
+  state.folders = state.folders.filter(f => !state.selected.has(f.id));
+  state.folders.splice(Math.min(firstIdx, state.folders.length), 0, merged);
+  state.selected = new Set([merged.id]);
+  closeModal(); toast(`Merged into "${name}"`); render();
+}
+
+function renameDialog() {
+  const f = selFolders()[0];
+  dialog(`<h2>Rename folder</h2>
+    ${titleField('renameIn', splitName(f).date, splitName(f).title)}
+    <p class="muted small">The date stays at the front so the archive stays sorted, e.g. <span class="mono">2007-11-10 - SMU Homecoming</span>.</p>
+    <div class="row end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="doRename('${f.id}')">Rename</button></div>`);
+  setTimeout(() => focusEnd('renameIn'), 0);
+}
+function focusEnd(id) { const i = document.getElementById(id); if (!i) return; i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
+function doRename(id) { const f = getFolder(id); f.name = folderName(splitName(f).date, document.getElementById('renameIn').value); closeModal(); render(); }
+
+// Archive convention: "YYYY-MM-DD - Title". The date prefix is fixed; only the title is edited.
+function splitName(f) {
+  const m = f.name.match(/^(\d{4}-\d{2}-\d{2})(?: - (.*))?$/);
+  return m ? { date: m[1], title: m[2] || '' } : { date: [...f.dates].sort()[0], title: f.name };
+}
+const folderName = (date, title) => title.trim() ? `${date} - ${title.trim()}` : date;
+function titleField(id, date, title) {
+  return `<label class="f">Folder title</label>
+    <div class="row" style="flex-wrap:nowrap;gap:6px"><span class="mono muted" style="white-space:nowrap">${date} -</span>
+    <input type="text" id="${id}" value="${esc(title)}" placeholder="e.g. Yosemite"></div>`;
+}
+
+function discardDialog() {
+  const fs = selFolders(), n = fs.reduce((s, f) => s + f.files.length, 0);
+  dialog(`<h2>Discard ${fs.length} folder${fs.length > 1 ? 's' : ''}?</h2>
+    <p class="muted">${n} files are deleted from staging: ${fs.map(f => esc(f.name)).join(', ')}.</p>
+    <div class="note warn">These files stay in the ingest history and won't be re-imported from the card. To get them back, use "Re-import anyway" on the next ingest.</div>
+    <div class="row end"><button class="btn" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" style="background:var(--bad);border-color:var(--bad)" onclick="doDiscard()">Discard</button></div>`);
+}
+function doDiscard() { state.folders = state.folders.filter(f => !state.selected.has(f.id)); state.selected.clear(); closeModal(); toast('Discarded'); render(); }
+
+const promotePath = (f, pat) => pat.replace('{year}', f.dates[0].slice(0, 4)).replace('{month}', f.dates[0].slice(5, 7)).replace('{name}', f.name);
+function promoteDialog() {
+  const fs = selFolders(), n = fs.reduce((s, f) => s + f.files.length, 0);
+  const undated = fs.filter(f => /^\d{4}-\d{2}-\d{2}$/.test(f.name));
+  dialog(`<h2>Promote ${fs.length} folder${fs.length > 1 ? 's' : ''} to archive</h2>
+    <label class="f">Destination pattern</label>
+    <input type="text" id="patIn" value="${esc(state.promotePattern)}" oninput="updatePromotePreview()">
+    <p class="muted small" style="margin:4px 0 0">Tokens: <span class="mono">{year}</span> <span class="mono">{month}</span> <span class="mono">{name}</span></p>
+    <div class="preview mono" id="promotePreview"></div>
+    ${undated.length ? `<div class="note warn">${undated.length} folder${undated.length > 1 ? 's have' : ' has'} only a date for a name. Rename first if you want a description in the archive.</div>` : ''}
+    <div class="note">${n} files (${sizeGB(fs.flatMap(f => f.files)).toFixed(1)} GB) move from cache to the array and are added to the archive index.</div>
+    <div class="row end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="doPromote()">Promote</button></div>`);
+  updatePromotePreview();
+}
+function updatePromotePreview() {
+  const pat = document.getElementById('patIn').value;
+  document.getElementById('promotePreview').innerHTML = selFolders().map(f => `/mnt/user/Photos/Archive/${esc(promotePath(f, pat))}/`).join('<br>');
+}
+function doPromote() {
+  const pat = document.getElementById('patIn').value; state.promotePattern = pat;
+  const fs = selFolders(); let n = 0;
+  fs.forEach(f => { n += f.files.length; state.archive.promoted.unshift({ name: f.name, path: promotePath(f, pat), files: f.files.length, when: '2026-11-22' }); });
+  state.archive.files += n; state.archive.tb += sizeGB(fs.flatMap(f => f.files)) / 1024;
+  state.folders = state.folders.filter(f => !state.selected.has(f.id)); state.selected.clear();
+  closeModal(); toast(`Promoted ${fs.length} folder${fs.length > 1 ? 's' : ''} (${n} files) to the archive`); render();
+}
+
+// ---------- archive view ----------
+function renderArchive() {
+  const a = state.archive;
+  const scan = a.scanning !== null
+    ? `<div class="bar"><i style="width:${a.scanning}%"></i></div><div class="muted small">Rescanning… ${a.scanning}% (only files whose size or modified time changed get re-hashed)</div>`
+    : `<button class="btn" onclick="rescan()">Rescan now</button>`;
+  const changed = a.changed ? `<div class="card"><h2>⚠ ${a.changed} archive files changed since they were indexed</h2>
+      <p class="muted small" style="margin-top:-6px">Same path, different content. Usually an editor writing metadata into the file.</p>
+      <table><tr><th>File</th><th>Last indexed</th><th>Likely cause</th></tr>
+        <tr><td class="mono">2026-10-03 - Fall Hike/2026-10-03 09.14.22.JPG</td><td>2026-10-04</td><td class="muted">Metadata edit</td></tr>
+        <tr><td class="mono">2026-10-03 - Fall Hike/2026-10-03 09.14.40.JPG</td><td>2026-10-04</td><td class="muted">Metadata edit</td></tr>
+        <tr><td class="mono">2025-12-24 - Christmas/2025-12-24 18.02.11.JPG</td><td>2025-12-27</td><td class="muted">Metadata edit</td></tr>
+      </table>
+      <div class="row" style="margin-top:12px"><button class="btn primary" onclick="state.archive.changed=0;toast('New hashes saved (old ones kept as aliases)');render()">Accept new hashes</button>
+      <span class="muted small">The old hash is kept as an alias, so the original file from a card still counts as a duplicate.</span></div></div>` : '';
+  return `<h1>Archive index</h1><p class="sub">Hash catalog of <span class="mono">/mnt/user/Photos/Archive</span>, used to skip files you already have.</p>
+    <div class="card"><div class="stats">
+      <div class="stat"><b>${fmtN(a.files)}</b>files indexed</div>
+      <div class="stat"><b>${a.tb.toFixed(2)} TB</b>archive size</div>
+      <div class="stat"><b>${fmtN(51388)}</b>files in ingest history</div>
+      <div class="stat"><b class="small" style="font-size:15px;padding:5px 0">${a.lastScan}</b>last nightly scan</div>
+    </div><div style="margin-top:14px">${scan}</div></div>
+    ${changed}
+    <div class="card"><h2>Recently promoted</h2><table>
+      <tr><th>Folder</th><th>Archive path</th><th class="num">Files</th><th>Promoted</th></tr>
+      ${a.promoted.map(p => `<tr><td>${esc(p.name)}</td><td class="mono muted">${esc(p.path)}</td><td class="num">${fmtN(p.files)}</td><td>${p.when}</td></tr>`).join('')}
+    </table></div>`;
+}
+function rescan() {
+  state.archive.scanning = 0; render();
+  const iv = setInterval(() => {
+    state.archive.scanning += 5;
+    if (state.archive.scanning >= 100) { clearInterval(iv); state.archive.scanning = null; state.archive.lastScan = '2026-11-22 18:12'; toast('Rescan complete: 0 new changes'); }
+    if (state.view === 'archive') render();
+  }, 120);
+}
+
+// ---------- settings view ----------
+function renderSettings() {
+  const t = (label, desc, on, locked) => `<div class="toggle"><input type="checkbox" ${on ? 'checked' : ''} ${locked ? 'disabled' : ''}><div><div>${label}</div><div class="muted small">${desc}</div></div></div>`;
+  return `<h1>Settings</h1><p class="sub">Mockup only; nothing here saves.</p>
+    <div class="card"><h2>Paths</h2><div class="form2">
+      <div><label class="f">Card mount root (watched)</label><input type="text" value="/mnt/disks"></div>
+      <div><label class="f">Staging</label><input type="text" value="/mnt/cache/photo-staging"></div>
+      <div><label class="f">Archive</label><input type="text" value="/mnt/user/Photos/Archive"></div>
+      <div><label class="f">Promote pattern</label><input type="text" value="${esc(state.promotePattern)}"></div>
+    </div></div>
+    <div class="card"><h2>Import rules (same as the desktop app)</h2><div class="form2">
+      <div><label class="f">Image formats</label><input type="text" value="jpg, jpeg, png, gif, tif"></div>
+      <div><label class="f">RAW formats</label><input type="text" value="arw, cr2, cr3, nef, dng"></div>
+      <div><label class="f">Video formats</label><input type="text" value="mp4, mov, avi"></div>
+      <div><label class="f">Filename pattern</label><input type="text" value="YYYY-MM-DD HH.mm.ss" disabled></div>
+      <div><label class="f">Images subfolder</label><input type="text" value="/"></div>
+      <div><label class="f">RAW subfolder</label><input type="text" value="/Capture/"></div>
+      <div><label class="f">Video subfolder</label><input type="text" value="/Videos/"></div>
+    </div></div>
+    <div class="card"><h2>Behavior</h2>
+      ${t('Auto-ingest when a card is mounted', 'Triggered by the Unassigned Devices script', true)}
+      ${t('Unmount the card when ingest finishes', 'So you can just pull it out', true)}
+      ${t('Skip files ingested before, even if not in the archive', 'Keeps culled shots from coming back', true)}
+      ${t('Send a notification when done', 'Unraid notification or ntfy topic', true)}
+      ${t('Never modify or delete files on the card', 'Always on', true, true)}
+    </div>`;
+}
+
+// ---------- shell ----------
+function render() {
+  renderNav();
+  const v = { ingest: renderIngest, staging: renderStaging, archive: renderArchive, settings: renderSettings }[state.view];
+  document.getElementById('main').innerHTML = v();
+}
+let toastT;
+function toast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 2200); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+render();
+</script>
+</body>
+</html>
