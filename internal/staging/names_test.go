@@ -54,6 +54,9 @@ func TestExpandPattern(t *testing.T) {
 	if _, err := ExpandPattern("{year}", catalog.StagingFolder{Name: "Holiday"}); !errors.Is(err, ErrBadPattern) || !strings.Contains(err.Error(), "needs a date") {
 		t.Errorf("no-date err = %v", err)
 	}
+	if _, err := ExpandPattern("{year}", catalog.StagingFolder{Name: "Holiday", Dates: []string{"25"}}); !errors.Is(err, ErrBadPattern) {
+		t.Errorf("malformed date err = %v", err)
+	}
 	if _, err := ExpandPattern("{name}", catalog.StagingFolder{Name: "What?"}); !errors.Is(err, ErrBadPattern) {
 		t.Errorf("What? err = %v", err)
 	}

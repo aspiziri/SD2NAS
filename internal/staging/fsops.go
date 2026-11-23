@@ -141,6 +141,13 @@ func (s *Service) moveFile(ctx context.Context, src, dir, name, want string) (st
 			return "", err
 		}
 		if dup {
+			// dst may be src itself (a case-only alias on a case-insensitive
+			// disk, a link to it): the file is already in place, delete nothing.
+			if same, err := sameFile(src, dst); err != nil {
+				return "", err
+			} else if same {
+				return dst, nil
+			}
 			if err := os.Remove(src); err != nil {
 				return "", fmt.Errorf("identical copy already at %s, but removing %s failed: %w", dst, src, err)
 			}
@@ -160,6 +167,19 @@ func (s *Service) moveFile(ctx context.Context, src, dir, name, want string) (st
 		return dst, err
 	}
 	return "", fmt.Errorf("move %s: destination names in %s kept being taken", src, dir)
+}
+
+// sameFile reports whether a and b are the same file on disk.
+func sameFile(a, b string) (bool, error) {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(ai, bi), nil
 }
 
 // copyVerify copies src to dst (media.CopyHashed: a partial, fsync, rename,
@@ -193,7 +213,7 @@ func (s *Service) copyVerify(ctx context.Context, src, dst, want string) (string
 		return "", err
 	}
 	if err := os.Remove(src); err != nil {
-		return "", fmt.Errorf("copied and verified %s, but removing the original failed: %w", dst, err)
+		return dst, fmt.Errorf("copied and verified %s, but removing the original failed: %w", dst, err)
 	}
 	return dst, nil
 }

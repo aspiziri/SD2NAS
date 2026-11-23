@@ -78,6 +78,23 @@ func TestMoveFileIdentical(t *testing.T) {
 	}
 }
 
+func TestMoveFileSameFile(t *testing.T) {
+	e := newOpsEnv(t)
+	src := e.write(t, "Archive/a.JPG", "same")
+	dir := filepath.Join(e.photos, "Archive")
+	if err := os.Link(src, filepath.Join(dir, "b.JPG")); err != nil {
+		t.Skipf("hard links unsupported: %v", err)
+	}
+	// b.JPG is the same file as src: it must be kept, not deleted as a duplicate.
+	got, err := e.svc.moveFile(t.Context(), src, dir, "b.JPG", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != filepath.Join(dir, "b.JPG") || readFile(t, src) != "same" || readFile(t, got) != "same" {
+		t.Fatalf("got %s", got)
+	}
+}
+
 func TestMoveFileCrossDevice(t *testing.T) {
 	e := newOpsEnv(t)
 	e.svc.rename = xdev
@@ -189,7 +206,7 @@ func TestRemoveEmptyTree(t *testing.T) {
 
 func TestFolderFiles(t *testing.T) {
 	e := newOpsEnv(t)
-	for _, rel := range []string{"f/b.JPG", "f/Capture/a.ARW", "f/.DS_Store", "f/._a.JPG", "f/x.JPG.partial", "f/THUMBS.DB"} {
+	for _, rel := range []string{"f/b.JPG", "f/Capture/a.ARW", "f/.DS_Store", "f/._a.JPG", "f/x.JPG.partial", "f/THUMBS.DB", "f/Desktop.INI"} {
 		e.write(t, rel, "x")
 	}
 	got, err := folderFiles(filepath.Join(e.photos, "f"))

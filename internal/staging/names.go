@@ -112,6 +112,10 @@ func ExpandPattern(pattern string, f catalog.StagingFolder) (string, error) {
 				bad = fmt.Errorf("%s needs a date, and %q has none", tok, f.Name)
 				return ""
 			}
+			if len(date) < 10 || date[4] != '-' || date[7] != '-' {
+				bad = fmt.Errorf("%s needs a YYYY-MM-DD date, and %q has %q", tok, f.Name, date)
+				return ""
+			}
 			if tok == "{year}" {
 				return date[:4]
 			}
