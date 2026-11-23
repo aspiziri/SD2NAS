@@ -345,6 +345,47 @@ func TestRunUnsupportedFormatsNotSafe(t *testing.T) {
 	}
 }
 
+func TestRunUnknownFormatsNotSafe(t *testing.T) {
+	e := newEnv(t)
+	card := e.fixtureCard(t, "SONY_A7IV")
+	writeFile(t, card, "PRIVATE/M4ROOT/MEDIAPRO.XML", []byte("<xml/>")) // ignored sidecar
+	writeFile(t, card, "DCIM/100MSDCF/DSC00002.360", []byte("spherical"))
+	writeFile(t, card, "DCIM/100MSDCF/DSC00003.MKV", []byte("matroska"))
+	writeFile(t, card, "DCIM/100MSDCF/DSC00004.mkv", []byte("matroska"))
+	out := e.run(t, card)
+	wantDone(t, out, catalog.Counts{Seen: 2, New: 2, Unsupported: 3}, false)
+	if want := []string{".360", ".mkv"}; !reflect.DeepEqual(out.UnsupportedExts, want) {
+		t.Errorf("UnsupportedExts = %q, want %q", out.UnsupportedExts, want)
+	}
+	files := e.files(t, out.ID)
+	if f := files["DCIM/100MSDCF/DSC00002.360"]; f.Outcome != catalog.OutcomeUnsupported {
+		t.Errorf(".360 row = %+v", f)
+	}
+	if f, ok := files["PRIVATE/M4ROOT/MEDIAPRO.XML"]; ok {
+		t.Errorf("ignored sidecar recorded: %+v", f)
+	}
+	level, msg := Describe(out)
+	if want := "SONY_A7IV: 2 new, 0 already known, 3 files not imported (.360, .mkv). Do not format the card."; level != LevelWarning || msg != want {
+		t.Errorf("Describe = %q, %q, want %q, %q", level, msg, LevelWarning, want)
+	}
+}
+
+func TestRunSidecarsStillSafe(t *testing.T) {
+	e := newEnv(t)
+	card := e.fixtureCard(t, "SONY_A7IV")
+	for _, rel := range []string{
+		"PRIVATE/M4ROOT/MEDIAPRO.XML", "PRIVATE/M4ROOT/STATUS.BIN", "PRIVATE/M4ROOT/CLIP/C0001M01.XML",
+		"PRIVATE/SONY/SONYCARD.IND", "AVF_INFO/AVIN0001.BNP", "DCIM/100GOPRO/GL010001.LRV", "DCIM/100GOPRO/GX010001.THM",
+	} {
+		writeFile(t, card, rel, []byte("x"))
+	}
+	out := e.run(t, card)
+	wantDone(t, out, catalog.Counts{Seen: 2, New: 2}, true)
+	if out.UnsupportedExts != nil {
+		t.Errorf("UnsupportedExts = %q, want nil", out.UnsupportedExts)
+	}
+}
+
 func TestRunEmptyCardNotSafe(t *testing.T) {
 	e := newEnv(t)
 	writeFile(t, e.cards, "DCIM/100MSDCF/._DSC00001.JPG", []byte("junk"))

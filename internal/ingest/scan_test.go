@@ -28,11 +28,40 @@ func TestScanSkipsJunk(t *testing.T) {
 		"PRIVATE/M4ROOT/CLIP/C0001.MP4",
 		"SUB/keep.JPG", // SUB is only skipped inside M4ROOT
 	}
+	// Every regular file that is neither imported nor on the ignore list
+	// (Decision 10), including extensions SD2NAS has never heard of and
+	// files with no extension.
 	unsupported := []string{
+		"DCIM/100GOPRO/GS010003.360",
 		"DCIM/100GOPRO/GX010002.3GP",
 		"DCIM/100MSDCF/DSC00002.HIF",
 		"DCIM/100MSDCF/DSC00003.TIFF",
+		"DCIM/100MSDCF/DSC00004.mpo",
+		"DCIM/100MSDCF/DSC00005.WebP",
+		"DCIM/100MSDCF/README",
+		"DCIM/101CANON/IMG_0001.CRM",
 		"PRIVATE/M4ROOT/CLIP/C0002.M4V",
+		"PRIVATE/M4ROOT/CLIP/C0003.MKV",
+	}
+	// Camera sidecars and metadata on the ignore list.
+	ignored := []string{
+		"DCIM/100GOPRO/GL010001.LRV",
+		"DCIM/100GOPRO/GX010001.THM",
+		"DCIM/100MEDIA/DJI_0001.LRF",
+		"DCIM/CANONMSC/M0100.CTG",
+		"PRIVATE/AVCHD/BDMV/INDEX.BDM",
+		"PRIVATE/AVCHD/BDMV/CLIPINF/00000.CPI",
+		"PRIVATE/AVCHD/BDMV/PLAYLIST/00000.MPL",
+		"PRIVATE/M4ROOT/CLIP/C0001M01.XML",
+		"PRIVATE/M4ROOT/MEDIAPRO.XML",
+		"PRIVATE/M4ROOT/STATUS.BIN",
+		"PRIVATE/SONY/SONYCARD.IND",
+		"AVF_INFO/AVIN0001.BNP",
+		"AVF_INFO/AVIN0001.INP",
+		"AVF_INFO/AVIN0001.INT",
+		"AVF_INFO/PRV00001.DAT",
+		"DCIM/100MSDCF/C0001.SMI",
+		"notes.txt",
 	}
 	junk := []string{
 		"DCIM/100MSDCF/._DSC00001.JPG",
@@ -42,16 +71,16 @@ func TestScanSkipsJunk(t *testing.T) {
 		".Spotlight-V100/Store-V2/x.JPG",
 		"MISC/THM00001.JPG",
 		"misc/lower.JPG",
-		"DCIM/100GOPRO/GL010001.LRV",
-		"DCIM/100GOPRO/GX010001.THM",
+		"misc/unknown.XYZ",
 		"DCIM/100GOPRO/.thumbnails/x.JPG",
+		"DCIM/100MSDCF/.hidden.XYZ",
 		"PRIVATE/M4ROOT/THMBNL/C0001T01.JPG",
 		"PRIVATE/M4ROOT/SUB/C0001S03.MP4",
-		"PRIVATE/M4ROOT/CLIP/C0001M01.XML",
 		"System Volume Information/x.jpg",
+		"System Volume Information/IndexerVolumeGuid",
 		"$RECYCLE.BIN/x.jpg",
 	}
-	for _, list := range [][]string{keep, unsupported, junk} {
+	for _, list := range [][]string{keep, unsupported, ignored, junk} {
 		for _, rel := range list {
 			writeFile(t, card, rel, []byte("x"))
 		}
@@ -88,6 +117,20 @@ func TestScanSkipsJunk(t *testing.T) {
 		if f.Kind != "" {
 			t.Errorf("%s: Kind = %q, want empty", f.Rel, f.Kind)
 		}
+	}
+}
+
+func TestUnsupportedExts(t *testing.T) {
+	files := []CardFile{
+		{Rel: "DCIM/A.MKV"}, {Rel: "DCIM/B.360"}, {Rel: "DCIM/c.mkv"}, {Rel: "README"}, {Rel: "DCIM/D.HIF"}, {Rel: "x/LICENSE"},
+	}
+	got := unsupportedExts(files)
+	want := []string{".360", ".hif", ".mkv", ""}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("unsupportedExts = %q, want %q", got, want)
+	}
+	if got := unsupportedExts(nil); got != nil {
+		t.Errorf("unsupportedExts(nil) = %q, want nil", got)
 	}
 }
 

@@ -81,6 +81,7 @@ type ingestRun struct {
 	log         *slog.Logger // r.log().With("ingest", id, "card", CardName(in))
 	p           *Progress
 	counts      catalog.Counts
+	exts        []string // distinct extensions of the recorded unsupported files
 	warnings    []catalog.ClockWarning
 	cardSize    int64 // sum of the Media sizes
 	// For the "ingest finished" log line (Decision 22):
@@ -187,6 +188,7 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 	for _, row := range rows {
 		j.addOutcome(row.Outcome)
 	}
+	j.exts = unsupportedExts(scan.Unsupported)
 	if j.ctx.Err() != nil {
 		return catalog.StatusCancelled, ""
 	}
@@ -649,7 +651,7 @@ func (j *ingestRun) finish(status catalog.IngestStatus, errText string) (catalog
 	c := j.counts
 	safe := status == catalog.StatusDone && c.Failed == 0 && c.Unsupported == 0 && c.Seen > 0 // Decision 9
 	err := j.cat().FinishIngest(j.dbctx, catalog.Ingest{
-		ID: j.id, Status: status, FinishedAt: j.r.now(), Counts: c, ClockWarnings: len(j.warnings),
+		ID: j.id, Status: status, FinishedAt: j.r.now(), Counts: c, UnsupportedExts: j.exts, ClockWarnings: len(j.warnings),
 		CardSize: j.cardSize, SafeToFormat: safe, Error: errText,
 	})
 	if err != nil {

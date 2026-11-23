@@ -27,8 +27,21 @@ func TestDescribe(t *testing.T) {
 			in.Status, in.Counts = catalog.StatusDone, counts{Seen: 3, New: 1, InStaging: 1, Failed: 1}
 		}, LevelWarning, p + "1 new, 1 already known, 1 failed. Do not format the card."},
 		{"done unsupported", func(in *catalog.Ingest) {
-			in.Status, in.Counts = catalog.StatusDone, counts{Seen: 1, New: 1, Unsupported: 4}
-		}, LevelWarning, p + "1 new, 0 already known, 4 in formats SD2NAS does not import. Do not format the card."},
+			in.Status, in.Counts, in.UnsupportedExts = catalog.StatusDone, counts{Seen: 1, New: 1, Unsupported: 4}, []string{".360", ".mkv"}
+		}, LevelWarning, p + "1 new, 0 already known, 4 files not imported (.360, .mkv). Do not format the card."},
+		{"one unsupported without extension", func(in *catalog.Ingest) {
+			in.Status, in.Counts, in.UnsupportedExts = catalog.StatusDone, counts{Seen: 1, New: 1, Unsupported: 1}, []string{""}
+		}, LevelWarning, p + "1 new, 0 already known, 1 file not imported (no extension). Do not format the card."},
+		{"many unsupported extensions", func(in *catalog.Ingest) {
+			in.Status, in.Counts = catalog.StatusDone, counts{Seen: 1, New: 1, Unsupported: 7}
+			in.UnsupportedExts = []string{".360", ".a", ".b", ".c", ".d", ".mkv", ""}
+		}, LevelWarning, p + "1 new, 0 already known, 7 files not imported (.360, .a, .b, .c, .d and 2 more). Do not format the card."},
+		{"unsupported extensions unknown", func(in *catalog.Ingest) {
+			in.Status, in.Counts = catalog.StatusDone, counts{Seen: 1, New: 1, Unsupported: 2}
+		}, LevelWarning, p + "1 new, 0 already known, 2 files not imported. Do not format the card."},
+		{"unsupported extension with control characters", func(in *catalog.Ingest) {
+			in.Status, in.Counts, in.UnsupportedExts = catalog.StatusDone, counts{Seen: 1, New: 1, Unsupported: 1}, []string{".a\nb"}
+		}, LevelWarning, p + "1 new, 0 already known, 1 file not imported (.a b). Do not format the card."},
 		{"one clock warning", func(in *catalog.Ingest) {
 			in.Status, in.Counts, in.SafeToFormat, in.ClockWarnings = catalog.StatusDone, counts{Seen: 2, New: 2}, true, 1
 		}, LevelWarning, p + "2 new, 0 already known. Card safe to format. Check the camera clock: 1 file has suspicious capture times."},
@@ -38,8 +51,8 @@ func TestDescribe(t *testing.T) {
 		{"empty card", func(in *catalog.Ingest) { in.Status = catalog.StatusDone },
 			LevelWarning, p + "no photos or videos found. Do not format the card."},
 		{"unsupported only", func(in *catalog.Ingest) {
-			in.Status, in.Counts = catalog.StatusDone, counts{Unsupported: 2}
-		}, LevelWarning, p + "0 new, 0 already known, 2 in formats SD2NAS does not import. Do not format the card."},
+			in.Status, in.Counts, in.UnsupportedExts = catalog.StatusDone, counts{Unsupported: 2}, []string{".crm"}
+		}, LevelWarning, p + "0 new, 0 already known, 2 files not imported (.crm). Do not format the card."},
 		{"refused", func(in *catalog.Ingest) {
 			in.Status = catalog.StatusRefused
 			in.Error = "staging would drop below the 50.0 GB free-space reserve (2 new files need 0.1 GB, 40.0 GB free)"

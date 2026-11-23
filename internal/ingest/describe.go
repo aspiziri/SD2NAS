@@ -96,7 +96,8 @@ func describeDone(in catalog.Ingest) (level, body string) {
 		body += fmt.Sprintf(", %d failed", c.Failed)
 	}
 	if c.Unsupported > 0 {
-		body += fmt.Sprintf(", %d in formats SD2NAS does not import", c.Unsupported)
+		body += fmt.Sprintf(", %d %s not imported", c.Unsupported, plural(c.Unsupported, "file", "files"))
+		body += describeExts(in.UnsupportedExts)
 	}
 	body += "."
 	if !in.SafeToFormat {
@@ -108,4 +109,30 @@ func describeDone(in catalog.Ingest) (level, body string) {
 			in.ClockWarnings, plural(in.ClockWarnings, "file has", "files have"))
 	}
 	return LevelNormal, body
+}
+
+// maxExts is how many unsupported extensions the message names.
+const maxExts = 5
+
+// describeExts names the unsupported extensions, e.g. " (.360, .mkv)", so
+// the owner can decide whether formatting would lose anything.
+func describeExts(exts []string) string {
+	if len(exts) == 0 {
+		return ""
+	}
+	names := make([]string, 0, maxExts)
+	for i, e := range exts {
+		if i == maxExts {
+			break
+		}
+		if e == "" {
+			e = "no extension"
+		}
+		names = append(names, e)
+	}
+	s := strings.Join(names, ", ")
+	if len(exts) > maxExts {
+		s += fmt.Sprintf(" and %d more", len(exts)-maxExts)
+	}
+	return " (" + s + ")"
 }

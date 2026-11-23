@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func TestIngestLifecycle(t *testing.T) {
 	}
 	counts := Counts{Seen: 3, New: 1, InArchive: 1, SeenBefore: 1}
 	err = d.FinishIngest(ctx, Ingest{ID: in.ID, Status: StatusDone, FinishedAt: t2, Counts: counts,
-		ClockWarnings: 2, CardSize: 1234, SafeToFormat: true})
+		ClockWarnings: 2, CardSize: 1234, SafeToFormat: true, UnsupportedExts: []string{".360", ".mkv", ""}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,8 +56,28 @@ func TestIngestLifecycle(t *testing.T) {
 	}
 	if got.ID != in.ID || got.CardPath != "/cards/SONY_A7IV" || got.CardLabel != "SONY_A7IV" || got.CardUUID != "1234-ABCD" ||
 		got.CardSize != 1234 || !got.StartedAt.Equal(t1) || !got.FinishedAt.Equal(t2) || got.Status != StatusDone ||
-		got.Counts != counts || got.ClockWarnings != 2 || !got.SafeToFormat || got.Error != "" {
+		got.Counts != counts || got.ClockWarnings != 2 || !got.SafeToFormat || got.Error != "" ||
+		!reflect.DeepEqual(got.UnsupportedExts, []string{".360", ".mkv", ""}) {
 		t.Fatalf("finished = %+v", got)
+	}
+}
+
+func TestIngestNoUnsupportedExtsReadsNil(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	in := newIngest(t, d)
+	if in.UnsupportedExts != nil {
+		t.Errorf("created UnsupportedExts = %q, want nil", in.UnsupportedExts)
+	}
+	if err := d.FinishIngest(ctx, Ingest{ID: in.ID, Status: StatusDone, FinishedAt: t2, UnsupportedExts: []string{}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.Ingest(ctx, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UnsupportedExts != nil {
+		t.Errorf("finished UnsupportedExts = %q, want nil", got.UnsupportedExts)
 	}
 }
 

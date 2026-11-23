@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -75,18 +76,22 @@ func (c *Counts) Add(o Outcome) {
 
 // Ingest is one import of one card.
 type Ingest struct {
-	ID            int64        `json:"id"`
-	CardPath      string       `json:"card_path"`
-	CardLabel     string       `json:"card_label"`
-	CardUUID      string       `json:"card_uuid"`
-	CardSize      int64        `json:"card_size"`
-	StartedAt     time.Time    `json:"started_at"`
-	FinishedAt    time.Time    `json:"finished_at,omitzero"`
-	Status        IngestStatus `json:"status"`
-	Counts        Counts       `json:"counts"`
-	ClockWarnings int          `json:"clock_warnings"`
-	SafeToFormat  bool         `json:"safe_to_format"`
-	Error         string       `json:"error,omitempty"`
+	ID         int64        `json:"id"`
+	CardPath   string       `json:"card_path"`
+	CardLabel  string       `json:"card_label"`
+	CardUUID   string       `json:"card_uuid"`
+	CardSize   int64        `json:"card_size"`
+	StartedAt  time.Time    `json:"started_at"`
+	FinishedAt time.Time    `json:"finished_at,omitzero"`
+	Status     IngestStatus `json:"status"`
+	Counts     Counts       `json:"counts"`
+	// UnsupportedExts are the distinct extensions of the unsupported files,
+	// lowercase with the dot ("" for a file with no extension), sorted with
+	// "" last. nil when there are none.
+	UnsupportedExts []string `json:"unsupported_exts,omitempty"`
+	ClockWarnings   int      `json:"clock_warnings"`
+	SafeToFormat    bool     `json:"safe_to_format"`
+	Error           string   `json:"error,omitempty"`
 }
 
 // IngestFile is what happened to one file on the card.
@@ -120,7 +125,7 @@ type ClockWarning struct {
 const interruptedMessage = "interrupted: SD2NAS stopped before this import finished"
 
 const ingestCols = "id, card_path, card_label, card_uuid, card_size, started_at, finished_at, status, " +
-	"seen, new, in_archive, in_staging, seen_before, failed, unsupported, clock_warnings, safe_to_format, error"
+	"seen, new, in_archive, in_staging, seen_before, failed, unsupported, unsupported_exts, clock_warnings, safe_to_format, error"
 
 func scanIngest(s scanner) (Ingest, error) {
 	var (
@@ -128,13 +133,22 @@ func scanIngest(s scanner) (Ingest, error) {
 		started  string
 		finished sql.NullString
 		status   string
+		exts     string
 		safe     int
 	)
 	err := s.Scan(&in.ID, &in.CardPath, &in.CardLabel, &in.CardUUID, &in.CardSize, &started, &finished, &status,
 		&in.Counts.Seen, &in.Counts.New, &in.Counts.InArchive, &in.Counts.InStaging, &in.Counts.SeenBefore,
-		&in.Counts.Failed, &in.Counts.Unsupported, &in.ClockWarnings, &safe, &in.Error)
+		&in.Counts.Failed, &in.Counts.Unsupported, &exts, &in.ClockWarnings, &safe, &in.Error)
 	if err != nil {
 		return Ingest{}, err
+	}
+	if exts != "" {
+		if err := json.Unmarshal([]byte(exts), &in.UnsupportedExts); err != nil {
+			return Ingest{}, fmt.Errorf("ingest %d: parse unsupported_exts: %w", in.ID, err)
+		}
+		if len(in.UnsupportedExts) == 0 {
+			in.UnsupportedExts = nil
+		}
 	}
 	in.Status = IngestStatus(status)
 	in.SafeToFormat = safe != 0
@@ -196,7 +210,7 @@ func (d *DB) requireChanged(ctx context.Context, res sql.Result, id int64, verb,
 }
 
 // FinishIngest writes in.Status (must be Terminal), FinishedAt (must be
-// non-zero), Counts, ClockWarnings, CardSize, SafeToFormat and Error to row
+// non-zero), Counts, UnsupportedExts, ClockWarnings, CardSize, SafeToFormat and Error to row
 // in.ID, which must be queued or running (ErrNotFound when there is no row).
 func (d *DB) FinishIngest(ctx context.Context, in Ingest) error {
 	if !in.Status.Terminal() {
@@ -209,13 +223,21 @@ func (d *DB) FinishIngest(ctx context.Context, in Ingest) error {
 	if in.SafeToFormat {
 		safe = 1
 	}
+	exts := ""
+	if len(in.UnsupportedExts) > 0 {
+		b, err := json.Marshal(in.UnsupportedExts)
+		if err != nil {
+			return fmt.Errorf("finish ingest %d: unsupported extensions: %w", in.ID, err)
+		}
+		exts = string(b)
+	}
 	c := in.Counts
 	res, err := d.db.ExecContext(ctx, `UPDATE ingests SET status = ?, finished_at = ?, seen = ?, new = ?,
-		in_archive = ?, in_staging = ?, seen_before = ?, failed = ?, unsupported = ?, clock_warnings = ?,
-		card_size = ?, safe_to_format = ?, error = ?
+		in_archive = ?, in_staging = ?, seen_before = ?, failed = ?, unsupported = ?, unsupported_exts = ?,
+		clock_warnings = ?, card_size = ?, safe_to_format = ?, error = ?
 		WHERE id = ? AND status IN ('queued','running')`,
 		string(in.Status), formatTime(in.FinishedAt), c.Seen, c.New, c.InArchive, c.InStaging, c.SeenBefore,
-		c.Failed, c.Unsupported, in.ClockWarnings, in.CardSize, safe, in.Error, in.ID)
+		c.Failed, c.Unsupported, exts, in.ClockWarnings, in.CardSize, safe, in.Error, in.ID)
 	if err != nil {
 		return fmt.Errorf("finish ingest %d: %w", in.ID, err)
 	}

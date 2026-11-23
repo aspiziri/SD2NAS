@@ -21,6 +21,7 @@ CREATE TABLE ingests (
   seen_before    INTEGER NOT NULL DEFAULT 0,
   failed         INTEGER NOT NULL DEFAULT 0,
   unsupported    INTEGER NOT NULL DEFAULT 0,
+  unsupported_exts TEXT NOT NULL DEFAULT '', -- JSON array of the unsupported files' distinct extensions; '' = none
   clock_warnings INTEGER NOT NULL DEFAULT 0,
   safe_to_format INTEGER NOT NULL DEFAULT 0,
   error          TEXT NOT NULL DEFAULT ''

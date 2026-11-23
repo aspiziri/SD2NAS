@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -32,19 +33,40 @@ type ScanError struct {
 // ScanResult is what Scan found on a card.
 type ScanResult struct {
 	Media       []CardFile  // files the rules import, sorted by Rel
-	Unsupported []CardFile  // media formats the rules don't import (Decision 10), sorted by Rel
+	Unsupported []CardFile  // files neither imported nor ignored (Decision 10), sorted by Rel
 	Errors      []ScanError // unreadable entries below the root
 }
 
-// unsupportedExts are media formats the rules do not import but that the
-// user should be told about (Decision 10). Lowercase, no dot.
-var unsupportedExts = map[string]bool{
-	"heic": true, "heif": true, "hif": true, "tiff": true, "raf": true,
-	"orf": true, "rw2": true, "pef": true, "srw": true, "x3f": true,
-	"3fr": true, "iiq": true, "gpr": true, "crw": true, "nrw": true,
-	"srf": true, "sr2": true, "m4v": true, "3gp": true, "mts": true,
-	"m2ts": true, "mxf": true, "braw": true, "r3d": true, "insv": true,
-	"insp": true,
+// unsupportedExts returns the distinct extensions of files, lowercase with
+// the dot and sorted, with "" (no extension) last; nil for no files.
+func unsupportedExts(files []CardFile) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range files {
+		ext := strings.ToLower(path.Ext(f.Rel))
+		if !seen[ext] {
+			seen[ext] = true
+			out = append(out, ext)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if (out[i] == "") != (out[j] == "") {
+			return out[j] == ""
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+// ignoredExts are camera sidecars and metadata that hold no photo or video
+// (Sony XML/BIN/IND/BNP/INT/INP/DAT/SMI, AVCHD BDM/MPL/CPI, Canon CTG,
+// GoPro THM/LRV, DJI LRF, text files). Every other regular file the rules
+// don't import is unsupported and blocks "safe to format" (Decision 10), so
+// an unknown format is never lost by formatting. Lowercase, no dot.
+var ignoredExts = map[string]bool{
+	"xml": true, "bin": true, "ctg": true, "thm": true, "lrv": true, "lrf": true,
+	"dat": true, "ind": true, "bdm": true, "mpl": true, "cpi": true, "smi": true,
+	"bnp": true, "int": true, "inp": true, "txt": true,
 }
 
 // junkDirNames are directories (matched case-insensitively) that never hold
@@ -63,9 +85,9 @@ func skipDir(name, parent string) bool {
 	return strings.EqualFold(name, "SUB") && strings.EqualFold(parent, "M4ROOT")
 }
 
-// Scan lists the importable and unsupported media files below root, skipping
-// camera and OS housekeeping folders, dot files and anything that is not a
-// regular file. It only reads; it returns an error only when root itself is
+// Scan lists the importable and unsupported files below root, skipping
+// camera and OS housekeeping folders, dot files, ignored sidecars and anything
+// that is not a regular file. It only reads; it returns an error only when root itself is
 // unusable.
 func Scan(root string, rules media.Rules) (ScanResult, error) {
 	info, err := os.Stat(root)
@@ -105,8 +127,7 @@ func Scan(root string, rules media.Rules) (ScanResult, error) {
 		kind, ok := rules.KindOf(name)
 		unsupported := false
 		if !ok {
-			ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(name), "."))
-			if !unsupportedExts[ext] {
+			if ignoredExts[strings.ToLower(strings.TrimPrefix(filepath.Ext(name), "."))] {
 				return nil
 			}
 			unsupported = true
