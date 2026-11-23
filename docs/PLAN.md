@@ -73,7 +73,7 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
 | `/photos` | `/mnt/user/photos` | RW | The `photos` share (array only, no cache). Contains `Archive/` (existing), `Staging/` (created by SD2NAS) and `Management/SD2NAS/` for catalog backups. |
 | `/config` | `/mnt/user/appdata/sd2nas` | RW | SQLite database, thumbnail and preview cache, settings, on the ZFS pool for fast browsing. `appdata` is an exclusive share, so `/mnt/user/appdata` goes straight to the pool and skips Unraid's FUSE share layer, which SQLite's WAL locking doesn't work well on. Without an exclusive share, use the pool path (`/mnt/<pool>/appdata`). |
 
-The container runs as `99:100` (nobody:users) with `UMASK=000` so files stay
+SD2NAS runs as `PUID:PGID`, default `99:100` (nobody:users), with `UMASK=000` so files stay
 editable over SMB, and must have `TZ` set (§13).
 
 ---
@@ -573,7 +573,9 @@ unaffected.
 with the UI embedded → final `alpine` image containing the binary plus
 `tzdata`, `exiftool` (~20 MB, RAW previews for every format including CR3) and
 `ffmpeg` (video poster frames), both installed with `apk`. The M0 image is
-about 280 MB uncompressed, mostly ffmpeg and its libraries. Exposes 8080, runs as `99:100`, with a
+about 280 MB uncompressed, mostly ffmpeg and its libraries. Exposes 8080. The entrypoint starts as root, fixes ownership of `/config`, then
+runs SD2NAS as `PUID:PGID` (default `99:100`) using `su-exec`. It never chowns
+`/photos`. It has a
 `HEALTHCHECK` on `/healthz`.
 
 **GitHub Actions**
@@ -588,14 +590,12 @@ about 280 MB uncompressed, mostly ffmpeg and its libraries. Exposes 8080, runs a
   inside the existing `photos` share.
 - Template `deploy/unraid/sd2nas.xml`: repository, web UI link, port, the three
   paths (with `/cards` as RW/Slave), `UMASK=000`, optional
-  `SD2NAS_TOKEN`, and `--user 99:100` in Extra Parameters. The image isn't
-  linuxserver-based, so it doesn't use their `PUID`/`PGID` convention; the
-  binary applies `UMASK` itself at startup. Unraid passes `TZ` to every
+  `SD2NAS_TOKEN`, and `PUID`/`PGID` (the same convention as linuxserver.io
+  images, so no manual folder setup). The binary applies `UMASK` itself at
+  startup. Starting with `--user` also works: the entrypoint then skips the
+  ownership fix, and `/config` must already be writable. Unraid passes `TZ` to every
   container automatically, so the template doesn't set it; `/healthz` shows the
   value and warns if it's missing.
-- The appdata folder must be owned by `99:100` before the first start
-  (`mkdir -p /mnt/user/appdata/sd2nas && chown 99:100 …`), or `/healthz`
-  reports `/config` as not writable.
 - Install by adding the repo's `deploy/unraid` URL under Docker → Template
   repositories, or by pasting the values into Add Container. Updates show up in
   the Docker tab like any CA app.

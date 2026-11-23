@@ -14,9 +14,8 @@ services:
     environment:
       TZ: America/Los_Angeles
       UMASK: "000"
-    # Docker Desktop bind mounts are writable regardless of uid, so this
-    # matches the Unraid user without any chown on the desktop.
-    user: "99:100"
+      PUID: "99"
+      PGID: "100"
     volumes:
       - ../tmp/cards:/cards:ro
       - ../tmp/photos:/photos
