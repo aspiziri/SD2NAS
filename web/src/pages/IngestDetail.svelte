@@ -11,32 +11,50 @@
   let error = $state('');
   const MAX = 200; // longest file list shown
 
+  let ctl = null; // the in-flight request; starting another aborts it
+
+  // load keeps the last good data on screen if a refetch fails.
   async function load() {
     if (!isId(id)) {
       error = 'There is no such import.';
       return;
     }
+    ctl?.abort();
+    const mine = (ctl = new AbortController());
     try {
-      ingest = await api(`/api/ingests/${id}`);
+      const data = await api(`/api/ingests/${id}`, { signal: mine.signal });
+      ingest = data;
       error = '';
     } catch (err) {
+      if (err.name === 'AbortError') return;
       error = err.status === 503 ? `Ingest is unavailable: ${err.message}` : err.message;
     }
   }
 
   // Load once, again when this import finishes, and again when the live
-  // stream reconnects (events missed while it was down are not replayed).
+  // stream comes back after a drop (events missed meanwhile are not replayed).
+  // The first connection of a fresh page is not a reconnect.
   let started = false;
+  let wasConnected = false;
+  let wasConnectedEver = false;
+  let finishedSeen = 0;
   $effect(() => {
-    const f = live.finished;
     const connected = live.connected;
+    const finishedCount = live.finishedCount;
+    const f = live.finished;
     untrack(() => {
-      if (!started || connected || (f && String(f.id) === id)) {
+      const reconnected = connected && !wasConnected && wasConnectedEver;
+      if (connected) wasConnectedEver = true;
+      wasConnected = connected;
+      const finished = finishedCount !== finishedSeen && f && String(f.id) === id;
+      finishedSeen = finishedCount;
+      if (!started || reconnected || finished) {
         started = true;
         load();
       }
     });
   });
+  $effect(() => () => ctl?.abort());
 
   const files = $derived(ingest?.files ?? []);
   const groups = $derived(groupKnown(files));
@@ -59,12 +77,13 @@
 
 <p><a href="/ingest" class="btn">← Card ingest</a></p>
 
-{#if error}
+{#if error && !ingest}
   <div class="note bad">{error}</div>
 {:else if !ingest}
   <p class="muted">Loading…</p>
 {:else}
   {@const c = ingest.counts}
+  {#if error}<div class="note bad" role="alert">Couldn't refresh this import: {error}</div>{/if}
   <h1>{cardName(ingest)}</h1>
   <p class="sub">
     {formatWhen(ingest.started_at)} · <span class="mono">{ingest.card_path}</span>{#if ingest.card_size} · {formatBytes(ingest.card_size)} of photos and videos{/if}

@@ -8,38 +8,71 @@
   const PAGE = 20;
   let ingests = $state([]);
   let loading = $state(true);
+  let busy = $state(false); // a request is in flight
   let error = $state('');
   let unavailable = $state(false); // the server has no ingest routes (catalog can't open)
   let more = $state(false);
+  let ctl = null; // the in-flight request; starting another aborts it
 
-  async function load(before = 0) {
+  // run fetches the history with limit n (after the id `before`, if given) and
+  // hands the rows to apply. A newer run aborts this one, and its AbortError is
+  // not an error. A failure keeps whatever is already on screen.
+  async function run(n, before, apply) {
+    ctl?.abort();
+    const mine = (ctl = new AbortController());
+    busy = true;
     try {
-      const data = await api(`/api/ingests?limit=${PAGE}` + (before ? `&before=${before}` : ''));
-      ingests = before ? [...ingests, ...data.ingests] : data.ingests;
-      more = data.ingests.length === PAGE;
+      const data = await api(`/api/ingests?limit=${n}` + (before ? `&before=${before}` : ''), { signal: mine.signal });
+      apply(data.ingests);
+      more = data.ingests.length === n;
       error = '';
       unavailable = false;
     } catch (err) {
-      unavailable = err.status === 404 || err.status === 503;
+      if (err.name === 'AbortError') return;
+      unavailable = !ingests.length && (err.status === 404 || err.status === 503);
       error = err.message;
     } finally {
-      loading = false;
+      if (ctl === mine) {
+        busy = false;
+        loading = false;
+      }
     }
   }
 
-  // Load on mount, again when an import finishes, and again whenever the live
-  // stream reconnects: events missed while it was down are not replayed.
+  // Refresh keeps as many rows as are shown, and replaces them at once.
+  const refresh = () => {
+    const n = Math.min(Math.max(PAGE, ingests.length), 1000);
+    return run(n, 0, (rows) => (ingests = rows));
+  };
+  const loadMore = () =>
+    run(PAGE, ingests[ingests.length - 1].id, (rows) => {
+      const have = new Set(ingests.map((i) => i.id));
+      ingests = [...ingests, ...rows.filter((i) => !have.has(i.id))];
+    });
+
+  // Load on mount, again when an import finishes, and again when the live
+  // stream comes back after a drop: events missed while it was down are not
+  // replayed. The first connection of a fresh page is not a reconnect.
   let started = false;
+  let wasConnected = false;
+  let wasConnectedEver = false;
+  let finishedSeen = 0;
   $effect(() => {
-    live.finishedCount;
     const connected = live.connected;
+    const finishedCount = live.finishedCount;
     untrack(() => {
-      if (connected || !started) {
+      const reconnected = connected && !wasConnected && wasConnectedEver;
+      if (connected) wasConnectedEver = true;
+      wasConnected = connected;
+      const finished = finishedCount !== finishedSeen;
+      finishedSeen = finishedCount;
+      if (!started || reconnected || finished) {
         started = true;
-        load();
+        refresh();
       }
     });
   });
+  $effect(() => () => ctl?.abort());
 </script>
 
 <h1>Card ingest</h1>
@@ -54,7 +87,10 @@
 
   <div class="card">
     <h2>Recent imports</h2>
-    {#if error}
+    {#if error && ingests.length}
+      <div class="note bad" role="alert">Couldn't refresh the import history: {error}</div>
+    {/if}
+    {#if error && !ingests.length}
       <div class="note bad">Couldn't load the import history: {error}</div>
     {:else if loading}
       <p class="muted">Loading…</p>
@@ -92,7 +128,7 @@
         {/each}
       </ul>
       {#if more}
-        <p><button class="btn" onclick={() => load(ingests[ingests.length - 1].id)}>Load more</button></p>
+        <p><button class="btn" disabled={busy} onclick={loadMore}>Load more</button></p>
       {/if}
     {/if}
   </div>
