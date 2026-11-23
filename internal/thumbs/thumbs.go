@@ -286,12 +286,15 @@ func writeJPEG(dst string, img image.Image, quality int) (err error) {
 	return os.Rename(f.Name(), dst)
 }
 
-// renderSource decodes src into an upright image of any size. Task 6 adds
-// the raw and video cases.
+// renderSource decodes src into an upright image of any size.
 func (c *Cache) renderSource(ctx context.Context, src Source) (image.Image, error) {
 	switch src.Kind {
 	case media.KindImage:
 		return decodeImage(src.Path)
+	case media.KindRaw:
+		return c.rawPreview(ctx, src.Path)
+	case media.KindVideo:
+		return c.videoFrame(ctx, src.Path)
 	}
 	return nil, fmt.Errorf("no renderer for kind %q", src.Kind)
 }
