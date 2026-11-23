@@ -59,6 +59,15 @@ type Service struct {
 	status Status
 	notify func(Status)
 	closed bool
+
+	pmu        sync.Mutex // guards the promote fields below; take s.mu first when both are needed
+	queue      []*queuedJob
+	running    *queuedJob
+	last       *PromoteJob
+	jobSeq     int64
+	working    bool // a worker goroutine is draining the queue
+	promoteFn  func(PromoteQueue)
+	lastReport time.Time
 }
 
 // New is NewService with only the catalog and the photos root.
@@ -152,6 +161,7 @@ func (s *Service) Close() {
 	s.closed = true
 	s.mu.Unlock()
 	s.bgCancel()
+	s.dropQueue()
 	s.wg.Wait()
 }
 

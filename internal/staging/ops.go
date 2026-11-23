@@ -36,8 +36,8 @@ func (s *Service) rows(ctx context.Context, ids []int64) ([]catalog.StagingFolde
 }
 
 // busyNamed fills in a *BusyError's display name: the folder's name from
-// rows, or for a directory-name key the name without "Staging/". (Task 7
-// adds whether a promote holding it is still queued.) Other errors pass.
+// rows, or for a directory-name key the name without "Staging/"; for a
+// promote's key it says whether the job is still queued. Other errors pass.
 func (s *Service) busyNamed(err error, rows []catalog.StagingFolder) error {
 	var busy *BusyError
 	if !errors.As(err, &busy) {
@@ -50,6 +50,9 @@ func (s *Service) busyNamed(err error, rows []catalog.StagingFolder) error {
 		if busy.ID != 0 && r.ID == busy.ID {
 			busy.Name = r.Name
 		}
+	}
+	if busy.Holder == HolderPromote {
+		busy.Queued = s.promoteQueued(busy.ID, busy.Name)
 	}
 	return err
 }
