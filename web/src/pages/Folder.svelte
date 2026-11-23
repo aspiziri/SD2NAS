@@ -81,6 +81,7 @@
   // The preview takes a history entry, so the phone's back gesture closes
   // it instead of leaving the folder.
   function show(i) {
+    if (open >= 0) return; // already open: never push a second history entry
     open = i;
     history.pushState({ lightbox: true }, '');
   }

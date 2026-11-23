@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from 'svelte';
   import { formatBytes, formatCapture, extLabel } from '../lib/format.js';
 
   let { files, index = $bindable(), onclose } = $props();
@@ -8,20 +9,55 @@
   let failed = $state(false);
   let chrome = $state(true); // top and bottom bars
 
-  // A new file: reset the load state and warm the neighbours' previews.
+  const sha = $derived(file.sha256);
+
+  // A new file (not merely a refetched list): reset the load state and warm
+  // the neighbours' previews.
   $effect(() => {
-    file.sha256;
+    sha;
     loaded = false;
     failed = false;
-    for (const j of [index - 1, index + 1]) {
-      if (j >= 0 && j < files.length) new Image().src = `/api/preview/${files[j].sha256}`;
-    }
+    untrack(() => {
+      for (const j of [index - 1, index + 1]) {
+        if (j >= 0 && j < files.length) new Image().src = `/api/preview/${files[j].sha256}`;
+      }
+    });
   });
 
+  let dialog;
+
+  // Modal: lock scroll, make the page behind inert, focus the dialog, and
+  // give focus back to whatever opened it on close.
   $effect(() => {
+    const opener = document.activeElement;
+    const app = document.querySelector('.app');
     document.body.classList.add('noscroll');
-    return () => document.body.classList.remove('noscroll');
+    if (app) app.inert = true;
+    dialog.focus();
+    return () => {
+      document.body.classList.remove('noscroll');
+      if (app) app.inert = false;
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+    };
   });
+
+  // Render the dialog directly under <body> so the inert page doesn't contain it.
+  function portal(node) {
+    document.body.appendChild(node);
+  }
+
+  function trapTab(e) {
+    const items = [...dialog.querySelectorAll('button:not(:disabled)')];
+    if (items.length === 0) {
+      e.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const at = items.indexOf(document.activeElement);
+    const to = e.shiftKey ? (at <= 0 ? items.length - 1 : at - 1) : at === items.length - 1 ? 0 : at + 1;
+    e.preventDefault();
+    items[to].focus();
+  }
 
   function prev() {
     if (index > 0) index -= 1;
@@ -32,6 +68,10 @@
 
   function onkeydown(e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === 'Tab') {
+      trapTab(e);
+      return;
+    }
     if (e.key === 'ArrowLeft') prev();
     else if (e.key === 'ArrowRight') next();
     else if (e.key === 'Escape') onclose();
@@ -66,9 +106,9 @@
 
 <svelte:window {onkeydown} />
 
-<div class="lightbox" role="dialog" aria-modal="true" aria-label={file.name}>
+<div class="lightbox" role="dialog" aria-modal="true" aria-label={file.name} tabindex="-1" bind:this={dialog} use:portal>
   <div class="stage" role="presentation" {onpointerdown} {onpointerup} onpointercancel={() => (start = null)}>
-    {#key file.sha256}
+    {#key sha}
       <img src="/api/preview/{file.sha256}" alt={file.name} draggable="false" class:hidden={!loaded}
         onload={() => (loaded = true)} onerror={() => (failed = true)} />
     {/key}
@@ -97,6 +137,7 @@
 </div>
 
 <style>
+  .lightbox:focus { outline: none; }
   .lightbox { position: fixed; inset: 0; z-index: 50; background: #000; color: var(--text); }
   .stage { position: absolute; inset: 0; display: grid; place-items: center; touch-action: none; user-select: none; }
   .stage img { max-width: 100%; max-height: 100%; object-fit: contain; -webkit-user-drag: none; }
