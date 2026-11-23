@@ -22,12 +22,19 @@ func CleanPartials(stagingRoot string) ([]string, error) {
 	var removed []string
 	err := filepath.WalkDir(stagingRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// A staging operation may rename or remove a folder mid-walk.
+			if path != stagingRoot && errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if !d.Type().IsRegular() || !strings.HasSuffix(d.Name(), media.PartialSuffix) {
 			return nil
 		}
 		if err := os.Remove(path); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		rel, err := filepath.Rel(stagingRoot, path)
