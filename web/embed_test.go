@@ -48,4 +48,14 @@ func TestBuiltUI(t *testing.T) {
 	if _, err := fs.Stat(d, ".placeholder"); err != nil {
 		t.Errorf("the build removed dist/.placeholder; go:embed fails on a fresh checkout without it: %v", err)
 	}
+	for _, want := range []string{`rel="manifest" href="/manifest.webmanifest"`, `rel="apple-touch-icon"`} {
+		if !strings.Contains(string(index), want) {
+			t.Errorf("index.html has no %s", want)
+		}
+	}
+	for _, name := range []string{"manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"} {
+		if _, err := fs.Stat(d, name); err != nil {
+			t.Errorf("dist has no %s: %v", name, err)
+		}
+	}
 }
