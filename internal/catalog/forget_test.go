@@ -126,6 +126,10 @@ func TestForgetAssets(t *testing.T) {
 	if ws, err := f.d.ClockWarnings(ctx, 1); err != nil || len(ws) != 0 {
 		t.Errorf("clock warnings = %v, %v; want none", ws, err)
 	}
+	var aliases int
+	if err := f.d.db.QueryRowContext(ctx, "SELECT count(*) FROM aliases").Scan(&aliases); err != nil || aliases != 0 {
+		t.Errorf("alias rows = %d, %v; want 0", aliases, err)
+	}
 	wantPath(t, f.d, f.dd, "Archive/d.jpg", StateArchived)
 	wantPath(t, f.d, f.e, "Staging/x/e.jpg", StateStaged)
 	after, err := f.d.IngestFiles(ctx, 1)

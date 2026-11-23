@@ -92,6 +92,9 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 const schemaV2 = `
 ALTER TABLE ingests ADD COLUMN forgotten_at TEXT;   -- set by "Forget this import"; NULL = never
 CREATE INDEX assets_first_ingest ON assets(first_ingest);
+-- Forgetting deletes per asset: keep those deletes (and the foreign-key checks) off full scans.
+CREATE INDEX fingerprints_sha256 ON fingerprints(sha256);
+CREATE INDEX aliases_sha256 ON aliases(sha256);
 
 -- Folder ids are never reused (a lock or a waiter may still hold a deleted
 -- folder's id): rebuild staging_folders with AUTOINCREMENT, keeping every id.

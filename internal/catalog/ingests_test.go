@@ -421,26 +421,12 @@ func TestMigrateV1ToV2(t *testing.T) {
 	if err != nil || !in.ForgottenAt.IsZero() {
 		t.Fatalf("ingest = %+v, %v", in, err)
 	}
-	var found bool
-	rows, err := d.db.QueryContext(ctx, "SELECT name FROM pragma_index_list('assets')")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			t.Fatal(err)
+	for _, want := range [][2]string{{"assets", "assets_first_ingest"}, {"fingerprints", "fingerprints_sha256"}, {"aliases", "aliases_sha256"}} {
+		var n int
+		err := d.db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_index_list(?) WHERE name = ?", want[0], want[1]).Scan(&n)
+		if err != nil || n != 1 {
+			t.Errorf("index %s on %s: count %d, %v; want 1", want[1], want[0], n, err)
 		}
-		found = found || n == "assets_first_ingest"
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if err := rows.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if !found {
-		t.Error("index assets_first_ingest missing")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
@@ -81,40 +82,12 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 	if !in.ForgottenAt.IsZero() {
 		return ForgetResult{}, ErrAlreadyForgotten
 	}
-	assets, err := s.db.IngestAssets(ctx, ingestID)
+	forget, staged, ids, err := s.forgetPlan(ctx, ingestID)
 	if err != nil {
 		return ForgetResult{}, err
 	}
-	all, err := s.db.StagingFolders(ctx)
-	if err != nil {
-		return ForgetResult{}, err
-	}
-	byName := map[string]catalog.StagingFolder{}
-	for _, r := range all {
-		byName[r.Name] = r
-	}
-	res := ForgetResult{Removed: []int64{}}
-	var forget, staged []catalog.Asset
-	folderIDs := map[int64]bool{}
-	for _, a := range assets {
-		switch a.State {
-		case catalog.StateStaged:
-			staged = append(staged, a)
-			if name, _, ok := strings.Cut(strings.TrimPrefix(a.RelPath, Dir+"/"), "/"); ok {
-				if r, known := byName[name]; known {
-					folderIDs[r.ID] = true
-				}
-			}
-			forget = append(forget, a)
-		case catalog.StateCulled:
-			forget = append(forget, a)
-		case catalog.StateArchived:
-			res.KeptArchived++
-		}
-	}
-	ids := make([]int64, 0, len(folderIDs))
-	for id := range folderIDs {
-		ids = append(ids, id)
+	if forgetAfterRead != nil {
+		forgetAfterRead()
 	}
 	rows, release, err := s.lockFolders(ctx, uniqueIDs(ids))
 	if err != nil {
@@ -122,6 +95,35 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 	}
 	defer release()
 	defer s.changed()
+	// Read again under the locks: a rename or move that landed since the
+	// first read changed the paths and may have left a folder unlocked.
+	in, err = s.db.Ingest(ctx, ingestID)
+	if err != nil {
+		return ForgetResult{}, err
+	}
+	if !in.ForgottenAt.IsZero() {
+		return ForgetResult{}, ErrAlreadyForgotten
+	}
+	forget, staged, ids, err = s.forgetPlan(ctx, ingestID)
+	if err != nil {
+		return ForgetResult{}, err
+	}
+	locked := map[int64]bool{}
+	for _, r := range rows {
+		locked[r.ID] = true
+	}
+	for _, id := range ids {
+		if !locked[id] {
+			return ForgetResult{}, ErrChanged
+		}
+	}
+	res := ForgetResult{Removed: []int64{}}
+	for _, a := range forget {
+		if a.State == catalog.StateArchived {
+			res.KeptArchived++
+		}
+	}
+	forget = slices.DeleteFunc(forget, func(a catalog.Asset) bool { return a.State == catalog.StateArchived })
 	// Files first, then the catalog (global rule): a delete that fails half
 	// way leaves the import unforgotten, so Forget can simply run again
 	// (a file already gone counts as deleted); the rescan meanwhile culls
@@ -152,6 +154,10 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 	res.Forgotten = len(gone)
 	s.removed(gone)
 	if err := s.db.MarkIngestForgotten(ctx, ingestID, s.now()); err != nil {
+		// Another forget of this import may have won the race.
+		if in, rerr := s.db.Ingest(ctx, ingestID); rerr == nil && !in.ForgottenAt.IsZero() {
+			err = errors.Join(ErrAlreadyForgotten, err)
+		}
 		return res, errors.Join(err, syncDirs(touched))
 	}
 	if deleteFiles {
@@ -166,6 +172,49 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 		}
 	}
 	return res, syncDirs(touched)
+}
+
+// forgetAfterRead is a test seam: it runs between Forget's first read and
+// its folder locks.
+var forgetAfterRead func()
+
+// forgetPlan reads import ingestID's assets: those to forget (staged and
+// culled) and archived ones (kept) in forget, the staged ones in staged,
+// and the ids of the folders holding the staged ones. A staged asset that
+// is not inside a known staging folder is ErrChanged.
+func (s *Service) forgetPlan(ctx context.Context, ingestID int64) (forget, staged []catalog.Asset, ids []int64, err error) {
+	assets, err := s.db.IngestAssets(ctx, ingestID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	all, err := s.db.StagingFolders(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	byName := map[string]catalog.StagingFolder{}
+	for _, r := range all {
+		byName[r.Name] = r
+	}
+	seen := map[int64]bool{}
+	for _, a := range assets {
+		switch a.State {
+		case catalog.StateStaged:
+			name, _, ok := strings.Cut(strings.TrimPrefix(a.RelPath, Dir+"/"), "/")
+			r, known := byName[name]
+			if !strings.HasPrefix(a.RelPath, Dir+"/") || !ok || !known {
+				return nil, nil, nil, ErrChanged
+			}
+			staged = append(staged, a)
+			forget = append(forget, a)
+			if !seen[r.ID] {
+				seen[r.ID] = true
+				ids = append(ids, r.ID)
+			}
+		case catalog.StateCulled, catalog.StateArchived:
+			forget = append(forget, a)
+		}
+	}
+	return forget, staged, ids, nil
 }
 
 // ForgetCulled forgets that import ingestID's culled "seen before" files

@@ -264,3 +264,78 @@ func TestForgetCulled(t *testing.T) {
 	}
 	e.lockFree(t, f.ID)
 }
+
+// A move that lands between Forget's first read and its locks leaves a file
+// in a folder Forget did not lock: nothing is deleted or forgotten.
+func TestForgetChangedUnderLock(t *testing.T) {
+	e := newOpsEnv(t)
+	id, f, staged, _, _ := importOf(t, e, forgetStaged, []string{"culled"}, nil)
+	forgetAfterRead = func() {
+		if _, err := e.svc.Move(t.Context(), MoveRequest{SHAs: staged[:1], NewTitle: "Other"}); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { forgetAfterRead = nil })
+	_, err := e.svc.Forget(t.Context(), id, true)
+	if !errors.Is(err, ErrChanged) {
+		t.Fatalf("err = %v, want ErrChanged", err)
+	}
+	forgetAfterRead = nil
+	e.mustExist(t, "Staging/2025-05-30/b.jpg", "Staging/2025-05-30 - Other/a.jpg")
+	for _, sha := range staged {
+		if a := e.asset(t, sha); a.State != catalog.StateStaged {
+			t.Errorf("asset %s = %s, want staged", sha[:4], a.State)
+		}
+	}
+	if in, err := e.db.Ingest(t.Context(), id); err != nil || !in.ForgottenAt.IsZero() {
+		t.Errorf("ingest = %+v, %v; want not forgotten", in, err)
+	}
+	if shas, err := e.db.CulledSeenBefore(t.Context(), id); err != nil || len(shas) != 1 {
+		t.Errorf("culled files = %v, %v; want 1", shas, err)
+	}
+	e.lockFree(t, f.ID)
+	// Retrying after the reload works and deletes both files at their new places.
+	got, err := e.svc.Forget(t.Context(), id, true)
+	if err != nil || got.DeletedFiles != 2 {
+		t.Fatalf("retry = %+v, %v; want 2 deleted files", got, err)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30/b.jpg", "Staging/2025-05-30 - Other/a.jpg")
+}
+
+// A rename that lands in the gap keeps the folder id: Forget deletes the
+// files at their new paths.
+func TestForgetRenamedUnderLock(t *testing.T) {
+	e := newOpsEnv(t)
+	id, f, _, _, _ := importOf(t, e, forgetStaged, nil, nil)
+	forgetAfterRead = func() {
+		if _, err := e.svc.Rename(t.Context(), f.ID, "Trip"); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { forgetAfterRead = nil })
+	got, err := e.svc.Forget(t.Context(), id, true)
+	if err != nil || got.DeletedFiles != 2 || got.Forgotten != 2 {
+		t.Fatalf("Forget = %+v, %v; want 2 deleted and forgotten", got, err)
+	}
+	if files := e.files(t); len(files) != 0 {
+		t.Errorf("files left: %v", files)
+	}
+}
+
+// Forgets of an import with no staged files take no folder lock; the loser
+// of the race still gets ErrAlreadyForgotten.
+func TestForgetTwiceWithoutStagedFiles(t *testing.T) {
+	e := newOpsEnv(t)
+	id, _, _, _, _ := importOf(t, e, nil, []string{"culled"}, nil)
+	forgetAfterRead = func() {
+		forgetAfterRead = nil
+		if _, err := e.svc.Forget(t.Context(), id, false); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { forgetAfterRead = nil })
+	_, err := e.svc.Forget(t.Context(), id, false)
+	if !errors.Is(err, ErrAlreadyForgotten) {
+		t.Fatalf("err = %v, want ErrAlreadyForgotten", err)
+	}
+}
