@@ -114,7 +114,7 @@ neither imports nor ignores, turn it into a warning instead.
   if the share would drop below a reserve (default 50 GB). The card stays
   mounted and a notification explains why.
 - Staging shows a warning banner, plus a daily notification, when a folder has
-  been in staging longer than 30 days. The threshold is a setting.
+  been in staging longer than 30 days. The threshold is a setting. It is `staging_warn_days` (default 30, 0 turns it off); the daily notification comes with M6's card script.
 
 **Catalog backup:** the database is the only record of what you culled, and
 that can't be rebuilt from the archive. Nightly, after the rescan, SD2NAS writes
@@ -272,6 +272,7 @@ matches.
 **Culled stays remembered:** culling or discarding deletes the file and sets
 `state = culled`, `rel_path = NULL`. The row and fingerprint stay, so it's
 skipped on future ingests. The ingest summary offers "Re-import anyway".
+"Forget this import" (§8) is the one exception to "never deleted": it deletes the forgotten assets' fingerprints so the card imports them again. Schema version 2 adds `ingests.forgotten_at`.
 
 ---
 
@@ -337,7 +338,9 @@ removed by hand over SMB.
 a lock on each staging folder it touches. If you try to merge or rename a folder
 that a card ingest is currently filling, the API returns `409 Conflict` and the
 UI says "this folder is being imported into". Locks are held for one operation,
-never across user think time.
+never across user think time. The one exception is a queued promote, which
+holds its folders' locks from the moment it is queued. Locks also cover the
+directory names an operation creates.
 
 | Operation | Filesystem | Catalog |
 |---|---|---|
@@ -346,16 +349,20 @@ never across user think time.
 | Merge N → 1 | move files into the target folder (collision loop), remove empty sources | union `dates`, update paths |
 | Move files | same as merge, per file; "New folder…" creates one | update paths and dates |
 | Cull files / discard folder | delete files | `state = culled`, `rel_path = NULL` |
-| Forget an import | optionally delete the import's files still in `Staging/` | delete the import's `staged` and `culled` asset rows and their fingerprints, so the same card imports them again; `archived` rows are never forgotten (that would import archive duplicates); the ingest stays in the history marked as forgotten |
-| Promote | `os.Rename(Staging/X, Archive/<pattern>)`, instant within the share. If the target folder already exists, merge into it file by file with the collision loop. If a rename ever returns `EXDEV`, fall back to copy, verify hash, delete. | `state = archived`, new paths, drop the `staging_folders` row |
+| Forget an import | optionally delete the import's files still in `Staging/` first | then delete the import's `staged` and `culled` asset rows and their fingerprints, so the same card imports them again; `archived` rows are never forgotten (that would import archive duplicates); the ingest stays in the history marked as forgotten |
+| Promote (queued, one job at a time) | `os.Rename(Staging/X, Archive/<pattern>)`, instant within the share. If the target folder already exists, merge into it file by file with the collision loop. If a rename ever returns `EXDEV`, fall back to copy, verify hash, delete. | `state = archived`, new paths, drop the `staging_folders` row |
 
-**M3 (read-only) lists from the catalog.** Until M4's startup reconcile, a
-staging folder's files are the `staged` assets under `Staging/<name>/` in the
-catalog, not a directory scan (thumbnails and clock warnings need the content
-hash, which only the catalog has). `Staging/` is read only to report
-directories with no catalog row ("untracked") and rows whose directory is
-gone ("Not found on disk"). Files added or removed over SMB therefore don't
-show in the UI until M4's reconcile picks them up.
+**Listing and reconcile.** A staging folder's files are the `staged`
+assets under `Staging/<name>/` in the catalog (thumbnails and clock
+warnings need the content hash). The reconcile pass, at startup and from
+"Rescan staging", brings the catalog in line with the disk: it adopts
+directories with no row and media files the catalog doesn't know, follows
+files moved by hand, culls files deleted by hand, and drops rows whose
+directory is gone. Non-media files are left alone, and nothing is changed
+when `Staging/` itself is missing. "Forget an import" covers the assets the
+import brought in and the ones any of its file rows names (so forgetting a
+card's second import also forgets what its first brought in); archived ones
+are never forgotten.
 
 **Folder naming follows the existing archive:** `YYYY-MM-DD - Title`, e.g.
 `2007-11-10 - SMU Homecoming`. New staging folders start as just `YYYY-MM-DD`.
@@ -426,12 +433,13 @@ mockup. Everything else is reversible by doing the opposite operation.
 
 JSON throughout. Server-sent events at `/api/events` push ingest progress,
 staging changes, promote jobs and indexer progress, which replaces
-CameraImport's polling. Event types: `ingest.current` and `ingest.finished` (M3); `staging.changed`, `promote.progress` and `indexer.progress` are reserved for M4 and M5.
+CameraImport's polling. Event types: `ingest.current` and `ingest.finished` (M3); `staging.changed` and `promote.progress` (M4; it carries `{running, queued, last}`); `indexer.progress` is reserved for M5.
 
 ```
 POST   /api/ingest                       {path,label,uuid}  ?wait=1 blocks until done
 GET    /api/ingest/current
 POST   /api/ingest/{id}/reimport-culled
+GET    /api/ingest/{id}/forget           what forgetting would do (M4)
 POST   /api/ingest/{id}/forget           {deleteFiles}  (M4)
 GET    /api/ingests                      history
 GET    /api/ingests/{id}                 summary + skipped-file breakdown + clock warnings
@@ -443,7 +451,10 @@ POST   /api/staging/merge                {ids[], title}
 POST   /api/staging/move                 {fileShas[], toId | newTitle}
 POST   /api/staging/cull                 {fileShas[]}
 DELETE /api/staging/{id}                 discard folder
-POST   /api/staging/promote              {ids[], pattern} → job id
+POST   /api/staging/promote              {ids[], pattern} → 202, queues a job
+GET    /api/staging/promote              the running job, the queue and the last finished job
+DELETE /api/staging/promote/{jobId}     cancel a queued promote
+POST   /api/staging/rescan               reconcile Staging/ with the disk
 
 GET    /api/thumbs/{sha}                 small (~400px), cached
 GET    /api/preview/{sha}                large (~1600px) for the phone lightbox
@@ -738,19 +749,55 @@ exits in about 0.5 s. `@sveltejs/vite-plugin-svelte` 7.3.1 was approved as a
 dev dependency alongside `svelte` 5.59.1 and `vite` 8.3.8.
 
 ### M4: Staging operations
-- [ ] Rename, merge, move files, cull, discard, promote (background job), all with tests on temp dirs
-- [ ] Folder locks; 409 on conflict with a running ingest
-- [ ] Startup reconcile for changes made over SMB
-- [ ] Adopt staging directories that have no catalog row (shown as "untracked" since M3) in the startup reconcile
-- [ ] Staging age warnings
-- [ ] "Forget this import" on the import detail page (§8): the same card can be imported again, e.g. to retest; archived files stay known
-- [ ] Touch-friendly selection (long-press to start selecting, swipe-select in grids)
+- [x] Rename, merge, move files, cull, discard, promote (background job), all with tests on temp dirs
+- [x] Folder locks; 409 on conflict with a running ingest
+- [x] Startup reconcile for changes made over SMB
+- [x] Adopt staging directories that have no catalog row (shown as "untracked" since M3) in the startup reconcile
+- [x] Staging age warnings
+- [x] "Forget this import" on the import detail page (§8): the same card can be imported again, e.g. to retest; archived files stay known
+- [x] Touch-friendly selection (long-press to start selecting, swipe-select in grids)
+
+Implementation plan: `docs/plans/m4-staging-ops.md`. Imports hold the lock
+of every staging folder they write into until they end; operations take
+their locks (folder ids, plus the directory names they create) without
+waiting and answer 409 (`folder_busy`, naming who holds it) when one is
+busy; the rescan skips busy folders and names. Merge and promote
+move every file of a folder, keeping its path inside the folder (so
+`Capture/`, `Videos/` and any sidecars survive); discard and cull delete only
+catalogued files, so a folder holding untracked files stays. Promotes
+queue: each request adds a job that locks its folders at once (a waiting
+folder can't be changed, and the job can be cancelled until it starts),
+jobs run one after another (`promote.progress` carries the queue), and each
+folder is an instant rename when the archive folder doesn't exist, a
+file-by-file merge with the collision loop when it does, copy-verify-delete
+across filesystems. Shutdown drops the queue (its folders stay in Staging).
+The startup reconcile also runs from "Rescan staging": it adopts untracked
+folders and media, follows files moved by hand, culls files deleted by hand,
+and does nothing when `Staging/` is missing or vanishes mid-pass. It skips NAS
+metadata and hidden directories (`@eaDir`, `.@__thumb`, `#recycle`, dot-names),
+logs every problem and reports how many it left out of the list. "Forget this
+import" deletes the import's staged and culled assets with their fingerprints,
+aliases and clock warnings (optionally its files in Staging/): files first,
+then catalog rows, so a half-failed delete leaves the import un-forgotten and
+re-runnable; it re-reads the import's files under the folder locks. The ingest
+row gets `forgotten_at` (schema version 2, which also indexes
+`fingerprints(sha256)`, `aliases(sha256)` and `assets(first_ingest)`). An
+import's assets are the ones it brought in and the ones any of its file rows
+names, so forgetting the second import of a card forgets what the first
+brought in too. Staging folder ids are never reused (`AUTOINCREMENT`).
+"Re-import anyway" forgets the culls of an import's seen-before files and
+starts an import if the card is still mounted. Culled, discarded and forgotten
+files lose their cached thumbnails. Folders older than `staging_warn_days`
+(default 30) are flagged. The UI selects by click, Ctrl/⌘-click, Shift-click
+and checkboxes on desktop, and by long-press and drag on touch.
+- [ ] Owner's hardware checks: real long-press and swipe-select on iOS, and a promote on the real share
 
 ### M5: Archive indexer
 - [ ] Resumable backfill with progress, Capture One skip rules, move detection
 - [ ] Nightly rescan, aliases, "changed since indexed" view
 - [ ] Nightly catalog backup to the array
 - [ ] Backfill run against the real archive
+- [ ] When the indexer finds content in `Archive/` whose asset is `culled` (a promote interrupted between the rename and the catalog write), mark it `archived` at that path
 - [ ] `missing` assets (catalogued copy vanished without a cull) stay known so they are not re-imported, but do not count toward safe to format: add a blocking count and message ('N files' archive copies are missing')
 
 ### M6: Unraid integration
@@ -760,11 +807,13 @@ dev dependency alongside `svelte` 5.59.1 and `vite` 8.3.8.
 - [ ] Recover from a panic in the ingest worker (fail the job, keep serving); `catalog.tx` must roll back in a defer first so a panic can't leak the single connection
 - [ ] Take an exclusive lock on `/config` at startup so a second instance can't fail the live job or delete its partials
 - [ ] The fallback poller must register its jobs with the API's ingest feed (`watch`), as `POST /api/ingest` does, so short imports still send `ingest.finished`
+- [ ] Daily notification for folders in staging longer than `staging_warn_days`
 
 ### M7: Polish
 - [ ] Extra staging views (timeline, list)
 - [ ] "Shift times" tool for wrong camera clocks
 - [ ] Optional token auth
+- [ ] Settings page: `staging_warn_days`, the default promote pattern (now remembered per device), `day_starts_at`
 - [ ] Cache thumbnail render failures per file so a corrupt file isn't re-rendered on every view
 - [ ] Byte-level copy progress for long videos (progress currently updates once per file)
 - [ ] Keep one `exiftool -stay_open` process for RAW thumbnails instead of one process per file
