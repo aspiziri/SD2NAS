@@ -98,6 +98,31 @@ func TestCaptureTimePNGUsesMtime(t *testing.T) {
 	}
 }
 
+// A .cr3 is ISO-BMFF, which goexif can't parse: it would scan the whole file
+// for an APP1 marker. The fake file carries a valid JPEG EXIF block, so a
+// CaptureTime that still called ReadExif would return SourceExif.
+func TestCaptureTimeCR3SkipsExif(t *testing.T) {
+	b, err := mt.JPEG(mt.SonyExif)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"IMG_0001.CR3", "IMG_0002.cr3", "IMG_0003.Cr3"} {
+		c, err := CaptureTime(writeBytes(t, t.TempDir(), name, b), KindRaw)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if c.Source != SourceMtime || !c.Time.Equal(fixedMtime) {
+			t.Errorf("%s: Source = %q, Time = %v; want mtime %v", name, c.Source, c.Time, fixedMtime)
+		}
+		if !errors.Is(c.Fallback, ErrExifUnsupported) || !strings.Contains(c.Fallback.Error(), filepath.Ext(name)) {
+			t.Errorf("%s: Fallback = %v, want ErrExifUnsupported naming %s", name, c.Fallback, filepath.Ext(name))
+		}
+		if c.Camera != "" || c.Offset != "" || !c.GPS.IsZero() {
+			t.Errorf("%s: EXIF fields set: %+v", name, c)
+		}
+	}
+}
+
 func TestCaptureTimeJPEGWithoutDate(t *testing.T) {
 	b, err := mt.JPEG(mt.ExifSpec{Make: "SONY", Model: "ILCE-7M4"})
 	if err != nil {

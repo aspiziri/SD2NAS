@@ -20,6 +20,10 @@ const (
 var (
 	ErrNoExifTime = errors.New("media: no DateTimeOriginal or DateTime in EXIF")
 	ErrNoMvhdTime = errors.New("media: mvhd has no creation time")
+	// ErrExifUnsupported is Capture.Fallback (wrapped, naming the file's
+	// extension) for a format that carries EXIF in a container this package
+	// can't read: CR3, whose EXIF lives in ISO-BMFF boxes goexif doesn't parse.
+	ErrExifUnsupported = errors.New("media: EXIF in this format is not supported")
 )
 
 // Capture is what CaptureTime learned about when a file was shot.
@@ -29,7 +33,7 @@ type Capture struct {
 	Offset   string     // EXIF OffsetTimeOriginal (e.g. "+02:00"); "" when unknown
 	GPS      time.Time  // EXIF GPS timestamp in UTC; zero when absent
 	Camera   string     // EXIF "Make Model", or video udta make/model; "" when unknown
-	Fallback error      // why a better source than mtime was tried and not used (includes ExifData.Warning when EXIF was read); nil otherwise
+	Fallback error      // why a better source than mtime was tried and not used (includes ExifData.Warning when EXIF was read), or wraps ErrExifUnsupported when it couldn't be tried (cr3); nil otherwise
 }
 
 // canCarryExif reports whether the format can hold EXIF. For formats that
@@ -46,9 +50,18 @@ func canCarryExif(path string, kind Kind) bool {
 	return true
 }
 
+// exifUnsupported reports whether the format carries EXIF that goexif can't
+// reach. goexif has no ISO-BMFF support: on a CR3 it reads the whole file
+// looking for an APP1 marker and then fails, so don't try.
+func exifUnsupported(path string) bool {
+	return strings.EqualFold(filepath.Ext(path), ".cr3")
+}
+
 // CaptureTime resolves a file's capture time: EXIF for images and RAW
-// (except png/gif, which can't carry it), mvhd for video, else the
-// modified time. It errors only when the modified time can't be read.
+// (except png/gif, which can't carry it, and cr3, whose EXIF this package
+// can't read), mvhd for video, else the modified time. For a cr3 the
+// modified time is used without opening the file, and Fallback wraps
+// ErrExifUnsupported. It errors only when the modified time can't be read.
 func CaptureTime(path string, kind Kind) (Capture, error) {
 	var c Capture
 	if kind == KindVideo {
@@ -65,7 +78,9 @@ func CaptureTime(path string, kind Kind) (Capture, error) {
 			c.Source = SourceMvhd
 		}
 	}
-	if c.Source == "" && canCarryExif(path, kind) {
+	if c.Source == "" && canCarryExif(path, kind) && exifUnsupported(path) {
+		c.Fallback = fmt.Errorf("exif: %w (%s)", ErrExifUnsupported, filepath.Ext(path))
+	} else if c.Source == "" && canCarryExif(path, kind) {
 		x, err := ReadExif(path)
 		switch {
 		case err != nil:
