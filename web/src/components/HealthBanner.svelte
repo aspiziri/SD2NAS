@@ -3,7 +3,7 @@
 </script>
 
 {#if error}
-  <div class="note bad" role="alert">SD2NAS is not reachable ({error}). Checking again every minute.</div>
+  <div class="note bad" role="alert">{error}. Checking again every minute.</div>
 {:else if health && health.status !== 'ok'}
   <div class="note bad" role="alert">
     <b>SD2NAS needs attention.</b> Imports and staging may be unavailable until this is fixed:

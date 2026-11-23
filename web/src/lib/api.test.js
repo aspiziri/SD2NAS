@@ -49,6 +49,12 @@ test('a network failure is status 0', async () => {
   await assert.rejects(api('/api/x'), (err) => err.status === 0 && err.message.startsWith('SD2NAS is not reachable'));
 });
 
+test('getHealth reports a network failure as "not reachable", which the banner shows as is', async () => {
+  globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+  await assert.rejects(getHealth(), (err) =>
+    err instanceof ApiError && err.status === 0 && err.message.startsWith('SD2NAS is not reachable:') && err.message.includes('Failed to fetch'));
+});
+
 test('getHealth returns the report for 503 too', async () => {
   respond('{"status":"degraded","problems":["catalog: boom"]}', { status: 503 });
   assert.deepEqual(await getHealth(), { status: 'degraded', problems: ['catalog: boom'] });
