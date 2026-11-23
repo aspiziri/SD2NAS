@@ -1,6 +1,7 @@
 <script>
   import { untrack } from 'svelte';
   import { formatBytes, formatCapture, extLabel } from '../lib/format.js';
+  import { classifyGesture } from '../lib/gesture.js';
 
   let { files, index = $bindable(), onclose } = $props();
 
@@ -81,33 +82,46 @@
 
   // Swipe left or right for the next or previous file, down to close. A tap
   // on the left or right third steps; in the middle it shows or hides the bars.
+  // A gesture that ever had a second finger down (a pinch) does nothing, even
+  // when that finger is the last one lifted.
   let start = null;
+  let multi = false;
+  const pointers = new Set();
   function onpointerdown(e) {
+    pointers.add(e.pointerId);
+    if (pointers.size > 1) multi = true;
     if (e.isPrimary) start = { x: e.clientX, y: e.clientY };
   }
   function onpointerup(e) {
-    if (!start || !e.isPrimary) return;
-    const dx = e.clientX - start.x;
-    const dy = e.clientY - start.y;
+    pointers.delete(e.pointerId);
+    const s = start;
+    const wasMulti = multi;
+    if (pointers.size === 0) multi = false;
+    if (!s || !e.isPrimary) return;
     start = null;
-    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
-      if (dx < 0) next();
-      else prev();
-    } else if (dy > 80 && dy > Math.abs(dx)) {
-      onclose();
-    } else if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
-      const third = e.currentTarget.clientWidth / 3;
-      if (e.clientX < third) prev();
-      else if (e.clientX > 2 * third) next();
-      else chrome = !chrome;
-    }
+    const action = classifyGesture({
+      dx: e.clientX - s.x,
+      dy: e.clientY - s.y,
+      x: e.clientX,
+      width: e.currentTarget.clientWidth,
+      multi: wasMulti,
+    });
+    if (action === 'next') next();
+    else if (action === 'prev') prev();
+    else if (action === 'close') onclose();
+    else if (action === 'toggle') chrome = !chrome;
+  }
+  function onpointercancel(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size === 0) multi = false;
+    if (e.isPrimary) start = null;
   }
 </script>
 
 <svelte:window {onkeydown} />
 
 <div class="lightbox" role="dialog" aria-modal="true" aria-label={file.name} tabindex="-1" bind:this={dialog} use:portal>
-  <div class="stage" role="presentation" {onpointerdown} {onpointerup} onpointercancel={() => (start = null)}>
+  <div class="stage" role="presentation" {onpointerdown} {onpointerup} {onpointercancel}>
     {#key sha}
       <img src="/api/preview/{file.sha256}" alt={file.name} draggable="false" class:hidden={!loaded}
         onload={() => (loaded = true)} onerror={() => (failed = true)} />
