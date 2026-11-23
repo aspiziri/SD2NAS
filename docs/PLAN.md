@@ -168,7 +168,7 @@ module's `internal/` packages). The two repos are free to drift.
 | `importer.go`: `copyFile` | `internal/media/copy.go` | Becomes `CopyHashed(src, dst) (sha256, error)`. Writes to `dst.partial` with `O_EXCL`, hashes while copying, fsyncs, then renames into place. Keeps the original modified time. |
 | `importer.go`: `filesAreIdentical`, `fileHash` | `internal/media/hash.go` | Plus `QuickFingerprint(path)` (§6). |
 | `internal/preview/preview.go` | `internal/thumbs/` | JPEG/PNG resized in Go as before. RAW: `exiftool -b -PreviewImage` (falling back to `JpgFromRaw`). Video: `ffmpeg` frame at 1s. Cached under `/config/thumbs/` by hash. |
-| `internal/config/config.go` | `internal/config/` | Same format lists and subfolder paths. Source and destination come from mounts, not settings. Add `cr3`. |
+| `internal/config/config.go` | `internal/media/formats.go` | Same format lists and subfolder paths, as `media.Rules` / `DefaultRules()` (`internal/config` holds only process flags and env). Source and destination come from mounts, not settings. Add `cr3`. |
 | `importer_test.go` | `internal/media/*_test.go`, `internal/ingest/*_test.go` | Port the collision, duplicate and overwrite tests as they are. |
 
 Not brought over: Wails, `ImportService`, `usbdetector`, the Svelte components
@@ -641,9 +641,9 @@ is what "done" means.
 - [x] Image installed on Unraid from the template and reachable at `http://tower:8080`; `/healthz` ok with uid 99, gid 100, `TZ` passed in by Unraid, photos and config writable
 
 ### M1: Media core
-- [ ] `internal/media` ported with CameraImport's tests passing
+- [ ] `internal/media` ported with CameraImport's applicable tests ported and passing
 - [ ] `CopyHashed`, `QuickFingerprint`, `mvhd` capture time, day cutoff
-- [ ] Fixtures in `testdata/` (real tiny JPEG, ARW, MP4)
+- [ ] Fixtures synthesized by `internal/media/mediatest` and committed under `testdata/cards/...`
 
 ### M2: Catalog and ingest (headless)
 - [ ] Schema and migrations; catalog tests on a temp database
