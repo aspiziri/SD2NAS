@@ -21,6 +21,37 @@ test('formatBytes', () => {
   assert.equal(f.formatBytes(5e15), '5000.0 TB');
 });
 
+test('addSample keeps a time window and restarts when bytes go backwards', () => {
+  let s = [];
+  s = f.addSample(s, 0, 0);
+  s = f.addSample(s, 10_000, 100);
+  s = f.addSample(s, 35_000, 300);
+  assert.deepEqual(s, [{ t: 10_000, bytes: 100 }, { t: 35_000, bytes: 300 }]);
+  s = f.addSample(s, 36_000, 50); // a new job's counter
+  assert.deepEqual(s, [{ t: 36_000, bytes: 50 }]);
+});
+
+test('copyEstimate', () => {
+  const s = [{ t: 0, bytes: 0 }, { t: 10_000, bytes: 1_000_000_000 }];
+  assert.deepEqual(f.copyEstimate(s, 6_000_000_000), { rate: 100_000_000, seconds: 60 });
+  assert.equal(f.copyEstimate(s.slice(0, 1), 100), null, 'one sample');
+  assert.equal(f.copyEstimate([{ t: 0, bytes: 0 }, { t: 4_000, bytes: 10 }], 100), null, 'too short a span');
+  assert.equal(f.copyEstimate([{ t: 0, bytes: 5 }, { t: 9_000, bytes: 5 }], 100), null, 'no bytes moved');
+  assert.equal(f.copyEstimate(s, NaN), null);
+  assert.deepEqual(f.copyEstimate(s, 0), { rate: 100_000_000, seconds: 0 });
+});
+
+test('formatTimeLeft', () => {
+  assert.equal(f.formatTimeLeft(0), 'less than a minute left');
+  assert.equal(f.formatTimeLeft(59), 'less than a minute left');
+  assert.equal(f.formatTimeLeft(60), 'about 1 min left');
+  assert.equal(f.formatTimeLeft(750), 'about 13 min left');
+  assert.equal(f.formatTimeLeft(3599), 'about 1 h left');
+  assert.equal(f.formatTimeLeft(3900), 'about 1 h 5 min left');
+  assert.equal(f.formatTimeLeft(-1), '');
+  assert.equal(f.formatTimeLeft(Infinity), '');
+});
+
 test('formatWhen and formatCapture', () => {
   assert.equal(f.formatWhen('2026-11-21T06:42:05.000Z'), '2026-11-21 20:27');
   assert.equal(f.formatWhen(''), '');

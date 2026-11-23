@@ -71,6 +71,37 @@ export function progressFraction(p) {
   }
 }
 
+// addSample appends a (time ms, bytes copied) sample for the copy-speed
+// estimate and drops samples older than windowMs. It also drops samples with
+// more bytes than the new one, so a counter that went backwards starts over.
+export function addSample(samples, t, bytes, windowMs = 30_000) {
+  const kept = samples.filter((s) => t - s.t <= windowMs && s.bytes <= bytes);
+  kept.push({ t, bytes });
+  return kept;
+}
+
+// copyEstimate returns {rate (bytes/s), seconds left} from the samples, or
+// null until they span minMs and show bytes moving: an early guess jumps around.
+export function copyEstimate(samples, bytesLeft, minMs = 5_000) {
+  if (samples.length < 2 || !(bytesLeft >= 0)) return null;
+  const a = samples[0];
+  const b = samples[samples.length - 1];
+  if (b.t - a.t < minMs || b.bytes <= a.bytes) return null;
+  const rate = ((b.bytes - a.bytes) * 1000) / (b.t - a.t);
+  return { rate, seconds: bytesLeft / rate };
+}
+
+// formatTimeLeft(750) === 'about 13 min left'.
+export function formatTimeLeft(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  if (seconds < 60) return 'less than a minute left';
+  const min = Math.round(seconds / 60);
+  if (min < 60) return `about ${min} min left`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m ? `about ${h} h ${m} min left` : `about ${h} h left`;
+}
+
 const STATUS = { queued: 'Waiting', running: 'Importing', done: 'Done', failed: 'Failed', refused: 'Refused', cancelled: 'Cancelled' };
 export const statusLabel = (s) => STATUS[s] ?? s;
 export const levelClass = (level) => (level === 'alert' ? 'bad' : level === 'warning' ? 'warn' : 'ok');

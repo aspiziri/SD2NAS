@@ -1,6 +1,6 @@
 <script>
   import { live } from '../lib/live.svelte.js';
-  import { phaseSteps, progressFraction, formatCount, formatBytes, cardName, knownCount, levelClass } from '../lib/format.js';
+  import { phaseSteps, progressFraction, formatCount, formatBytes, cardName, knownCount, levelClass, addSample, copyEstimate, formatTimeLeft } from '../lib/format.js';
 
   const running = $derived(live.current.running);
   const queued = $derived(live.current.queued);
@@ -8,6 +8,26 @@
   const steps = $derived(phaseSteps(p?.phase ?? 'queued'));
   const pct = $derived(Math.round(progressFraction(p) * 100));
   const last = $derived(live.finished);
+
+  // Copy speed and time left, from the progress events of the current job.
+  // The samples are plain variables: only the estimate is shown.
+  let samples = [];
+  let sampledJob = null;
+  let estimate = $state(null);
+  $effect(() => {
+    if (!running || p?.phase !== 'copying') {
+      samples = [];
+      sampledJob = null;
+      estimate = null;
+      return;
+    }
+    if (running.id !== sampledJob) {
+      samples = [];
+      sampledJob = running.id;
+    }
+    samples = addSample(samples, Date.now(), p.bytes_done);
+    estimate = copyEstimate(samples, p.bytes_total - p.bytes_done);
+  });
 </script>
 
 <div class="card">
@@ -27,6 +47,7 @@
         {formatCount(p.files_done)} / {formatCount(p.files_total)} files checked
       {:else if p?.phase === 'copying'}
         {formatCount(p.files_done)} / {formatCount(p.files_total)} new files copied · {formatBytes(p.bytes_done)} of {formatBytes(p.bytes_total)}
+        {#if estimate}<br>{formatBytes(estimate.rate)}/s · {formatTimeLeft(estimate.seconds)}{/if}
       {:else if p?.phase === 'scanning'}
         Reading the card's file list…
       {:else}
