@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -194,7 +195,15 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		h.Status = "degraded"
 		code = http.StatusServiceUnavailable
 	}
-	w.Header().Set("Content-Type", "application/json")
+	// A browser opening /healthz asks for HTML. Some (Edge on iOS, Samsung
+	// Internet) offer to download application/json, so they get the same
+	// JSON as plain text. The UI, the card script and curl get JSON.
+	ct := "application/json"
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		ct = "text/plain; charset=utf-8"
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+	}
+	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	enc := json.NewEncoder(w)
