@@ -70,7 +70,7 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
 | Container path | Host path (example) | Mode | Purpose |
 |---|---|---|---|
 | `/cards` | `/mnt/disks` | RW/Slave, used read-only | Cards mounted by Unassigned Devices. Slave propagation is required so cards mounted after the container starts are visible. |
-| `/photos` | `/mnt/user/photos` | RW | The `photos` share (array only, no cache). Contains `Archive/` (existing), `Staging/` (created by SD2NAS) and a hidden `.sd2nas/` folder for catalog backups. |
+| `/photos` | `/mnt/user/photos` | RW | The `photos` share (array only, no cache). Contains `Archive/` (existing), `Staging/` (created by SD2NAS) and `Management/SD2NAS/` for catalog backups. |
 | `/config` | `/mnt/cache/appdata/sd2nas` | RW | SQLite database, thumbnail and preview cache, settings, on the cache SSD for fast browsing. Use the cache path directly, not `/mnt/user`, to avoid SQLite locking problems on Unraid's share filesystem. |
 
 The container runs as `99:100` (nobody:users) with `UMASK=000` so files stay
@@ -84,7 +84,9 @@ editable over SMB, and must have `TZ` set (§13).
 /mnt/user/photos/          the photos share: array only, dual parity, no cache
   Archive/                 existing archive (flat list of session folders)
   Staging/                 created by SD2NAS
-  .sd2nas/backups/         nightly catalog backups
+  Management/
+    immich/                existing, not touched
+    SD2NAS/                nightly catalog backups
 ```
 
 **Why the array and not the cache SSD:**
@@ -115,10 +117,10 @@ Failed files turn it into a warning instead.
 
 **Catalog backup:** the database is the only record of what you culled, and
 that can't be rebuilt from the archive. Nightly, after the rescan, SD2NAS writes
-`VACUUM INTO /photos/.sd2nas/backups/catalog-YYYY-MM-DD.db` and keeps the last
-14. It sits outside `Archive/`, so neither the indexer nor Capture One sees it.
-Unraid hides dot-folders over SMB by default (verify in M0). This is on top of
-the Appdata Backup plugin.
+`VACUUM INTO /photos/Management/SD2NAS/catalog-YYYY-MM-DD.db` and keeps the
+last 14, next to the existing `Management/immich`. It sits outside `Archive/`,
+so neither the indexer nor Capture One sees it. The folder is a setting. This is
+on top of the Appdata Backup plugin.
 
 ---
 
@@ -380,7 +382,8 @@ mockup. Everything else is reversible by doing the opposite operation.
 - **What gets indexed inside a session folder:** top-level media, `Capture/`,
   `Selects/`, `Trash/`, `Videos/`, `Other/`. **Skipped:** `Output/` (exports
   made from originals, never from a card), `CaptureOne/` subfolders (cache and
-  settings), `*.cosessiondb`, and `.sd2nas/`. Files in `Trash/` still count as
+  settings) and `*.cosessiondb`. The indexer only walks `Archive/`, so
+  `Staging/` and `Management/` are never indexed. Files in `Trash/` still count as
   seen, so rejected shots don't come back from the card.
 - **Moves are recognized:** Capture One moves files between `Capture/`,
   `Selects/` and `Trash/`. When a path disappears and the same hash shows up at
@@ -562,8 +565,8 @@ image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
   public because the repo is. ghcr image names must be lowercase.
 
 **Unraid setup**
-- No new share needed: SD2NAS creates `Staging/` and `.sd2nas/` inside the
-  existing `photos` share.
+- No new share needed: SD2NAS creates `Staging/` and `Management/SD2NAS/`
+  inside the existing `photos` share.
 - Template `deploy/unraid/sd2nas.xml`: repository, web UI link, port, the three
   paths (with `/cards` as RW/Slave), `TZ`, `UMASK=000`, optional
   `SD2NAS_TOKEN`, and `--user 99:100` in Extra Parameters. The image isn't
@@ -607,7 +610,6 @@ is what "done" means.
 ### M0: Skeleton and hardware check
 - [ ] Card reader tested with Unassigned Devices: insert-triggered or reader-plug only
 - [ ] Confirm the variables Unassigned Devices passes to device scripts (`LABEL`, `SERIAL`, `MOUNTPOINT`) on your Unraid version
-- [ ] Confirm Unraid's SMB hides dot-folders (`.sd2nas/`)
 - [ ] Go module, `cmd/sd2nas` serving "hello" and `/healthz`
 - [ ] Dockerfile builds; image runs locally
 - [ ] CI and release workflows publish `ghcr.io/aspiziri/sd2nas:edge`
