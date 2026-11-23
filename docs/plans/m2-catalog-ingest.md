@@ -16,7 +16,7 @@ Relevant spec sections: §2 (mounts), §3 (storage, capacity guard, safe to form
 
 - Module path `github.com/aspiziri/SD2NAS`. Task 1's `go get` rewrites the directive to `go 1.24.0` (required: the new dependencies declare `go 1.24.0`); keep that, and add no `toolchain` line. Use no API newer than Go 1.24: no `sync.WaitGroup.Go`, no `testing.T.Output`. Go 1.24 features that are fine: `testing.T.Context`, `encoding/json` `omitzero`, `slog.DiscardHandler`, `range` over an int. The local toolchain is go1.26 on Windows; CI runs `gofmt -l .`, `go vet ./...` and `go test ./...` on ubuntu with the Go version from `go.mod`.
 - Dependencies: only `modernc.org/sqlite v1.46.1` (Task 1) and the indirect modules it brings (listed in Task 1). No migration library, router, ORM or anything else. Driver name `"sqlite"`, imported for side effects in `internal/catalog` only.
-- M2 touches: `internal/catalog/` (new), `internal/ingest/` (new), `internal/media/copy.go`, `internal/media/syncdir_*.go`, `internal/media/copy_test.go`, `internal/media/import_test.go`, `internal/media/mediatest/card.go` (new), `internal/api/`, `cmd/sd2nas/main.go`, `deploy/Dockerfile`, `go.mod`, `go.sum`, and `docs/PLAN.md` (Task 10 only, the edits it lists). Do not modify `internal/config/` or other `internal/media` files.
+- M2 touches: `internal/catalog/` (new), `internal/ingest/` (new), `internal/media/copy.go`, `internal/media/syncdir_*.go`, `internal/media/copy_test.go`, `internal/media/import_test.go`, `internal/media/mediatest/card.go` (new), `internal/media/mediatest/card_test.go` (new), `internal/api/`, `cmd/sd2nas/main.go`, `deploy/Dockerfile`, `go.mod`, `go.sum`, and `docs/PLAN.md` (Task 10 only, the edits it lists). Do not modify `internal/config/` or other `internal/media` files.
 - Tests pass on Windows and Linux. Use `path/filepath` for OS paths and `path` / slash-separated strings for anything stored in the catalog. OS-specific code goes in build-tagged files with a variant for every other OS. Never assert permission bits. Never depend on the value of `time.Local`: build expected values through `time.Local` or fixed zones and compare instants with `Equal`.
 - Close every file, `*sql.Rows` and `*catalog.DB` before returning; Windows cannot delete open files and `t.TempDir` cleanup fails otherwise. In tests, call `t.TempDir()` before registering a `Close` cleanup so the close runs first.
 - Never silently swallow an error: return it (wrapped with `%w`), record it in a documented field (`IngestFile.Error`, `Ingest.Error`), or log it where this plan says to. Use `errors.Join` when a cleanup step fails after an earlier error.
@@ -30,7 +30,7 @@ Relevant spec sections: §2 (mounts), §3 (storage, capacity guard, safe to form
 
 ## Review Focus
 
-1. **A card that must not be reported safe to format**: only formats SD2NAS doesn't import (Sony `.HIF`), no media at all, or a single failed file. Expected: `safe_to_format` false and a warning-level message. Pinned in Task 7 (`TestRunUnsupportedFormatsNotSafe`, `TestRunEmptyCardNotSafe`) and Task 8 (`TestRunFailedFileNotSafe`, `TestRunZeroByteFileFails`).
+1. **A card that must not be reported safe to format**: only formats SD2NAS doesn't import (Sony `.HIF`, `.TIFF`, `.M4V`, `.3GP`), no media at all, or a single failed file. Expected: `safe_to_format` false and a warning-level message. Pinned in Task 5 (`TestScanSkipsJunk`, the unsupported list), Task 6 (`TestDescribe`, the unsupported-only row), Task 7 (`TestRunUnsupportedFormatsNotSafe`, `TestRunEmptyCardNotSafe`) and Task 8 (`TestRunFailedFileNotSafe`, `TestRunZeroByteFileFails`).
 2. **Re-inserting a card that was already imported**, including when the share is nearly full. Expected: 0 new, nothing copied, no space refusal, safe to format. Pinned in Task 7 (`TestRunRerunImportsNothing`, `TestRunNoSpaceCheckWithoutNewFiles`) and Task 10 (`TestIngestWaitText`).
 3. **Card pulled or a read failing mid-copy.** Expected: never a file at a final name that isn't complete, finished files stay recorded, job `failed`, and a re-insert picks up where it left off. Pinned in Task 2 (`TestCopyHashedCloseErrorLeavesNoDst`) and Task 8 (`TestRunCardRemovedMidCopy`, `TestRunCopyFailureLeavesNothing`).
 4. **SIGTERM during a long video copy.** Expected: the copy stops within one 32 KiB read, its partial is removed, the job is `cancelled` and recorded, queued jobs are `cancelled`. Pinned in Task 2 (`TestCopyHashedCanceledMidCopy`), Task 8 (`TestRunCancelledMidCopy`) and Task 9 (`TestManagerCloseCancelsRunning`).
@@ -48,25 +48,26 @@ Relevant spec sections: §2 (mounts), §3 (storage, capacity guard, safe to form
 3. **One connection.** `Open` sets `SetMaxOpenConns(1)`: the catalog is the single writer, no `SQLITE_BUSY` is possible, and reads are tiny. DSN pragmas, applied to every connection: `busy_timeout(5000)`, `foreign_keys(1)`, `journal_mode(WAL)`, `synchronous(FULL)` (the catalog is the record behind "safe to format", so a commit must survive power loss), and `_txlock=immediate`. `Open` checks that `PRAGMA journal_mode` really reports `wal` and fails otherwise. The path is passed without a `file:` prefix (modernc then uses it verbatim), and a path containing `?` is rejected.
 4. **Migrations** are an ordered `[]string` in `schema.go`. Version N is `PRAGMA user_version`. Each pending migration runs in its own transaction that also sets `user_version`. A database whose version is newer than the binary's is refused ("created by a newer SD2NAS"), never touched.
 5. **Schema changes from §6.** Ingest status gains `queued` (every job has a row and an id as soon as it's submitted). `ingests` gains `card_path`, `unsupported` and `clock_warnings` columns. File outcome gains `unsupported`. A `clock_warnings` table holds per-file clock warnings (§12 wants them on the summary and, later, on staging folders). Count columns are `NOT NULL DEFAULT 0`, and text columns where NULL would mean nothing are `NOT NULL DEFAULT ''`. NULL is kept where it means something: `assets.capture_time`, `rel_path` (culled), `mtime`, `first_ingest` (found by the indexer), `ingests.finished_at`, and `ingest_files.quick_fp`/`sha256`. Enumerations get `CHECK` constraints. `ingest_files` and `clock_warnings` are indexed by `ingest_id`. `card_size` is the total size of the media files found on the card. The exact SQL is in Task 1.
-6. **Encodings.** Hashes are lowercase hex at the catalog API (what `internal/media` returns) and 32-byte BLOBs in the database; anything else is `ErrBadHash`. Timestamps (`started_at`, `updated_at`, …) are UTC text `2006-01-02T15:04:05.000Z`. `capture_time` is the naming wall clock with no zone, `2006-01-02T15:04:05` (`catalog.CaptureLayout`), read back in `time.Local`. `mtime` is the staged file's `ModTime().UnixNano()`. `staging_folders.dates` is a JSON array of `YYYY-MM-DD`, kept sorted.
+6. **Encodings.** Hashes are lowercase hex at the catalog API (what `internal/media` returns) and 32-byte BLOBs in the database; anything else is `ErrBadHash`. Timestamps (`started_at`, `updated_at`, …) are UTC text `2006-01-02T15:04:05.000Z`; an in-memory `StartedAt`/`FinishedAt` that the manager keeps alongside a catalog row is truncated to milliseconds so the two compare `Equal`. `capture_time` is the naming wall clock with no zone, `2006-01-02T15:04:05` (`catalog.CaptureLayout`), read back in `time.Local`. `mtime` is the staged file's `ModTime().UnixNano()`. `staging_folders.dates` is a JSON array of `YYYY-MM-DD`, kept sorted.
 7. **Settings** (§6 `settings` table) read in M2: `day_starts_at` (`HH:MM`, default `04:00`), `verify_known` (`quick` | `full`, default `quick`), and `free_space_reserve_gb` (a whole number of decimal GB, default `50`, i.e. 50,000,000,000 bytes). Values are validated strictly on write and on read: a bad stored value fails the ingest with an error naming the key, never a silent default. Import rules stay `media.DefaultRules()` in M2; settings-backed rules (M1 decision 1) arrive with the settings API.
 8. **Known outcomes.** An asset's state maps to the outcome: `archived` → `in_archive`, `staged` → `in_staging`, `culled` and `missing` → `seen_before`. When a fingerprint matches several assets, the best state wins: archived, staged, culled, missing.
 9. **Safe to format** = status `done` and `failed == 0` and `unsupported == 0` and `seen > 0`. "Verified" (§3) means: hashed while copying, file fsynced (`CopyHashed`), its folder fsynced (`media.SyncDir`, the M2 follow-up), and the asset committed with `synchronous=FULL`. There is no read-back of the staged file: right after the write it would come from the page cache and prove nothing about the disk. Clock warnings never block it.
-10. **Unsupported formats**: a media-like extension that the rules don't import (lowercase): `heic heif hif raf orf rw2 pef srw x3f 3fr iiq gpr crw nrw srf sr2 mts m2ts mxf braw r3d insv insp`. They are recorded with outcome `unsupported` and block "safe to format", because formatting would lose them. Other unknown files (Sony `.XML` sidecars, `.BIN`, `.CTG`, GoPro `.LRV`/`.THM`) are ignored.
+10. **Unsupported formats**: a media-like extension that the rules don't import (lowercase): `heic heif hif tiff raf orf rw2 pef srw x3f 3fr iiq gpr crw nrw srf sr2 m4v 3gp mts m2ts mxf braw r3d insv insp` (`tif` is imported; `tiff`, `m4v` and `3gp` are not, so they must block safe to format: the cost of a wrong entry is one warning on an odd card). They are recorded with outcome `unsupported` and block "safe to format", because formatting would lose them. Other unknown files (Sony `.XML` sidecars, `.BIN`, `.CTG`, GoPro `.LRV`/`.THM`) are ignored.
 11. **Scan skip rules** (§7 step 2, extended): directories whose name starts with `.` (`.Trashes`, `.thumbnails`, `.Spotlight-V100`, `.fseventsd`), or is `MISC`, `System Volume Information`, `$RECYCLE.BIN` or `THMBNL` (Sony video thumbnails), or is `SUB` inside `M4ROOT` (Sony proxy clips), all case-insensitive. Files whose name starts with `.` (`._*` resource forks, `.DS_Store`). Non-regular entries, so symlinks are never followed. The whole card is walked, not just `DCIM/`, because Sony video lives in `PRIVATE/M4ROOT/CLIP`. An unreadable subdirectory becomes a `failed` row and the rest of the card is still imported; an unreadable card root fails the job.
 12. **Target staging folder** for a folder date D: the folder whose `dates` contains D (the lowest id if several); else the folder *named* D, which gets D added to its dates; else a new row named D. Directories are created with `mkdirDurable`, which fsyncs each new directory's parent. A folder name that isn't a single path element is refused (defence against a hand-edited row).
 13. **Copy errors** are classified by `media.ClassifyCopyError` (the M1 follow-up that tells the two `fs.ErrNotExist` and the two `fs.ErrExist` cases apart). Name taken → pick a new name with `FreeName`. Stale partial → remove it (ingest is the only writer of partials in Staging and runs alone, so it must be stale). Destination folder missing → recreate it. Each of these retries, up to 3 attempts per file. Source missing or anything else → the file fails. After any file failure the card root is stat'ed; if it is gone the job ends `failed` with `card removed during import`. A card whose mount point survives but whose reads return I/O errors ends `done` with every remaining file `failed`, which is still not safe to format.
 14. **Duplicates found while copying.** If `FreeName` finds identical content already at the target, the card file is hashed and looked up: a catalog asset makes it a known outcome (and its fingerprint is added); no asset means a copy from an interrupted ingest, which is adopted as a `staged` asset with outcome `in_staging`. If the full hash of a fresh copy matches an existing asset (fingerprint collision or alias, §6), the fresh copy is deleted and the file gets that asset's known outcome.
 15. **`CopyHashed` gains a `context.Context`** (`CopyHashed(ctx, src, dst)`, a breaking change; only M1's tests call it) so a SIGTERM stops a multi-GB copy at the next 32 KiB read instead of after it, and it **closes the source explicitly before the final rename** (M2 follow-up), so any error means no destination file. `media.SyncDir` fsyncs a directory on Unix and only checks that it is a directory elsewhere (NTFS journals metadata; Windows cannot fsync a directory handle without backup semantics). An `EINVAL` or other error from fsyncing on Unraid's shfs is surfaced, not ignored; FUSE turns an unimplemented `fsyncdir` into success itself.
 16. **Partials** (`*.partial`) are deleted by `CleanPartials` on startup (`Manager.Recover`) and again before every copy phase, only under `Staging/`. M4 must keep ingest the only writer of partials in Staging, or clean them under the folder locks.
-17. **Queue.** `Submit` writes a `queued` row at once. At most 8 jobs wait behind the running one; the 9th gets `ErrQueueFull` (503). The same resolved card path, while queued or running, returns the existing job. The queue is in memory: on restart, `queued` and `running` rows become `failed` (§7 "On startup").
+17. **Queue.** `Submit` writes a `queued` row at once. At most 8 jobs wait behind the running one; the 9th gets `ErrQueueFull` (503). The same resolved card path, while queued or running, returns the existing job. The queue is in memory: on restart, `queued` and `running` rows become `failed` (§7 "On startup"). `Submit` holds the manager's lock for its whole call, including `CreateIngest`, and `Close` sets `closed` under the same lock, so no job is accepted after `Close` and every accepted job's `Done` closes. With one catalog connection, that `CreateIngest` can wait behind the running job's catalog writes, and `Current`/`Close` wait with it; this is accepted: it serialises submits (rare) and cannot deadlock, because `Run` never takes the manager's lock. `Close` calls `FinishIngest` for the queued jobs after releasing the lock. A job whose `StartIngest` fails is marked `failed` in the catalog with the error, never left `queued`.
 18. **HTTP.** The request guard (§10) is implemented in M2 for every request whose method isn't GET or HEAD, because `POST /api/ingest` is the first mutating endpoint. M3's checklist item stays as is (it is about the UI's endpoints). The optional token stays M7. `?wait=1` maps the finished status to a code: done 200, refused 507, failed 500, cancelled 503, and 504 after `DefaultMaxWait = 2h` (the script's `curl --max-time 7200`). So every case where the card must stay mounted is non-2xx and fails `curl -f`. A client that hangs up just stops waiting; the job continues. M6 should switch the script to `curl --fail-with-body` so refusal reasons reach the notification.
 19. **Not in M2:** SSE (`/api/events`, M3; headless clients poll `GET /api/ingest/current`), thumbnail queueing (M3), folder locks (M4: in M2, ingest is the only writer of `Staging/`), `reimport-culled`, settings endpoints.
 20. **Clock checks** (§12, on new files only): `future` when the capture instant is more than 10 minutes after the NAS time; `reset_default` when the capture year is before 2005; `gps_mismatch` when EXIF GPS time and the capture instant differ by more than 5 minutes (GPS fixes lag a little). The capture instant is the EXIF wall clock in `OffsetTimeOriginal`'s zone when the offset is known, else `Capture.Time`. The time-zone hint (§12 row 4) is stored as `assets.tz_offset`, not raised as a warning.
-21. **Catalog unavailable at startup** (for example `/config` not writable): SD2NAS keeps serving, as M0 does for bad mounts, `/healthz` reports the problem and returns 503, and the ingest routes are not mounted (the card script's request fails, so the card stays mounted).
+21. **Catalog unavailable at startup** (for example `/config` not writable): SD2NAS keeps serving, as M0 does for bad mounts, `/healthz` reports the problem and returns 503, and the ingest routes are not mounted (the card script's request fails, so the card stays mounted). There is then no manager, so shutdown closes it only when it is non-nil.
 22. **Measuring RAW ingest** (M2 follow-up) is a documented manual step on the NAS: the runner logs `capture` (time spent reading capture times), `copy` (time spent copying) and `copy_bytes` on its `ingest finished` line. Task 10 writes the procedure into PLAN.md and leaves that checklist item open for the user.
 23. **Zero-byte media files** are `failed` (`empty file`): they mean an interrupted camera write, and the card should be looked at before it is formatted.
 24. **Catalog writes in a running job use `context.WithoutCancel(ctx)`**, so a cancelled job still records the files it finished and its own `cancelled` status. The job's context only stops the pipeline between files and inside `CopyHashed`.
+25. **Video metadata is read once per file.** For a video, ingest calls `media.ReadVideoMeta` itself and derives the capture time from it the way `media.CaptureTime`'s video branch does (videos never carry EXIF; `internal/media` stays untouched), then names the file from the same metadata. A metadata error is not dropped: it becomes `Capture.Fallback` (logged at Warn) and the new file's `IngestFile.Error`, and the file is named without the video suffix.
 
 ## File Structure
 
@@ -406,7 +407,7 @@ type fakeSource struct {
 	closed   bool
 }
 
-func (f *fakeSource) Read(p []byte) (int, error)  { return f.r.Read(p) }
+func (f *fakeSource) Read(p []byte) (int, error) { return f.r.Read(p) }
 func (f *fakeSource) Stat() (fs.FileInfo, error) { return f.info, nil }
 func (f *fakeSource) Close() error {
 	f.closed = true
@@ -999,7 +1000,12 @@ keep := []string{ // want in Media, in this order
 	"PRIVATE/M4ROOT/CLIP/C0001.MP4",
 	"SUB/keep.JPG", // SUB is only skipped inside M4ROOT
 }
-unsupported := []string{"DCIM/100MSDCF/DSC00002.HIF"}
+unsupported := []string{ // want in Unsupported, in this order
+	"DCIM/100GOPRO/GX010002.3GP",
+	"DCIM/100MSDCF/DSC00002.HIF",
+	"DCIM/100MSDCF/DSC00003.TIFF",
+	"PRIVATE/M4ROOT/CLIP/C0002.M4V",
+}
 junk := []string{
 	"DCIM/100MSDCF/._DSC00001.JPG",
 	"DCIM/100MSDCF/.DS_Store",
@@ -1019,7 +1025,7 @@ junk := []string{
 }
 ```
 
-Then `Scan(card, media.DefaultRules())` has `Media` Rels equal to `keep`, the `Unsupported` Rels equal to `unsupported`, no `Errors`, and every `Size == 1`. Kinds: MP4 → video, ARW → raw, JPG → image, and the unsupported file's kind is `""`. Each `Path` equals `filepath.Join(card, filepath.FromSlash(Rel))`.
+Then `Scan(card, media.DefaultRules())` has `Media` Rels equal to `keep`, the `Unsupported` Rels equal to `unsupported`, no `Errors`, and every `Size == 1`. Kinds: MP4 → video, ARW → raw, JPG → image, and every unsupported file's kind is `""`. Each `Path` equals `filepath.Join(card, filepath.FromSlash(Rel))`.
 - `TestScanSkipsSymlinks`: `os.Symlink(outsideJPG, filepath.Join(card, "DCIM", "link.JPG"))` (call `t.Skip` if creating the symlink fails, as it does on Windows without the privilege) leaves `Media` empty.
 - `TestScanRootErrors`: a missing root gives an error with `errors.Is(err, fs.ErrNotExist)`; a root that is a regular file gives an error.
 
@@ -1040,7 +1046,7 @@ Expected: build failure (`undefined: Scan`, `undefined: CopyCard`).
 
 - [ ] **Step 3: Implement**
 
-`Scan`: `os.Stat(root)` must succeed and be a directory. Then `filepath.WalkDir(root, …)`. An error on the root entry is returned. Below the root, an error becomes a `ScanError` with the entry's slash Rel, plus `fs.SkipDir` for a directory. Skip directories by Decision 11: a name starting with `.`, or `strings.EqualFold` to `MISC`, `System Volume Information`, `$RECYCLE.BIN` or `THMBNL`, or `SUB` whose parent directory's name is `M4ROOT` (EqualFold). Skip files whose name starts with `.` and any entry where `!d.Type().IsRegular()`. Classify with `rules.KindOf` first, then the lowercase extension against the Decision 10 set (a package-level `map[string]bool`). Get `Size` from `d.Info()`; an error there becomes a `ScanError`. Sort both slices by `Rel`.
+`Scan`: `os.Stat(root)` must succeed and be a directory. Then `filepath.WalkDir(root, …)`. An error on the root entry is returned. Below the root, an error becomes a `ScanError` with the entry's slash Rel, plus `fs.SkipDir` for a directory. Skip directories by Decision 11: a name starting with `.`, or `strings.EqualFold` to `MISC`, `System Volume Information`, `$RECYCLE.BIN` or `THMBNL`, or `SUB` whose parent directory's name is `M4ROOT` (EqualFold). Skip files whose name starts with `.` and any entry where `!d.Type().IsRegular()`. Classify with `rules.KindOf` first, then the lowercase extension (no dot) against the unsupported set, a package-level `map[string]bool` holding exactly `heic heif hif tiff raf orf rw2 pef srw x3f 3fr iiq gpr crw nrw srf sr2 m4v 3gp mts m2ts mxf braw r3d insv insp` (Decision 10; `tif` is imported by the rules, `tiff` is not). Any other extension is ignored. Get `Size` from `d.Info()`; an error there becomes a `ScanError`. Sort both slices by `Rel`.
 
 `CleanPartials`: return `nil, nil` when `stagingRoot` doesn't exist. Otherwise walk it, `os.Remove` every regular file whose name ends in `media.PartialSuffix`, and return walk and remove errors wrapped as `clean partials: …`.
 
@@ -1191,15 +1197,18 @@ Each returned warning has an empty `CardPath` and `SHA256`.
 | done, Seen 2, New 2, safe, ClockWarnings 1 | warning | `SONY_A7IV: 2 new, 0 already known. Card safe to format. Check the camera clock: 1 file has suspicious capture times.` |
 | done, Seen 2, New 2, safe, ClockWarnings 3 | warning | `… Check the camera clock: 3 files have suspicious capture times.` |
 | done, Seen 0, Unsupported 0 | warning | `SONY_A7IV: no photos or videos found. Do not format the card.` |
+| done, Seen 0, Unsupported 2 (an `.HIF`-only card) | warning | `SONY_A7IV: 0 new, 0 already known, 2 in formats SD2NAS does not import. Do not format the card.` |
 | refused, Error `staging would drop below the 50.0 GB free-space reserve (2 new files need 0.1 GB, 40.0 GB free)` | alert | `SONY_A7IV: not imported, staging would drop below the 50.0 GB free-space reserve (2 new files need 0.1 GB, 40.0 GB free). Card left mounted.` |
 | failed, New 5, Error `card removed during import` | alert | `SONY_A7IV: import failed: card removed during import. 5 new copied before it stopped. Card left mounted.` |
+| failed, New 0, Error `scan card: boom` | alert | `SONY_A7IV: import failed: scan card: boom. Card left mounted.` |
 | cancelled, New 1 | alert | `SONY_A7IV: import cancelled because SD2NAS stopped. 1 new copied. Card left mounted.` |
+| cancelled, New 0 | alert | `SONY_A7IV: import cancelled because SD2NAS stopped. Card left mounted.` |
 | queued | normal | `SONY_A7IV: waiting for another import to finish.` |
 | running | normal | `SONY_A7IV: importing.` |
 
 Plus:
 - `TestDescribeOneLine`: a failed ingest with `Error "a\nb"` and `CardLabel "A\tB"` gives a message starting `A B: import failed: a b.`, and no message in the table contains `\n` or `\r`.
-- `TestCardName`: `CardLabel ""` with `CardPath "/cards/GOPRO"` gives `GOPRO` (also with a Windows path `C:\cards\GOPRO`, through `filepath.Base`); both empty gives `card`; `"  SONY \x00"` gives `SONY`.
+- `TestCardName`: `CardLabel ""` with `CardPath "/cards/GOPRO"` gives `GOPRO`, and so does `CardPath filepath.Join(t.TempDir(), "cards", "GOPRO")` (an OS path built for the OS the test runs on; no Windows literal such as `C:\cards\GOPRO`, which `filepath.Base` doesn't split on Linux); both empty gives `card`; `"  SONY \x00"` gives `SONY`.
 - `TestFormatGB`: 0 gives `"0.0 GB"`, 50e9 gives `"50.0 GB"`, 812 gives `"0.0 GB"`, 123_456_789_012 gives `"123.5 GB"`.
 
 - [ ] **Step 2: Run the tests and confirm they fail**
@@ -1209,9 +1218,9 @@ Expected: build failure (`undefined: CheckClock`).
 
 - [ ] **Step 3: Implement**
 
-`clock.go`: the capture instant is, when `c.Source == media.SourceExif` and `c.Offset` matches `^[+-]([01][0-9]|2[0-3]):[0-5][0-9]$`, `c.Time`'s wall-clock fields in `time.FixedZone("", ±(h*3600+m*60))`; otherwise `c.Time`. Future: `instant.After(now.Add(FutureTolerance))`, with the detail formatting `instant.In(now.Location())` and `now` using `"2006-01-02 15:04:05"`. Reset: `c.Time.Year() < ResetBeforeYear` (wall clock). GPS: when `!c.GPS.IsZero()`, `d := instant.Sub(c.GPS)`; warn if `|d| > GPSTolerance`, with detail `fmt.Sprintf("camera clock is %s %s GPS time", abs(d).Round(time.Minute), "ahead of"|"behind")` (`d > 0` means ahead of).
+`clock.go`: the capture instant is, when `c.Source == media.SourceExif` and `c.Offset` matches `^[+-]([01][0-9]|2[0-3]):[0-5][0-9]$`, `c.Time`'s wall-clock fields in `time.FixedZone("", ±(h*3600+m*60))`; otherwise `c.Time`. Future: `instant.After(now.Add(FutureTolerance))`, with the detail formatting `instant.In(now.Location())` and `now` using `"2006-01-02 15:04:05"`. Reset: `c.Time.Year() < ResetBeforeYear` (wall clock), with detail `fmt.Sprintf("capture time %s is before %d: the camera clock was probably reset", c.Time.Format("2006-01-02 15:04:05"), ResetBeforeYear)`, formatting `c.Time` itself (the camera's wall clock, not the instant and not converted to any zone). GPS: when `!c.GPS.IsZero()`, `d := instant.Sub(c.GPS)`; warn if `|d| > GPSTolerance`, with detail `fmt.Sprintf("camera clock is %s %s GPS time", abs(d).Round(time.Minute), "ahead of"|"behind")` (`d > 0` means ahead of).
 
-`describe.go`: `known := InArchive + InStaging + SeenBefore`. Build the messages exactly as the table shows. "Card safe to format." comes from `SafeToFormat`, not recomputed. The level for done is normal only when `SafeToFormat && ClockWarnings == 0`. Pass the final message through the same control-character → space replacement as `CardName`, and trim it.
+`describe.go`: `known := InArchive + InStaging + SeenBefore`. Build the messages exactly as the table shows. For done: `no photos or videos found` only when `Seen == 0 && Unsupported == 0`; otherwise `N new, K already known`, then `, F failed` when `Failed > 0`, then `, U in formats SD2NAS does not import` when `Unsupported > 0` (so an unsupported-only card reads `0 new, 0 already known, 2 in formats …`). For failed and cancelled, the `N new copied[ before it stopped].` sentence appears only when `New > 0`. "Card safe to format." comes from `SafeToFormat`, not recomputed. The level for done is normal only when `SafeToFormat && ClockWarnings == 0`. Pass the final message through the same control-character → space replacement as `CardName`, and trim it.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
@@ -1241,7 +1250,16 @@ func DefaultRules() Rules; func TypeSubdir(kind Kind, r Rules) string
 const DefaultDayStartsAt = 4 * time.Hour
 func QuickFingerprint(path string) (string, error); func HashFile(path string) (string, error) // lowercase hex
 func CaptureTime(path string, kind Kind) (Capture, error) // errors only when even the mtime can't be read
-func ReadVideoMeta(path string) (*VideoMeta, error)
+func ReadVideoMeta(path string) (*VideoMeta, error)        // nil meta on error
+func FileModDate(path string) (time.Time, error)          // CaptureTime's mtime fallback
+var ErrNoMvhdTime error                                   // "media: mvhd has no creation time"
+type TimeSource string // SourceExif "exif", SourceMvhd "mvhd", SourceMtime "mtime"
+type Capture struct{ Time time.Time; Source TimeSource; Offset string; GPS time.Time; Camera string; Fallback error }
+type VideoMeta struct{ Duration float64; Width, Height int; FrameRate, Resolution string; CreationTime time.Time; Make, Model, Firmware string } // CreationTime UTC, zero when absent
+// CaptureTime's video branch (capture.go; videos never read EXIF): ReadVideoMeta error →
+// Fallback = fmt.Errorf("video metadata: %w", err); zero CreationTime → Camera = TrimSpace(Make+" "+Model),
+// Fallback = ErrNoMvhdTime; else Camera likewise, Time = CreationTime.In(time.Local), Source = SourceMvhd.
+// With no Source yet: Time = FileModDate(path), Source = SourceMtime (its error joined onto Fallback is returned).
 func FolderDate(t time.Time, dayStartsAt time.Duration) string // "YYYY-MM-DD"
 func DestFileName(t time.Time, kind Kind, meta *VideoMeta, ext string) string
 func FreeName(src, dir, name string) (dst string, duplicate bool, err error) // collision loop; duplicate = identical content already at dst
@@ -1282,9 +1300,12 @@ func Scan(root string, rules media.Rules) (ScanResult, error)
 func CleanPartials(stagingRoot string) ([]string, error)
 func FreeSpace(path string) (uint64, error)
 func mkdirDurable(dir string) error
+// Task 6 defined these in clock.go and describe.go: call them, do not redefine them
+// (a second definition fails to compile with "redeclared in this block").
 func CheckClock(c media.Capture, now time.Time) []catalog.ClockWarning
 func CardName(in catalog.Ingest) string
-func formatGB(b uint64) string
+func formatGB(b uint64) string               // fmt.Sprintf("%.1f GB", float64(b)/1e9)
+func plural(n int, one, many string) string // one when n == 1, else many
 func writeFile(t, root, rel string, data []byte) string // helpers_test.go
 
 // internal/media/mediatest
@@ -1330,7 +1351,8 @@ func (j *ingestRun) cat() *catalog.DB                    // unexported: j.r.cfg.
 // Run imports the card of in (a queued row from CreateIngest) and returns
 // the finished row. The outcome, including failure, is in the row; the
 // error is non-nil only when the catalog couldn't record the start or the
-// finish.
+// finish. When the start can't be recorded, Run first tries to mark the
+// row failed with that error, so it is never left queued.
 func (r *Runner) Run(ctx context.Context, in catalog.Ingest, p *Progress) (catalog.Ingest, error)
 
 const (
@@ -1424,8 +1446,9 @@ func (e *env) run(t *testing.T, card string) catalog.Ingest {
 	return out
 }
 
-// staged lists regular files under photos/Staging as slash paths relative
-// to photos, sorted; nil when Staging doesn't exist.
+// staged lists every regular file under photos/Staging (partials included)
+// as slash paths relative to photos, sorted. It returns nil when there are
+// no regular files, whether or not Staging or folders inside it exist.
 func (e *env) staged(t *testing.T) []string
 
 // files maps CardPath → IngestFile for an ingest.
@@ -1461,19 +1484,46 @@ Expected: build failure (`undefined: NewRunner`).
 
 - [ ] **Step 3: Implement `progress.go` and `run.go`**
 
-`Run` creates a per-run state value, `type ingestRun struct` (r, ctx, `dbctx := context.WithoutCancel(ctx)` for every catalog call (Decision 24), id, card root, `now := r.now()` taken once, `rules := media.DefaultRules()`, settings, `stagingRoot`, a logger `r.log().With("ingest", id, "card", CardName(in))`, `p`, counts, warnings, cardSize, and the `scan`/`classify`/`capture`/`copy` durations and copied bytes). It calls `StartIngest(dbctx, in.ID, now)` (an error is returned as `Run`'s error), then `status, errText := j.pipeline()`, then `return j.finish(status, errText)`.
+`Run` creates a per-run state value with exactly these field names (Task 8 uses them):
+
+```go
+type ingestRun struct {
+	r           *Runner
+	ctx         context.Context // the job's context: stops the pipeline
+	dbctx       context.Context // context.WithoutCancel(ctx), for every catalog call (Decision 24)
+	id          int64
+	card        string      // the card root, in.CardPath
+	now         time.Time   // r.now(), taken once
+	rules       media.Rules // media.DefaultRules()
+	settings    catalog.Settings
+	stagingRoot string       // filepath.Join(PhotosRoot, StagingDir)
+	log         *slog.Logger // r.log().With("ingest", id, "card", CardName(in))
+	p           *Progress
+	counts      catalog.Counts
+	warnings    []catalog.ClockWarning
+	cardSize    int64 // sum of the Media sizes
+	// For the "ingest finished" log line (Decision 22):
+	scanDur     time.Duration
+	classifyDur time.Duration
+	captureDur  time.Duration
+	copyDur     time.Duration
+	copyBytes   int64
+}
+```
+
+`Run` calls `StartIngest(dbctx, in.ID, now)`. If that fails, the row must not stay queued: call `FinishIngest(dbctx, catalog.Ingest{ID: in.ID, Status: catalog.StatusFailed, FinishedAt: now, Error: "start import: " + err.Error()})`, set those fields on `in`, and return `in, fmt.Errorf("start ingest %d: %w", in.ID, errors.Join(err, finishErr))` (a nil `finishErr` drops out of the join). Otherwise `status, errText := j.pipeline()`, then `return j.finish(status, errText)`.
 
 `pipeline()`, in order:
 1. Phase scanning. `Settings` (on error, return failed, `"settings: " + err.Error()`). `Scan(card, rules)` (on error, failed, `"scan card: " + err.Error()`). Each `ScanError` becomes a failed row `{CardPath: Rel, Error: Err.Error()}`; each unsupported file becomes `{CardPath, Size, Outcome: unsupported}`. `cardSize` is the sum of the `Media` sizes.
-2. Phase classifying, `FilesTotal = len(Media)`. Classify with 3 workers (an index channel, `results[i]` written by index, `sync.WaitGroup` with `Add`/`Done`). `classifyOne(f CardFile) classified`, with `type classified struct { CardFile; fp string; outcome catalog.Outcome; sha string; err error }` (`sha` is the matched asset's for a known outcome, `err` the reason for a failed one): `fp := r.fingerprint(f.Path)` (on error, failed); `matches := AssetsByFingerprint(fp)` (on error, failed); no match → new. In quick mode the best match by state precedence (Decision 8) is known, with that asset's sha. In full mode, `h := r.hashFile(f.Path)`: a match whose sha equals `h` → known; else `AssetBySHA(h)` found → `AddFingerprint(fp, a.SHA256)` and known; `ErrNotFound` → new; any other error → failed. Each classified file increments `FilesDone`.
-3. Record the failed, unsupported and known rows (known rows carry `QuickFP` and the matched `SHA256`) with one `AddIngestFiles`, adding each to `counts` and to the progress counts (on error, failed, `"record files: " + err.Error()`).
+2. Phase classifying, `FilesTotal = len(Media)`, `FilesDone = 0`. Classify with 3 workers (an index channel, `results[i]` written by index, `sync.WaitGroup` with `Add`/`Done`). `classifyOne(f CardFile) classified`, with `type classified struct { CardFile; fp string; outcome catalog.Outcome; sha string; err error }` (`sha` is the matched asset's for a known outcome, `err` the reason for a failed one): `fp := r.fingerprint(f.Path)` (on error, failed); `matches := AssetsByFingerprint(fp)` (on error, failed); no match → new. In quick mode the best match by state precedence (Decision 8) is known, with that asset's sha. In full mode, `h := r.hashFile(f.Path)`: a match whose sha equals `h` → known; else `AssetBySHA(h)` found → `AddFingerprint(fp, a.SHA256)` and known; `ErrNotFound` → new; any other error → failed. Each classified file increments `FilesDone`.
+3. Record the failed, unsupported and known rows (known rows carry `QuickFP` and the matched `SHA256`) with one `AddIngestFiles`, then add each row's outcome to `j.counts` and, through `p.update`, to the progress snapshot's `Counts` (on error, failed, `"record files: " + err.Error()`).
 4. With no new files, return done.
 5. `CleanPartials(stagingRoot)` (on error, failed, `"clean partial files: " + …`); log each removed path at Warn.
 6. `free := r.freeSpace(PhotosRoot)` (on error, failed, `"free space: " + …`). With `need` the sum of new sizes, if `free < need + settings.ReserveBytes`, return refused with `fmt.Sprintf("staging would drop below the %s free-space reserve (%d new %s need %s, %s free)", formatGB(reserve), n, plural(n, "file", "files"), formatGB(need), formatGB(free))`.
-7. Phase copying (`FilesTotal`, `BytesTotal`). For each new file in Rel order (`Scan` sorted them, which is what keeps bursts in card order), call `res := j.importOne(f)`. If `!res.recorded`, `AddIngestFiles(dbctx, id, []IngestFile{res.row})` (on error, failed, `"record files: …"`). Add the outcome to `counts`, append `res.warnings`, and increment `FilesDone`/`BytesDone`.
+7. Phase copying. Entering it resets the file and byte progress for the copy: `FilesTotal = len(new)`, `FilesDone = 0`, `BytesTotal` = the sum of the new files' sizes, `BytesDone = 0` (classification had already brought `FilesDone` to `len(Media)`). For each new file in Rel order (`Scan` sorted them, which is what keeps bursts in card order), call `res := j.importOne(f)`. If `!res.recorded`, `AddIngestFiles(dbctx, id, []IngestFile{res.row})` (on error, failed, `"record files: …"`). Then this step, not `importOne`, adds `res.row.Outcome` to `j.counts` and to the progress snapshot's `Counts`, appends `res.warnings`, and increments `FilesDone` by 1 and `BytesDone` by `f.Size`, whatever the outcome. So at the end of a run `FilesDone == FilesTotal`, `BytesDone == BytesTotal` and the snapshot's `Counts` equal the finished row's (`TestProgress`).
 8. Return done.
 
-`importOne` (Task 8 extends it; keep these names: `newFile`, `fileResult`, `copyNew`, `recordExisting`, `dropCopy`, `failedRow`):
+`importOne` (Task 8 extends it; keep these names: `newFile`, `fileResult`, `captureOf`, `copyNew`, `recordExisting`, `dropCopy`, `failedRow`):
 
 ```go
 // newFile is a card file classified as new, with its quick fingerprint.
@@ -1489,16 +1539,42 @@ type fileResult struct {
 	warnings []catalog.ClockWarning
 }
 
+// captureOf resolves f's capture time and, for a video, returns the
+// metadata it read, so the card's moov box is read once (Decision 25).
+// Non-videos go through media.CaptureTime. For a video it mirrors
+// CaptureTime's video branch: a metadata error or a missing mvhd time is
+// the Fallback, and the modified time names the file.
+func captureOf(path string, kind media.Kind) (media.Capture, *media.VideoMeta, error) {
+	if kind != media.KindVideo {
+		c, err := media.CaptureTime(path, kind)
+		return c, nil, err
+	}
+	var c media.Capture
+	meta, err := media.ReadVideoMeta(path)
+	switch {
+	case err != nil:
+		meta = nil
+		c.Fallback = fmt.Errorf("video metadata: %w", err)
+	case meta.CreationTime.IsZero():
+		c.Camera = strings.TrimSpace(meta.Make + " " + meta.Model)
+		c.Fallback = media.ErrNoMvhdTime
+	default:
+		c.Camera = strings.TrimSpace(meta.Make + " " + meta.Model)
+		c.Time, c.Source = meta.CreationTime.In(time.Local), media.SourceMvhd
+		return c, meta, nil
+	}
+	mtime, err := media.FileModDate(path)
+	if err != nil {
+		return media.Capture{}, nil, errors.Join(c.Fallback, err)
+	}
+	c.Time, c.Source = mtime, media.SourceMtime
+	return c, meta, nil
+}
+
 func (j *ingestRun) importOne(f newFile) fileResult {
 	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
 	start := time.Now()
-	c, err := media.CaptureTime(f.Path, f.Kind)
-	var meta *media.VideoMeta
-	if err == nil && f.Kind == media.KindVideo {
-		if m, verr := media.ReadVideoMeta(f.Path); verr == nil {
-			meta = m // on error the name has no video suffix; the reason is already in c.Fallback
-		}
-	}
+	c, meta, err := captureOf(f.Path, f.Kind) // meta is nil unless f is a video whose metadata was read
 	j.captureDur += time.Since(start)
 	if err != nil {
 		return fail(fmt.Errorf("capture time: %w", err))
@@ -1545,6 +1621,9 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 	a := catalog.Asset{SHA256: sum, Size: f.Size, Kind: f.Kind, CaptureTime: c.Time, TZOffset: c.Offset,
 		State: catalog.StateStaged, RelPath: j.rel(dst), Mtime: info.ModTime().UnixNano(), UpdatedAt: j.now}
 	row := catalog.IngestFile{CardPath: f.Rel, Size: f.Size, QuickFP: f.fp, SHA256: sum, Outcome: catalog.OutcomeNew, RelPath: a.RelPath}
+	if f.Kind == media.KindVideo && meta == nil {
+		row.Error = "named without video metadata: " + c.Fallback.Error() // imported, but not silently (Decision 25)
+	}
 	if err := j.cat().RecordNew(j.dbctx, j.id, a, f.fp, row); err != nil {
 		return fail(fmt.Errorf("copied to %s but not recorded: %w", a.RelPath, err))
 	}
@@ -1560,7 +1639,7 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 - `j.rel(dst)`: `filepath.Rel(PhotosRoot, dst)` passed through `filepath.ToSlash`.
 - `copyNew(f, dir, name) (dst, sum string, dup bool, err error)` for now: `FreeName`; if it errors or reports a duplicate, return that; else `sum, err = j.r.copyFile(j.ctx, f.Path, dst)`. Task 8 replaces it with the retrying version.
 - `recordExisting(f, dst)`: `sum := r.hashFile(f.Path)` (on error, fail). `AssetBySHA(sum)`: when found, `AddFingerprint(f.fp, a.SHA256)` (on error, fail) and return the known row for the asset. `ErrNotFound` for now gives fail with `fmt.Errorf("identical file already at %s but not in the catalog", j.rel(dst))` (Task 8 adopts it instead); any other error, fail.
-- `dropCopy(f, dst, a)`: `os.Remove(dst)` (on error, fail with `"duplicate copy %s could not be removed: %w"`), `media.SyncDir(dir)`, `AddFingerprint(f.fp, a.SHA256)`, each error a fail, then return the known row (`{CardPath, Size, QuickFP: f.fp, SHA256: a.SHA256, Outcome: knownOutcome(a.State)}`).
+- `dropCopy(f, dst, a)`: `os.Remove(dst)` (on error, fail with `"duplicate copy %s could not be removed: %w"`), `media.SyncDir(filepath.Dir(dst))`, `AddFingerprint(f.fp, a.SHA256)`, each error a fail, then return the known row (`{CardPath, Size, QuickFP: f.fp, SHA256: a.SHA256, Outcome: knownOutcome(a.State)}`).
 
 `finish(status, errText)`: phase finishing. If there are warnings, `AddClockWarnings` (on error, status failed with `"record clock warnings: …"`). `safe := status == StatusDone && counts.Failed == 0 && counts.Unsupported == 0 && counts.Seen > 0` (Decision 9). `FinishIngest(dbctx, Ingest{ID, Status, FinishedAt: r.now(), Counts, ClockWarnings: len(warnings), CardSize, SafeToFormat: safe, Error: errText})`, whose error is returned. Then `j.log.Info("ingest finished", "status", status, "seen", counts.Seen, "new", counts.New, "failed", counts.Failed, "scan", scanDur, "classify", classifyDur, "capture", captureDur, "copy", copyDur, "copy_bytes", copyBytes)`, phase done, and `return cat.Ingest(dbctx, id)`. These log keys are the RAW measurement (Decision 22), so keep their names.
 
@@ -1594,6 +1673,7 @@ type Runner struct {
 	copyFile    func(ctx context.Context, src, dst string) (string, error)
 }
 type ingestRun struct{ r *Runner; ctx, dbctx context.Context; id int64; card, stagingRoot string; now time.Time; log *slog.Logger; … }
+// (field names exactly as Task 7 pinned them; card is the card root, in.CardPath)
 type newFile struct{ CardFile; fp string }
 type fileResult struct{ row catalog.IngestFile; recorded bool; warnings []catalog.ClockWarning }
 func (j *ingestRun) pipeline() (catalog.IngestStatus, string) // numbered steps 1–8 in Task 7
@@ -1609,7 +1689,9 @@ func mkdirDurable(dir string) error
 // PartialSuffix; CopyHashed(ctx, src, dst); SyncDir(dir)
 // catalog: RecordNew(ctx, ingestID, a Asset, quickFP, f IngestFile) (f.Outcome new or in_staging)
 // tests (helpers_test.go): newEnv(t) *env with e.r, e.cat, e.photos, e.cards, e.free; e.fixtureCard(t, label);
-// e.run(t, card) catalog.Ingest; e.staged(t) []string; e.files(t, id) map[string]catalog.IngestFile;
+// e.run(t, card) catalog.Ingest; e.files(t, id) map[string]catalog.IngestFile;
+// e.staged(t) []string: every regular file under photos/Staging (partials included), slash paths
+//   relative to photos, sorted; nil when there are no regular files, whether or not Staging or folders inside it exist;
 // writeFile, writeJPEG; testNow; sonyJPEG/sonyARW are "Staging/2025-05-30/2025-05-31 01.30.12.JPG" and "Staging/2025-05-30/Capture/2025-05-31 01.30.12.ARW"
 ```
 
@@ -1629,7 +1711,7 @@ Sony card file order is `DCIM/100MSDCF/DSC00001.ARW` then `DCIM/100MSDCF/DSC0000
 - `TestRunRetriesTakenName`: on its first call `e.r.copyFile` writes `"someone else"` at `dst` and then calls `media.CopyHashed`, which fails with `CopyFailDestTaken`. The ARW ends up at `"Staging/2025-05-30/Capture/2025-05-31 01.30.12-1.ARW"` with the card's bytes, the intruder file is unchanged, New 2, and safe is true.
 - `TestRunRetriesStalePartial`: on its first call `e.r.copyFile` writes `dst+media.PartialSuffix` and then calls `media.CopyHashed`. The ARW is staged at its base name, no partials are left, and New is 2.
 - `TestRunRetriesMissingDestDir`: on its first call `e.r.copyFile` does `os.RemoveAll(filepath.Dir(dst))` and then calls `media.CopyHashed`. The ARW is staged at `sonyARW` and New is 2.
-- `TestRunGivesUpAfterThreeAttempts`: `e.r.copyFile` always writes `dst` first. The ARW is `failed` with an `Error` containing `"gave up after 3 attempts"`, and `copyFile` was called exactly 3 times for it.
+- `TestRunGivesUpAfterThreeAttempts`: the fault is scoped to the ARW. For a `src` ending `.ARW`, `e.r.copyFile` always writes `"someone else"` at `dst` first and then calls `media.CopyHashed` (which fails with `CopyFailDestTaken`); for any other `src` it only calls `media.CopyHashed`. The ARW is `failed` with an `Error` containing `"gave up after 3 attempts"`, and `copyFile` was called exactly 3 times for it. The JPG is unaffected: `new`, staged at `sonyJPEG`. `Counts{Seen: 2, New: 1, Failed: 1}`, safe false.
 - `TestRunCleansStalePartials` (Review Focus 10): before the run, write `"Staging/2025-05-30/2025-05-31 01.30.12.JPG.partial"` under photos. After it: New 2, `staged == [sonyJPEG, sonyARW]`, and the staged JPG has the card's bytes.
 - `TestRunAdoptsUnrecordedCopy` (Review Focus 10): before the run, copy the card JPG's bytes to `photos/` + `sonyJPEG` (a copy whose catalog write never happened). After it: the JPG is `in_staging` with `RelPath == sonyJPEG`, the ARW is `new`, `staged == [sonyJPEG, sonyARW]` (no `-1`), `AssetBySHA(HashFile(card JPG))` is `staged` at `sonyJPEG` with `FirstIngest == out.ID`, and safe is true.
 
@@ -1714,12 +1796,14 @@ type Runner struct{ cfg Config; fingerprint, hashFile func(string) (string, erro
 func NewRunner(cfg Config) *Runner
 func (r *Runner) now() time.Time
 func (r *Runner) log() *slog.Logger
-func (r *Runner) Run(ctx context.Context, in catalog.Ingest, p *Progress) (catalog.Ingest, error) // returns StatusCancelled when ctx is cancelled mid-run
+func (r *Runner) Run(ctx context.Context, in catalog.Ingest, p *Progress) (catalog.Ingest, error) // returns StatusCancelled when ctx is cancelled mid-run;
+// a non-nil error means the catalog couldn't record the start or the finish (on a failed start, Run has already tried to mark the row failed)
 type Progress struct{ … }; func NewProgress() *Progress; func (p *Progress) Snapshot() ProgressSnapshot
 const StagingDir = "Staging"
 func CleanPartials(stagingRoot string) ([]string, error)
-// tests: newEnv(t) *env (e.r, e.cat, e.photos, e.cards), e.fixtureCard(t, label) string,
-// e.staged(t) []string (regular files under photos/Staging, nil if none), writeFile
+// tests: newEnv(t) *env (e.r, e.cat, e.photos, e.cards), e.fixtureCard(t, label) string, writeFile,
+// e.staged(t) []string: every regular file under photos/Staging (partials included), slash paths
+//   relative to photos, sorted; nil when there are no regular files, whether or not Staging or folders inside it exist
 
 // internal/catalog
 func (d *DB) CreateIngest(ctx, cardPath, label, uuid string, at time.Time) (Ingest, error) // status queued
@@ -1775,7 +1859,7 @@ Tests:
 - `TestValidateCardPath` (Review Focus 8): `cards := t.TempDir()` holds `SONY/`, the file `f.txt`, and a sibling `outside := t.TempDir()`. `ValidateCardPath(cards, filepath.Join(cards, "SONY"))` returns `filepath.EvalSymlinks` of that path. These error: `cards` itself; `filepath.Join(cards, "..", filepath.Base(outside))`; `"SONY"` (relative); `filepath.Join(cards, "missing")` (also `errors.Is(err, fs.ErrNotExist)`); `filepath.Join(cards, "f.txt")`; and a symlink `cards/link → outside` (skip that case if `os.Symlink` fails).
 - `TestManagerRunsOneAtATime`: cards A (`e.fixtureCard(t, "SONY_A7IV")`) and B (`e.fixtureCard(t, "GOPRO")`), with the copy gated. Submit A and wait for its first `started`. Submit B: `B.Result().Status == StatusQueued`, and `Current()` gives running A and queued `[B]`. Submitting A's path again returns the same `*Job` (pointer equal) and `Ingests` still has 2 rows. Call `release()`, then `waitDone` A and B: both done. The `started` channel yielded A's two card files first and B's file last (B never started while A ran; the env's fixed clock makes timestamps useless for this).
 - `TestManagerQueueFull`: the copy is gated and never released. Make 9 more card dirs `cards/C1` … `cards/C9`, each with one JPEG (`writeFile`) under `DCIM/`. Submit the Sony card (wait for `started`), then C1–C8, which all queue; submitting C9 gives `errors.Is(err, ErrQueueFull)`. The cleanup `Close` must still finish within its deadline.
-- `TestManagerCloseCancelsRunning` (Review Focus 4): with the copy gated, A is running and B queued. `Close(ctx 10s)` returns nil, and both `Done` channels are closed. A's result is `StatusCancelled` with safe false; B's is `StatusCancelled` with `Error == "SD2NAS stopped before this import started"` and a non-zero `FinishedAt`. The catalog rows agree. `e.staged(t)` is nil (no partials, no files). `Submit` after `Close` gives `ErrClosed`, and a second `Close` returns nil.
+- `TestManagerCloseCancelsRunning` (Review Focus 4): with the copy gated, A is running and B queued. `Close(ctx 10s)` returns nil, and both `Done` channels are closed. A's result is `StatusCancelled` with safe false; B's is `StatusCancelled` with `Error == "SD2NAS stopped before this import started"` and a non-zero `FinishedAt`. The catalog rows (`e.cat.Ingest`) agree with both results: the same `Status`, `Error` and `SafeToFormat`, and `FinishedAt` `Equal` (the manager truncates its in-memory times to milliseconds, as the catalog stores them). `e.staged(t)` is nil (no partials, no files). `Submit` after `Close` gives `ErrClosed`, and a second `Close` returns nil.
 - `TestManagerRecover`: `CreateIngest` twice and `StartIngest` the second (one queued, one running), then write `photos/Staging/2025-05-30/x.JPG.partial` and `photos/Archive/y.JPG.partial`. `Recover(ctx)` returns nil. Both rows are `failed`, the Staging partial is gone, and the Archive partial is still there.
 - `TestManagerSubmitBadPath`: `Submit` of `filepath.Dir(e.cards)` gives `errors.Is(err, ErrBadCardPath)` and creates no ingest row.
 - `TestManagerDefaultLabel`: `Request{Path: card}` with an empty label gives `CardLabel == filepath.Base(card)`. `Request{Path: card, Label: "  CARD  "}` gives `"CARD"` (trimmed).
@@ -1814,9 +1898,11 @@ type Job struct {
 }
 ```
 
-- `Submit`: return `ErrClosed` if closed. `ValidateCardPath`, wrapping its error as `fmt.Errorf("%w: %v", ErrBadCardPath, err)`. Under `m.mu`, return the running or queued job with the same path; else `ErrQueueFull` if `len(queue) >= MaxQueued`; else `CreateIngest(ctx, path, label, req.UUID, r.now())`, where label is `strings.TrimSpace(req.Label)` or `filepath.Base(path)`. Append the job with `NewProgress()` and wake the worker.
-- Worker loop: `next()` pops the head under the lock (setting `m.running`). It returns nil once closed, and otherwise waits on `m.wake` or `m.ctx.Done()` when the queue is empty. For each job, set the in-memory row to running (`StartedAt = r.now()`) and call `out, err := m.r.Run(m.ctx, row, j.progress)`. If `err != nil`, log it at Error and use the last row with `Status: failed`, `Error: err.Error()`, `FinishedAt: r.now()`. Then, under the lock, clear `m.running`, store the row and `close(j.done)`.
-- `Close`: mark closed (a second call only waits); take the queue; `m.cancel()`. For each queued job, `FinishIngest(ctx, row with Status cancelled, Error "SD2NAS stopped before this import started", FinishedAt now)`, collecting the errors, then store the row and close `done`. If started, wait for `m.exited` or `ctx.Done()` (adding `ctx.Err()`). Return `errors.Join(errs...)`.
+In-memory `StartedAt`/`FinishedAt` values the manager sets are `r.now().Truncate(time.Millisecond)`, the precision the catalog stores, so a job's row and the catalog's compare `Equal`.
+
+- `Submit`: lock `m.mu` at the top and hold it for the whole call (`defer m.mu.Unlock()`), so the closed check, de-duplication and append are one atomic step. In order: return `ErrClosed` if `m.closed`. `ValidateCardPath`, wrapping its error as `fmt.Errorf("%w: %v", ErrBadCardPath, err)`. Return the running or queued job with the same path. `ErrQueueFull` if `len(m.queue) >= MaxQueued`. `CreateIngest(ctx, path, label, req.UUID, r.now().Truncate(time.Millisecond))`, where label is `strings.TrimSpace(req.Label)` or `filepath.Base(path)`. Append the job with `NewProgress()` and wake the worker (non-blocking send). Because `Close` sets `closed` under the same lock, no job is accepted after `Close` has taken the queue, and every accepted job's `Done` is closed by the worker or by `Close`. Holding `m.mu` across `CreateIngest` is deliberate and accepted (Decision 17): with one catalog connection it can wait behind the running job's catalog writes, and `Current` and `Close` wait with it, which only serialises submits (rare); it cannot deadlock, because `Run` never takes `m.mu`.
+- Worker loop: `next()` pops the head under the lock (setting `m.running`). It returns nil once closed, and otherwise waits on `m.wake` or `m.ctx.Done()` when the queue is empty. For each job, set the in-memory row to running (`StartedAt = r.now().Truncate(time.Millisecond)`) and call `out, err := m.r.Run(m.ctx, row, j.progress)`. If `err != nil`, log it at Error and use the last row with `Status: failed`, `Error: err.Error()`, `FinishedAt: r.now().Truncate(time.Millisecond)` (when the start couldn't be recorded, `Run` has already tried to mark the catalog row failed, so it is not left queued). Then, under the lock, clear `m.running`, store the row and `close(j.done)`.
+- `Close`: under `m.mu`, note whether it was already closed, set `m.closed = true`, and take the queue (`queued := m.queue; m.queue = nil`); then release the lock (a second call only waits). `m.cancel()`. For each queued job, outside the lock, `FinishIngest(ctx, row with Status cancelled, Error "SD2NAS stopped before this import started", FinishedAt r.now().Truncate(time.Millisecond))`, collecting the errors, then store the row and close `done`. If started, wait for `m.exited` or `ctx.Done()` (adding `ctx.Err()`). Return `errors.Join(errs...)`.
 - `Recover`: `FailInterrupted(ctx, r.now())`, logging the count when it isn't 0. `CleanPartials(filepath.Join(PhotosRoot, StagingDir))`, logging each removed path. Join both errors.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
@@ -1848,6 +1934,10 @@ type Server struct{ version string; started time.Time; mounts []Mount; writable 
 func New(version string, mounts []Mount) *Server // registers GET /healthz and GET /{$}
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // handleHealthz builds h.Problems; any problem → "degraded" and 503
+// existing test helpers in server_test.go (same package): reuse them, and do not define
+// another function named get or decode in the new test files (it would not compile):
+func get(t *testing.T, s *Server, path string) *httptest.ResponseRecorder
+func decode(t *testing.T, rec *httptest.ResponseRecorder) health
 
 // internal/ingest (Tasks 5–9)
 type Request struct{ Path, Label, UUID string }
@@ -1861,9 +1951,11 @@ func (j *Job) ID() int64; func (j *Job) Done() <-chan struct{}; func (j *Job) Re
 type ProgressSnapshot struct{ Phase string; FilesTotal, FilesDone int; BytesTotal, BytesDone int64; Counts catalog.Counts } // json tags phase, files_total, …
 func Describe(in catalog.Ingest) (level, message string)
 func CardName(in catalog.Ingest) string
+const LevelNormal, LevelWarning, LevelAlert = "normal", "warning", "alert"
 
 // internal/catalog
 func Open(path string) (*DB, error); func (d *DB) Close() error
+func (s IngestStatus) Terminal() bool // done, failed, refused, cancelled; "while not finished" = !Terminal()
 func (d *DB) Ingest(ctx, id int64) (Ingest, error)                   // ErrNotFound
 func (d *DB) Ingests(ctx, limit int, beforeID int64) ([]Ingest, error)
 func (d *DB) IngestFiles(ctx, ingestID int64) ([]IngestFile, error)
@@ -1941,14 +2033,14 @@ A 403 has a JSON body `{"error": "…"}`, and the inner handler was not called.
 func newIngestServer(t *testing.T, free func(string) (uint64, error), maxWait time.Duration) (s *Server, card string)
 ```
 
-It creates the cards, photos and config temp dirs first; `CopyCard(filepath.Join("..", "..", "testdata"), "SONY_A7IV", cards)`; `catalog.Open` plus a cleanup that closes it; `ingest.NewRunner(ingest.Config{Catalog, PhotosRoot, FreeSpace: free, Log: slog.New(slog.DiscardHandler)})`; `NewManager(runner, cards)`, `Start()`, and a cleanup that closes the manager with a 10 s context (registered after the catalog's, so it runs first); `New("test", nil)` and `MountIngest(m, db, maxWait)`. `post(t, s, query, body string) *httptest.ResponseRecorder` sets `X-SD2NAS: 1` and `Content-Type: application/json`. The body is `fmt.Sprintf(`{"path":%q,"label":"SONY_A7IV","uuid":"1234-ABCD"}`, card)`. `plenty` is a FreeSpace that returns 1e12.
+It creates the cards, photos and config temp dirs first; `CopyCard(filepath.Join("..", "..", "testdata"), "SONY_A7IV", cards)`; `catalog.Open` plus a cleanup that closes it; `ingest.NewRunner(ingest.Config{Catalog, PhotosRoot, FreeSpace: free, Log: slog.New(slog.DiscardHandler)})`; `NewManager(runner, cards)`, `Start()`, and a cleanup that closes the manager with a 10 s context (registered after the catalog's, so it runs first); `New("test", nil)` and `MountIngest(m, db, maxWait)`. `post(t, s, query, body string) *httptest.ResponseRecorder` sets `X-SD2NAS: 1` and `Content-Type: application/json`. The body is `fmt.Sprintf(`{"path":%q,"label":"SONY_A7IV","uuid":"1234-ABCD"}`, card)`. `plenty` is a FreeSpace that returns 1e12. The other new helpers in `ingest_test.go` are `decodeInto(t *testing.T, rec *httptest.ResponseRecorder, v any)` (JSON-decodes the body into `v`, failing the test on error) and `pollUntil(t *testing.T, what string, cond func() bool)` (calls `cond` every 10 ms until it is true, failing with `"timed out waiting for " + what` after 10 s). For GETs use the existing `get(t, s, path)`; don't name any new helper `get` or `decode`.
 
 - `TestIngestWaitText` (Review Focus 2): `post(t, s, "?wait=1&format=text", body)` gives 200, `Content-Type` `text/plain; charset=utf-8`, and body exactly `"normal\nSONY_A7IV: 2 new, 0 already known. Card safe to format.\n"`. The same request again gives 200 and `"normal\nSONY_A7IV: 0 new, 2 already known. Card safe to format.\n"`.
 - `TestIngestWaitJSON`: `?wait=1` gives 200 with JSON `status "done"`, `safe_to_format true`, `counts.new 2`, `level "normal"`, and an `id` greater than 0.
 - `TestIngestNoWait`: no query gives 202, JSON with `id > 0` and `status` one of `queued`/`running`/`done`. Poll `GET /api/ingests/{id}` (10 s deadline) until `status == "done"`; its JSON has no `files` key (every file was new) and `counts.new` is 2.
 - `TestIngestRefusedIs507` (Review Focus 6): FreeSpace returns 0. `?wait=1&format=text` gives 507; line 1 is `alert` and line 2 starts with `SONY_A7IV: not imported, staging would drop below the 50.0 GB free-space reserve`.
 - `TestIngestBadRequests`: a POST without `X-SD2NAS` gives 403. Each of these gives 400 with a JSON `error`: body `{`, body `{"path":"x","extra":1}`, body `{"path":""}`, and a path outside the cards root (`t.TempDir()`). None of them creates an ingest row (`GET /api/ingests` is empty).
-- `TestIngestWaitTimeout` (Review Focus 9): FreeSpace blocks until a `release` channel is closed (`defer close(release)` in the test body), with `maxWait` 50 ms. `?wait=1&format=text` gives 504 and body `"alert\nSONY_A7IV: still importing after 50ms. Card left mounted.\n"`. While the job is still blocked, `GET /healthz` answers (any status), and `GET /api/ingest/current` gives 200 with a non-null `running` whose `id` matches and whose `progress.phase` is `"classifying"`.
+- `TestIngestWaitTimeout` (Review Focus 9): FreeSpace blocks until a `release` channel is closed (`defer close(release)` in the test body), with `maxWait` 50 ms. `?wait=1&format=text` gives 504 and body `"alert\nSONY_A7IV: still importing after 50ms. Card left mounted.\n"`. While the job is still blocked, `GET /healthz` answers (any status). Then poll `GET /api/ingest/current` with `pollUntil` (10 s deadline; on a slow runner the worker may not have popped the job or finished scanning yet) until it gives 200 with a non-null `running` whose `id` matches and whose `progress.phase` is `"classifying"`.
 - `TestIngestHistory`: two `?wait=1` runs. `GET /api/ingests` lists the ids `[2, 1]`; `?limit=1` gives `[2]`; `?before=2` gives `[1]`; `?limit=x` gives 400. `GET /api/ingests/2` has `files` with 2 entries, both `outcome "in_staging"` with `rel_path` set. `/api/ingests/999` gives 404, and `/api/ingests/abc` gives 400.
 - `TestIngestCurrentIdle`: the body decodes to `running == nil` and an empty, non-nil `queued` slice (JSON `[]`, not `null`).
 
@@ -2032,7 +2124,7 @@ func finishedCode(s catalog.IngestStatus) int {
 }
 ```
 
-`respond` builds `ingestView{Ingest: row, Level, Message (from ingest.Describe), Progress (while not finished)}` and writes JSON, or in text mode just level and message. `GET /api/ingests/{id}` reads `db.Ingest` (`ErrNotFound` → 404), `IngestFiles` filtered to `Outcome != OutcomeNew`, and `ClockWarnings`, and adds progress when the id is the manager's running or queued job. Bad `limit`/`before`/`id` values (not a positive integer) give 400. `queued` is always a non-nil slice.
+`respond` builds `ingestView{Ingest: row, Level, Message (from ingest.Describe), Progress (while not finished, i.e. !row.Status.Terminal())}` and writes JSON, or in text mode just level and message. `GET /api/ingests/{id}` reads `db.Ingest` (`ErrNotFound` → 404), `IngestFiles` filtered to `Outcome != OutcomeNew`, and `ClockWarnings`, and adds progress when the id is the manager's running or queued job. Bad `limit`/`before`/`id` values (not a positive integer) give 400. `queued` is always a non-nil slice.
 
 - [ ] **Step 4: Run the API tests and confirm they pass**
 
@@ -2067,7 +2159,7 @@ After `config.Load` and the umask, make `cfg.Cards`, `cfg.Photos` and `cfg.Data`
 	}
 ```
 
-Shutdown, after `<-ctx.Done()`, uses one 8 s budget (inside Docker's default 10 s stop timeout): first `mgr.Close(shutdownCtx)`, which cancels the running copy so `?wait=1` handlers return, then `httpSrv.Shutdown(shutdownCtx)`. Return `errors.Join` of both, each wrapped with what it was stopping. The deferred `db.Close` runs last.
+Shutdown, after `<-ctx.Done()`, uses one 8 s budget (inside Docker's default 10 s stop timeout): first, only `if mgr != nil` (it is nil when the catalog failed to open, Decision 21; calling `Close` on it would panic), `mgr.Close(shutdownCtx)`, which cancels the running copy so `?wait=1` handlers return; then `httpSrv.Shutdown(shutdownCtx)`. Return `errors.Join` of both, each wrapped with what it was stopping (a skipped manager close contributes nil). The deferred `db.Close` runs last.
 
 - [ ] **Step 6: Smoke-test the binary**
 
