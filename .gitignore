@@ -1,0 +1,10 @@
+# Local dev data (go run ... --photos ./tmp/photos --config ./tmp/config)
+/tmp/
+
+# Built binaries
+/sd2nas
+/sd2nas.exe
+
+# Web build output and dependencies (from M3)
+/web/dist/
+node_modules/
