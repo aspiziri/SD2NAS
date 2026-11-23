@@ -572,8 +572,8 @@ unaffected.
 **Dockerfile** (multi-stage): node builds `web/dist` → Go builds a static binary
 with the UI embedded → final `alpine` image containing the binary plus
 `tzdata`, `exiftool` (~20 MB, RAW previews for every format including CR3) and
-`ffmpeg` (~80 MB, video poster frames), both installed with `apk`. Expected
-image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
+`ffmpeg` (video poster frames), both installed with `apk`. The M0 image is
+about 280 MB uncompressed, mostly ffmpeg and its libraries. Exposes 8080, runs as `99:100`, with a
 `HEALTHCHECK` on `/healthz`.
 
 **GitHub Actions**
@@ -587,10 +587,15 @@ image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
 - No new share needed: SD2NAS creates `Staging/` and `Management/SD2NAS/`
   inside the existing `photos` share.
 - Template `deploy/unraid/sd2nas.xml`: repository, web UI link, port, the three
-  paths (with `/cards` as RW/Slave), `TZ`, `UMASK=000`, optional
+  paths (with `/cards` as RW/Slave), `UMASK=000`, optional
   `SD2NAS_TOKEN`, and `--user 99:100` in Extra Parameters. The image isn't
   linuxserver-based, so it doesn't use their `PUID`/`PGID` convention; the
-  binary applies `UMASK` itself at startup.
+  binary applies `UMASK` itself at startup. Unraid passes `TZ` to every
+  container automatically, so the template doesn't set it; `/healthz` shows the
+  value and warns if it's missing.
+- The appdata folder must be owned by `99:100` before the first start
+  (`mkdir -p /mnt/cache/appdata/sd2nas && chown 99:100 …`), or `/healthz`
+  reports `/config` as not writable.
 - Install by adding the repo's `deploy/unraid` URL under Docker → Template
   repositories, or by pasting the values into Add Container. Updates show up in
   the Docker tab like any CA app.
@@ -630,8 +635,8 @@ is what "done" means.
 - [x] Card reader tested with Unassigned Devices: insert-triggered with the reader left plugged in (results in §11)
 - [x] Unassigned Devices passes `ACTION`, `DEVICE`, `LABEL`, `SERIAL`, `MOUNTPOINT`; `SERIAL` belongs to the reader, so cards are identified by filesystem UUID
 - [x] Phone notifications: Unraid notification agent configured, with Agents ticked for Notices as well (successful imports are sent as `normal`)
-- [ ] Go module, `cmd/sd2nas` serving "hello" and `/healthz`
-- [ ] Dockerfile builds; image runs locally
+- [x] Go module, `cmd/sd2nas` serving "hello" and `/healthz`
+- [x] Dockerfile builds; image runs locally
 - [ ] CI and release workflows publish `ghcr.io/aspiziri/sd2nas:edge`
 - [ ] Image installed on Unraid from the template and reachable at `http://tower:8080`
 

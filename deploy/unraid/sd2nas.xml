@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>SD2NAS</Name>
+  <!-- :edge tracks main until v0.1.0; switch to :latest after the first release -->
+  <Repository>ghcr.io/aspiziri/sd2nas:edge</Repository>
+  <Registry>https://github.com/aspiziri/SD2NAS/pkgs/container/sd2nas</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/aspiziri/SD2NAS/issues</Support>
+  <Project>https://github.com/aspiziri/SD2NAS</Project>
+  <Overview>Imports SD cards into a staging folder as soon as they are inserted, skips anything already imported or archived, and serves a phone-friendly web UI for merging, renaming, culling and promoting staging folders into the archive.&#xD;
+&#xD;
+Before the first start, create the appdata folder owned by nobody:users:&#xD;
+mkdir -p /mnt/cache/appdata/sd2nas &amp;&amp; chown 99:100 /mnt/cache/appdata/sd2nas&#xD;
+&#xD;
+After starting, open /healthz to check the time zone, user and mounts.</Overview>
+  <Category>MediaApp:Photos Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/aspiziri/SD2NAS/main/deploy/unraid/sd2nas.xml</TemplateURL>
+  <Icon/>
+  <ExtraParams>--user 99:100</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Config Name="Web UI port" Target="8080" Default="8080" Mode="tcp" Description="Port for the web UI and the card script" Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+  <Config Name="Cards" Target="/cards" Default="/mnt/disks" Mode="rw,slave" Description="Where Unassigned Devices mounts cards. Must be RW/Slave so cards inserted after the container starts are visible. SD2NAS never writes to cards." Type="Path" Display="always" Required="true" Mask="false">/mnt/disks</Config>
+  <Config Name="Photos share" Target="/photos" Default="/mnt/user/photos" Mode="rw" Description="The photos share. Contains Archive/; SD2NAS creates Staging/ and Management/SD2NAS/ next to it." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/photos</Config>
+  <Config Name="Appdata" Target="/config" Default="/mnt/cache/appdata/sd2nas" Mode="rw" Description="Database and thumbnail cache. Use the cache path directly, not /mnt/user, to avoid SQLite locking problems." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/sd2nas</Config>
+  <Config Name="UMASK" Target="UMASK" Default="000" Mode="" Description="000 keeps imported files editable over SMB" Type="Variable" Display="advanced" Required="false" Mask="false">000</Config>
+  <Config Name="Token" Target="SD2NAS_TOKEN" Default="" Mode="" Description="Optional. When set, the web UI and the card script must send this token." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+</Container>
