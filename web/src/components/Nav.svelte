@@ -23,7 +23,7 @@
 </nav>
 
 <style>
-  .nav { background: var(--nav); border-right: 1px solid var(--line); padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; position: sticky; top: 0; height: 100vh; height: 100dvh; }
+  .nav { background: var(--nav); border-right: 1px solid var(--line); padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; position: sticky; top: env(safe-area-inset-top); height: 100vh; height: calc(100dvh - env(safe-area-inset-top)); }
   .brand { font-weight: 700; font-size: 16px; padding: 4px 10px 16px; display: flex; align-items: center; gap: 8px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
   .dot.off { background: var(--muted); box-shadow: none; }

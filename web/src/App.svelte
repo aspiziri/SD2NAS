@@ -76,7 +76,7 @@
 </div>
 
 <style>
-  .app { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; min-height: 100dvh; }
+  .app { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; min-height: 100dvh; padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left); }
   main { padding: 22px 28px 60px; max-width: 1240px; width: 100%; }
   @media (max-width: 760px) {
     .app { grid-template-columns: minmax(0, 1fr); }
