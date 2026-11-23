@@ -50,6 +50,7 @@ type Service struct {
 	removedFn  func([]string)
 	rules      media.Rules
 	rename     func(oldpath, newpath string) error // os.Rename; tests inject EXDEV
+	afterHash  func(path string)                   // tests: runs between hashing a rescanned file and checking it didn't change
 
 	bgCtx    context.Context // cancelled by Close; promote and rescan run on it
 	bgCancel context.CancelFunc
