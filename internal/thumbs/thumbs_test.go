@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -481,6 +482,38 @@ func TestGetBadInput(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("Dir has %d entries, want none", len(entries))
+	}
+}
+
+// hugePNG is a PNG header declaring w×h pixels, with no pixel data.
+func hugePNG(w, h uint32) []byte {
+	var b bytes.Buffer
+	b.WriteString("\x89PNG\r\n\x1a\n")
+	ihdr := binary.BigEndian.AppendUint32(nil, w)
+	ihdr = binary.BigEndian.AppendUint32(ihdr, h)
+	ihdr = append(ihdr, 8, 2, 0, 0, 0) // 8-bit RGB
+	chunk := append([]byte("IHDR"), ihdr...)
+	b.Write(binary.BigEndian.AppendUint32(nil, uint32(len(ihdr))))
+	b.Write(chunk)
+	b.Write(binary.BigEndian.AppendUint32(nil, crc32.ChecksumIEEE(chunk)))
+	return b.Bytes()
+}
+
+func TestGetRejectsHugeImage(t *testing.T) {
+	c := newCache(t, Config{})
+	for _, d := range [][2]uint32{{20000, 20000}, {2000000000, 2}} {
+		src := Source{shaN(20), writeSource(t, t.TempDir(), "huge.png", hugePNG(d[0], d[1])), media.KindImage}
+		start := time.Now()
+		_, err := c.Get(context.Background(), src, ThumbSize)
+		if !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("%v: err = %v, want ErrTooLarge", d, err)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("%dx%d", d[0], d[1])) {
+			t.Errorf("err %q does not name the dimensions", err)
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Errorf("rejection took %v", time.Since(start))
+		}
 	}
 }
 

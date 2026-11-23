@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -36,7 +37,13 @@ var (
 	ErrBadSize = errors.New("thumbs: size must be ThumbSize or PreviewSize")
 	ErrNoImage = errors.New("thumbs: the file has no embedded preview or video frame")
 	ErrClosed  = errors.New("thumbs: cache closed")
+	// ErrTooLarge means the image declares more than maxPixels pixels; it is
+	// refused before decoding so that it cannot exhaust memory.
+	ErrTooLarge = errors.New("thumbs: image has too many pixels to decode")
 )
+
+// maxPixels caps the pixels of any image decoded in Go (120 megapixels).
+const maxPixels = 120_000_000
 
 // Source is a file to render.
 type Source struct {
@@ -284,9 +291,38 @@ func writeJPEG(dst string, img image.Image, quality int) (err error) {
 func (c *Cache) renderSource(ctx context.Context, src Source) (image.Image, error) {
 	switch src.Kind {
 	case media.KindImage:
-		return imaging.Open(src.Path, imaging.AutoOrientation(true))
+		return decodeImage(src.Path)
 	}
 	return nil, fmt.Errorf("no renderer for kind %q", src.Kind)
+}
+
+// decodeImage opens path, rejects images over maxPixels from their header
+// alone, and then decodes it upright.
+func decodeImage(path string) (image.Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if err := checkPixels(f); err != nil {
+		return nil, err
+	}
+	return imaging.Decode(f, imaging.AutoOrientation(true))
+}
+
+// checkPixels reads r's image header, returns ErrTooLarge when it declares
+// more than maxPixels pixels, and seeks r back to the start. Every decode of
+// an untrusted image in this package goes through it first.
+func checkPixels(r io.ReadSeeker) error {
+	cfg, _, err := image.DecodeConfig(r)
+	if err != nil {
+		return err
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > maxPixels {
+		return fmt.Errorf("%w: %dx%d", ErrTooLarge, cfg.Width, cfg.Height)
+	}
+	_, err = r.Seek(0, io.SeekStart)
+	return err
 }
 
 // Close cancels running renders, waits for them, and makes later Gets fail
