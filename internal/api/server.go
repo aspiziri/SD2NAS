@@ -51,7 +51,6 @@ func New(version string, mounts []Mount) *Server {
 		}
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
-	s.mux.HandleFunc("GET /{$}", s.handleIndex)
 	s.handler = guard(s.mux)
 	return s
 }
@@ -137,23 +136,6 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(h) // the client hung up; nothing useful to do with the error
-}
-
-// handleIndex is a placeholder until the Svelte UI is embedded in M3.
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SD2NAS</title>
-<style>body{font-family:system-ui,sans-serif;background:#16181d;color:#e6e6e6;margin:0;padding:24px 16px}
-a{color:#7fb4ff}code{background:#24272e;padding:2px 6px;border-radius:4px}</style>
-</head><body>
-<h1>SD2NAS</h1>
-<p>Version <code>%s</code>. The web UI arrives in a later milestone.</p>
-<p><a href="/healthz">/healthz</a> shows the time zone, user and mount checks.</p>
-</body></html>
-`, s.version)
 }
 
 // probeWrite creates and removes a temporary file to confirm the directory is

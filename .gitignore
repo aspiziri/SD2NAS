@@ -5,6 +5,7 @@
 /sd2nas
 /sd2nas.exe
 
-# Web build output and dependencies (from M3)
-/web/dist/
+# Web build output (only the placeholder go:embed needs is tracked) and dependencies
+/web/dist/*
+!/web/dist/.placeholder
 node_modules/

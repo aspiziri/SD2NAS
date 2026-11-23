@@ -7,6 +7,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
+COPY web/*.go ./web/
+# .dockerignore keeps web/dist out of the context. Until the node stage that
+# builds it exists, give go:embed the placeholder it needs.
+RUN mkdir -p web/dist && touch web/dist/.placeholder
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/sd2nas ./cmd/sd2nas
 

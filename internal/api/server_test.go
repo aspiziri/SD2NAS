@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func get(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
@@ -95,11 +96,11 @@ func TestHealthzWarnsWithoutTZ(t *testing.T) {
 }
 
 func TestIndexAndUnknownPaths(t *testing.T) {
-	s := New("v9", nil)
+	s := uiServer(t, fstest.MapFS{".placeholder": {Data: []byte("x")}})
 	if rec := get(t, s, "/"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "v9") {
 		t.Errorf("index: %d %s", rec.Code, rec.Body)
 	}
-	if rec := get(t, s, "/nope"); rec.Code != http.StatusNotFound {
+	if rec := get(t, s, "/nope.txt"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown path: %d", rec.Code)
 	}
 	rec := httptest.NewRecorder()

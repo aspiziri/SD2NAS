@@ -19,6 +19,7 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/config"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
+	"github.com/aspiziri/SD2NAS/web"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -63,6 +64,9 @@ func run(log *slog.Logger) error {
 		{Name: "photos", Path: cfg.Photos, NeedWrite: true},
 		{Name: "config", Path: cfg.Data, NeedWrite: true},
 	})
+	if err := srv.MountUI(web.Dist()); err != nil {
+		return err
+	}
 	// Keep serving so /healthz can explain the problem, but make it loud.
 	for _, p := range srv.WriteProblems() {
 		log.Error("directory is not usable", "detail", p)
