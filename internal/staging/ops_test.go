@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
+	"github.com/aspiziri/SD2NAS/internal/media"
 )
 
 // lockFree fails unless the locks of folders ids can be taken (it releases
@@ -341,6 +342,7 @@ func TestOperationsAfterClose(t *testing.T) {
 	e := newOpsEnv(t)
 	f := e.folder(t, "2025-05-30", "2025-05-30")
 	g := e.folder(t, "2025-05-31", "2025-05-31")
+	sha := e.stage(t, f, "a.JPG", "a", opsNow)
 	e.svc.Close()
 	v := e.version()
 	if _, err := e.svc.Rename(t.Context(), f.ID, "Trip"); !errors.Is(err, ErrClosed) {
@@ -349,7 +351,15 @@ func TestOperationsAfterClose(t *testing.T) {
 	if _, err := e.svc.Merge(t.Context(), []int64{f.ID, g.ID}, "Trip"); !errors.Is(err, ErrClosed) {
 		t.Errorf("Merge: err = %v, want ErrClosed", err)
 	}
-	// Task 6 adds Move, Cull and Discard here.
+	if _, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{sha}, ToID: g.ID}); !errors.Is(err, ErrClosed) {
+		t.Errorf("Move: err = %v, want ErrClosed", err)
+	}
+	if _, err := e.svc.Cull(t.Context(), []string{sha}); !errors.Is(err, ErrClosed) {
+		t.Errorf("Cull: err = %v, want ErrClosed", err)
+	}
+	if _, err := e.svc.Discard(t.Context(), f.ID); !errors.Is(err, ErrClosed) {
+		t.Errorf("Discard: err = %v, want ErrClosed", err)
+	}
 	e.mustExist(t, "Staging/2025-05-30", "Staging/2025-05-31")
 	if e.version() != v {
 		t.Error("an operation after Close bumped the version")
@@ -606,4 +616,542 @@ func TestMergeKeepsSourceWithSpecialFile(t *testing.T) {
 	}
 	e.lockFree(t, a.ID, b.ID)
 	e.nameKeyFree(t, "2025-05-30 - Trip")
+}
+
+// moveEnv is folders A (2025-05-30: a.JPG, Capture/a.ARW, b.JPG) and B
+// (2025-06-01 - Beach, empty) of the move, cull and discard tests.
+type moveEnv struct {
+	a, b             catalog.StagingFolder
+	aJPG, aARW, bJPG string // hashes
+	aJPGc            string // a.JPG's content
+}
+
+func newMoveEnv(t *testing.T, e *opsEnv) moveEnv {
+	t.Helper()
+	m := moveEnv{
+		a:     e.folder(t, "2025-05-30", "2025-05-30"),
+		b:     e.folder(t, "2025-06-01 - Beach", "2025-06-01"),
+		aJPGc: "a-jpg",
+	}
+	m.aJPG = e.stage(t, m.a, "a.JPG", m.aJPGc, at(10))
+	m.aARW = e.stage(t, m.a, "Capture/a.ARW", "a-raw", at(10))
+	m.bJPG = e.stage(t, m.a, "b.JPG", "b-jpg", at(10))
+	return m
+}
+
+func (e *opsEnv) folderRow(t *testing.T, id int64) catalog.StagingFolder {
+	t.Helper()
+	r, err := e.db.StagingFolderByID(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func (e *opsEnv) noFolder(t *testing.T, id int64) {
+	t.Helper()
+	if _, err := e.db.StagingFolderByID(t.Context(), id); !errors.Is(err, catalog.ErrNotFound) {
+		t.Errorf("folder %d: err = %v, want ErrNotFound", id, err)
+	}
+}
+
+func TestMoveToExistingFolder(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	v := e.version()
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.aJPG, m.aARW}, ToID: m.b.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Moved != 2 || len(res.Removed) != 0 || res.Folder.ID != m.b.ID {
+		t.Fatalf("result = %+v", res)
+	}
+	want := []string{
+		"Staging/2025-05-30/b.JPG",
+		"Staging/2025-06-01 - Beach/Capture/a.ARW",
+		"Staging/2025-06-01 - Beach/a.JPG",
+	}
+	if files := e.files(t); !slices.Equal(files, want) {
+		t.Fatalf("files = %v, want %v", files, want)
+	}
+	if p := e.relPath(t, m.aARW); p != "Staging/2025-06-01 - Beach/Capture/a.ARW" {
+		t.Errorf("a.ARW rel_path = %q", p)
+	}
+	if d := e.folderRow(t, m.b.ID).Dates; !slices.Equal(d, []string{"2025-05-30", "2025-06-01"}) {
+		t.Errorf("B dates = %v", d)
+	}
+	if d := e.folderRow(t, m.a.ID).Dates; !slices.Equal(d, []string{"2025-05-30"}) {
+		t.Errorf("A dates = %v, want unchanged", d)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestMoveDatesUseDayCutoff(t *testing.T) {
+	e := newOpsEnv(t)
+	a := e.folder(t, "2025-05-29", "2025-05-29")
+	b := e.folder(t, "2025-06-01 - Beach", "2025-06-01")
+	early := e.stage(t, a, "early.JPG", "early", time.Date(2025, 5, 31, 1, 30, 0, 0, time.Local))
+	none := e.stage(t, a, "none.JPG", "none", time.Time{})
+	v := e.version()
+	if _, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{early, none}, ToID: b.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if d := e.folderRow(t, b.ID).Dates; !slices.Equal(d, []string{"2025-05-29", "2025-05-30", "2025-06-01"}) {
+		t.Errorf("B dates = %v, want the cutoff date 2025-05-30 and the source date 2025-05-29", d)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, a.ID, b.ID)
+}
+
+func TestMoveLastFilesRemovesSource(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	e.write(t, "Staging/2025-05-30/.DS_Store", "junk")
+	if err := os.MkdirAll(filepath.Join(e.photos, Dir, m.a.Name, "Videos"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	v := e.version()
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.aJPG, m.aARW, m.bJPG}, ToID: m.b.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Moved != 3 || !slices.Equal(res.Removed, []int64{m.a.ID}) {
+		t.Fatalf("result = %+v", res)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30")
+	e.noFolder(t, m.a.ID)
+	if res.Folder.Files != 3 {
+		t.Errorf("destination files = %d, want 3", res.Folder.Files)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestMoveToNewFolder(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	older := opsNow.Add(-48 * time.Hour)
+	if err := e.db.SetStagingFolderInfo(t.Context(), m.a.ID, m.a.Dates, older); err != nil {
+		t.Fatal(err)
+	}
+	hold, err := e.locks.TryLockSet(HolderRescan, LockSet{Names: []string{"Staging/2025-05-30 - Picks"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	folders, err := e.db.StagingFolders(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := e.version()
+	_, err = e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.bJPG}, NewTitle: " Picks "})
+	var busy *BusyError
+	if !errors.As(err, &busy) || busy.ID != 0 || busy.Name != "2025-05-30 - Picks" || busy.Holder != HolderRescan {
+		t.Fatalf("err = %#v, want a rescan BusyError for the name", err)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30 - Picks")
+	e.mustExist(t, "Staging/2025-05-30/b.JPG")
+	after, err := e.db.StagingFolders(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(folders) {
+		t.Errorf("folder rows = %d, want %d: a row was created", len(after), len(folders))
+	}
+	if e.version() != v {
+		t.Error("a refused move bumped the version")
+	}
+	e.lockFree(t, m.a.ID, m.b.ID)
+	hold()
+
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.bJPG}, NewTitle: " Picks "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Folder.Name != "2025-05-30 - Picks" || res.Moved != 1 || res.Folder.Files != 1 || len(res.Removed) != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	if !slices.Equal(res.Folder.Dates, []string{"2025-05-30"}) {
+		t.Errorf("dates = %v", res.Folder.Dates)
+	}
+	if !res.Folder.CreatedAt.Equal(older) {
+		t.Errorf("created_at = %v, want A's %v", res.Folder.CreatedAt, older)
+	}
+	if p := e.relPath(t, m.bJPG); p != "Staging/2025-05-30 - Picks/b.JPG" {
+		t.Errorf("rel_path = %q", p)
+	}
+	e.mustExist(t, "Staging/2025-05-30 - Picks/b.JPG", "Staging/2025-05-30/a.JPG")
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID, res.Folder.ID)
+	e.nameKeyFree(t, "2025-05-30 - Picks")
+}
+
+func TestMoveNewFolderRules(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	taken := e.folder(t, "2025-05-30 - Picks", "2025-05-30")
+	sha := []string{m.bJPG}
+	v := e.version()
+	cases := []struct {
+		name string
+		req  MoveRequest
+		want error
+	}{
+		{"blank title", MoveRequest{SHAs: sha, NewTitle: "   "}, ErrBadTitle},
+		{"bad character", MoveRequest{SHAs: sha, NewTitle: "a/b"}, ErrBadTitle},
+		{"too long once dated", MoveRequest{SHAs: sha, NewTitle: strings.Repeat("x", 195)}, ErrBadTitle},
+		{"both", MoveRequest{SHAs: sha, ToID: m.b.ID, NewTitle: "Picks"}, ErrBadRequest},
+		{"neither", MoveRequest{SHAs: sha}, ErrBadRequest},
+		{"name exists", MoveRequest{SHAs: sha, NewTitle: "Picks"}, catalog.ErrNameTaken},
+		{"unknown folder", MoveRequest{SHAs: sha, ToID: 999}, catalog.ErrNotFound},
+	}
+	for _, c := range cases {
+		if _, err := e.svc.Move(t.Context(), c.req); !errors.Is(err, c.want) {
+			t.Errorf("%s: err = %v, want %v", c.name, err, c.want)
+		}
+	}
+	e.mustExist(t, "Staging/2025-05-30/b.JPG")
+	if p := e.relPath(t, m.bJPG); p != "Staging/2025-05-30/b.JPG" {
+		t.Errorf("rel_path = %q", p)
+	}
+	if e.version() != v {
+		t.Error("a refused move bumped the version")
+	}
+	e.lockFree(t, m.a.ID, m.b.ID, taken.ID)
+	e.nameKeyFree(t, "2025-05-30 - Picks")
+}
+
+func TestMoveCollision(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	e.write(t, "Staging/2025-06-01 - Beach/a.JPG", "a different a.JPG")
+	v := e.version()
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.aJPG}, ToID: m.b.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Moved != 1 {
+		t.Fatalf("moved = %d", res.Moved)
+	}
+	if p := e.relPath(t, m.aJPG); p != "Staging/2025-06-01 - Beach/a-1.JPG" {
+		t.Errorf("rel_path = %q, want a-1.JPG", p)
+	}
+	e.mustExist(t, "Staging/2025-06-01 - Beach/a.JPG", "Staging/2025-06-01 - Beach/a-1.JPG")
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestMoveToSameFolderIsNoop(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	before := e.files(t)
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.aJPG, m.bJPG}, ToID: m.a.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Moved != 0 || len(res.Removed) != 0 || res.Folder.ID != m.a.ID {
+		t.Fatalf("result = %+v", res)
+	}
+	if files := e.files(t); !slices.Equal(files, before) {
+		t.Errorf("files = %v, want %v", files, before)
+	}
+	if d := e.folderRow(t, m.a.ID).Dates; !slices.Equal(d, []string{"2025-05-30"}) {
+		t.Errorf("dates = %v", d)
+	}
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestMoveRejectsBadHashes(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	archived := shaOf("archived")
+	if err := e.db.InsertAsset(t.Context(), catalog.Asset{SHA256: archived, Size: 8, Kind: media.KindImage,
+		State: catalog.StateArchived, RelPath: "Archive/2025/x.JPG", UpdatedAt: opsNow}, shaOf("fp:archived")); err != nil {
+		t.Fatal(err)
+	}
+	culled := e.stage(t, m.a, "culled.JPG", "culled", at(10))
+	if err := e.db.CullAsset(t.Context(), culled, opsNow); err != nil {
+		t.Fatal(err)
+	}
+	tooMany := make([]string, MaxFiles+1)
+	for i := range tooMany {
+		tooMany[i] = m.aJPG
+	}
+	v := e.version()
+	for name, shas := range map[string][]string{
+		"unknown":  {shaOf("nope")},
+		"archived": {archived},
+		"culled":   {culled},
+		"not hex":  {"xyz"},
+		"upper":    {strings.ToUpper(m.aJPG)},
+		"empty":    {},
+		"too many": tooMany,
+		"one bad":  {m.aJPG, "xyz"},
+	} {
+		if _, err := e.svc.Move(t.Context(), MoveRequest{SHAs: shas, ToID: m.b.ID}); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("%s: err = %v, want ErrBadRequest", name, err)
+		}
+		if _, err := e.svc.Cull(t.Context(), shas); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("%s: cull err = %v, want ErrBadRequest", name, err)
+		}
+	}
+	e.mustExist(t, "Staging/2025-05-30/a.JPG")
+	if e.version() != v {
+		t.Error("a refused request bumped the version")
+	}
+	e.lockFree(t, m.a.ID, m.b.ID)
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.aJPG, m.aJPG}, ToID: m.b.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Moved != 1 {
+		t.Errorf("a duplicated hash moved %d files, want 1", res.Moved)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestMoveBusyDestination(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	release, err := e.locks.TryLock(HolderIngest, m.b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := e.version()
+	_, err = e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.aJPG}, ToID: m.b.ID})
+	var busy *BusyError
+	if !errors.As(err, &busy) || busy.Holder != HolderIngest || busy.Name != m.b.Name || busy.ID != m.b.ID {
+		t.Fatalf("err = %#v, want an import BusyError naming B", err)
+	}
+	e.mustExist(t, "Staging/2025-05-30/a.JPG")
+	if p := e.relPath(t, m.aJPG); p != "Staging/2025-05-30/a.JPG" {
+		t.Errorf("rel_path = %q", p)
+	}
+	if e.version() != v {
+		t.Error("a refused move bumped the version")
+	}
+	e.lockFree(t, m.a.ID)
+	release()
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestMoveCrossDevice(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	e.svc.rename = xdev
+	v := e.version()
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.aJPG, m.aARW}, ToID: m.b.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Moved != 2 {
+		t.Fatalf("moved = %d", res.Moved)
+	}
+	want := []string{
+		"Staging/2025-05-30/b.JPG",
+		"Staging/2025-06-01 - Beach/Capture/a.ARW",
+		"Staging/2025-06-01 - Beach/a.JPG",
+	}
+	if files := e.files(t); !slices.Equal(files, want) {
+		t.Fatalf("files = %v, want %v", files, want)
+	}
+	data, err := os.ReadFile(filepath.Join(e.photos, Dir, m.b.Name, "a.JPG"))
+	if err != nil || string(data) != m.aJPGc {
+		t.Errorf("copied content = %q, %v", data, err)
+	}
+	if p := e.relPath(t, m.aJPG); p != "Staging/2025-06-01 - Beach/a.JPG" {
+		t.Errorf("rel_path = %q", p)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestCullDeletesAndRemembers(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	v := e.version()
+	res, err := e.svc.Cull(t.Context(), []string{m.aJPG})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Culled != 1 || len(res.Removed) != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30/a.JPG")
+	e.mustExist(t, "Staging/2025-05-30/b.JPG", "Staging/2025-05-30/Capture/a.ARW")
+	a := e.asset(t, m.aJPG)
+	if a.State != catalog.StateCulled || a.RelPath != "" {
+		t.Errorf("asset = %v %q, want culled with no path", a.State, a.RelPath)
+	}
+	found, err := e.db.AssetsByFingerprint(t.Context(), shaOf("fp:"+m.aJPGc))
+	if err != nil || len(found) != 1 || found[0].SHA256 != m.aJPG {
+		t.Errorf("fingerprint lookup = %v, %v", found, err)
+	}
+	if got := e.removedHashes(); !slices.Equal(got, []string{m.aJPG}) {
+		t.Errorf("removed = %v", got)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestCullLastFileRemovesFolder(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	e.write(t, "Staging/2025-05-30/Thumbs.db", "junk")
+	if err := os.MkdirAll(filepath.Join(e.photos, Dir, m.a.Name, "Videos"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	v := e.version()
+	res, err := e.svc.Cull(t.Context(), []string{m.aJPG, m.aARW, m.bJPG})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Culled != 3 || !slices.Equal(res.Removed, []int64{m.a.ID}) {
+		t.Fatalf("result = %+v", res)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30")
+	e.noFolder(t, m.a.ID)
+	e.mustExist(t, "Staging/2025-06-01 - Beach")
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestCullMissingFile(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	if err := os.Remove(filepath.Join(e.photos, Dir, m.a.Name, "a.JPG")); err != nil {
+		t.Fatal(err)
+	}
+	v := e.version()
+	res, err := e.svc.Cull(t.Context(), []string{m.aJPG})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Culled != 1 {
+		t.Errorf("culled = %d", res.Culled)
+	}
+	if st := e.asset(t, m.aJPG).State; st != catalog.StateCulled {
+		t.Errorf("state = %v, want culled", st)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestCullAcrossFolders(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	bFile := e.stage(t, m.b, "c.JPG", "c-jpg", at(10))
+	release, err := e.locks.TryLock(HolderIngest, m.b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := e.version()
+	_, err = e.svc.Cull(t.Context(), []string{m.aJPG, bFile})
+	var busy *BusyError
+	if !errors.As(err, &busy) || busy.ID != m.b.ID || busy.Holder != HolderIngest {
+		t.Fatalf("err = %#v, want an import BusyError naming B", err)
+	}
+	if st := e.asset(t, m.aJPG).State; st != catalog.StateStaged {
+		t.Errorf("A's file state = %v, want staged", st)
+	}
+	e.mustExist(t, "Staging/2025-05-30/a.JPG", "Staging/2025-06-01 - Beach/c.JPG")
+	if e.version() != v {
+		t.Error("a refused cull bumped the version")
+	}
+	e.lockFree(t, m.a.ID)
+	release()
+	res, err := e.svc.Cull(t.Context(), []string{m.aJPG, bFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Culled != 2 || !slices.Equal(res.Removed, []int64{m.b.ID}) {
+		t.Fatalf("result = %+v", res)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30/a.JPG", "Staging/2025-06-01 - Beach")
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestDiscardRemovesFolder(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	e.write(t, "Staging/2025-05-30/.DS_Store", "junk")
+	if err := os.MkdirAll(filepath.Join(e.photos, Dir, m.a.Name, "Videos", "Empty"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	v := e.version()
+	res, err := e.svc.Discard(t.Context(), m.a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Culled != 3 || !res.Removed || len(res.Kept) != 0 || res.Kept == nil {
+		t.Fatalf("result = %+v", res)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30")
+	e.noFolder(t, m.a.ID)
+	want := []string{m.aJPG, m.aARW, m.bJPG}
+	slices.Sort(want)
+	if got := e.removedHashes(); !slices.Equal(got, want) {
+		t.Errorf("removed = %v, want %v", got, want)
+	}
+	if st := e.asset(t, m.aARW).State; st != catalog.StateCulled {
+		t.Errorf("state = %v, want culled", st)
+	}
+	e.mustExist(t, "Staging/2025-06-01 - Beach")
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
+func TestDiscardKeepsUntrackedFiles(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	e.write(t, "Staging/2025-05-30/notes.txt", "notes")
+	e.write(t, "Staging/2025-05-30/c.JPG", "untracked jpg")
+	v := e.version()
+	res, err := e.svc.Discard(t.Context(), m.a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Culled != 3 || res.Removed || !slices.Equal(res.Kept, []string{"c.JPG", "notes.txt"}) {
+		t.Fatalf("result = %+v", res)
+	}
+	e.mustExist(t, "Staging/2025-05-30/c.JPG", "Staging/2025-05-30/notes.txt")
+	e.mustNotExist(t, "Staging/2025-05-30/a.JPG", "Staging/2025-05-30/Capture")
+	got, err := e.svc.Files(t.Context(), m.a.ID, "")
+	if err != nil || got.Folder.Files != 0 {
+		t.Errorf("folder files = %d, %v; want the row to stay with 0", got.Folder.Files, err)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID)
+}
+
+func TestDiscardBusy(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	release, err := e.locks.TryLock(HolderRescan, m.a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := e.version()
+	_, err = e.svc.Discard(t.Context(), m.a.ID)
+	var busy *BusyError
+	if !errors.As(err, &busy) || busy.Holder != HolderRescan || busy.ID != m.a.ID || busy.Name != m.a.Name {
+		t.Fatalf("err = %#v, want a rescan BusyError naming A", err)
+	}
+	e.mustExist(t, "Staging/2025-05-30/a.JPG", "Staging/2025-05-30/b.JPG", "Staging/2025-05-30/Capture/a.ARW")
+	if st := e.asset(t, m.aJPG).State; st != catalog.StateStaged {
+		t.Errorf("state = %v, want staged", st)
+	}
+	if e.version() != v {
+		t.Error("a refused discard bumped the version")
+	}
+	release()
+	e.lockFree(t, m.a.ID)
+	if _, err := e.svc.Discard(t.Context(), 999); !errors.Is(err, catalog.ErrNotFound) {
+		t.Errorf("unknown folder: err = %v, want ErrNotFound", err)
+	}
+	if e.version() != v {
+		t.Error("a refused discard bumped the version")
+	}
 }

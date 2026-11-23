@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
+	"github.com/aspiziri/SD2NAS/internal/media"
 )
 
 // prefixOf is the rel_path prefix of the files in folder name.
@@ -419,4 +420,395 @@ func (s *Service) cullGone(ctx context.Context, gone map[string]catalog.Asset) e
 	}
 	s.removed(shas)
 	return nil
+}
+
+// MaxFiles is how many files one move or cull may name.
+const MaxFiles = 20000
+
+// ErrChanged: a file moved to a folder the request did not lock between
+// the lookup and the lock.
+var ErrChanged = errors.New("staging: files moved while the request was being made; reload and try again")
+
+// MoveRequest names the files to move and exactly one destination: an
+// existing folder, or the title of a new one.
+type MoveRequest struct {
+	SHAs     []string
+	ToID     int64  // an existing folder…
+	NewTitle string // …or a new folder "<earliest source date> - NewTitle" (exactly one of the two)
+}
+
+// MoveResult is what Move did.
+type MoveResult struct {
+	Folder  Folder  `json:"folder"` // the destination
+	Moved   int     `json:"moved"`
+	Removed []int64 `json:"removed"` // source folders left empty and removed
+}
+
+// CullResult is what Cull did.
+type CullResult struct {
+	Culled  int     `json:"culled"`
+	Removed []int64 `json:"removed"`
+}
+
+// DiscardResult is what Discard did.
+type DiscardResult struct {
+	Culled  int      `json:"culled"`
+	Removed bool     `json:"removed"` // false: untracked files kept the folder (listed in Kept)
+	Kept    []string `json:"kept"`
+}
+
+// checkSHAs de-duplicates shas and checks each is 64 lowercase hex digits.
+func checkSHAs(shas []string) ([]string, error) {
+	if len(shas) == 0 {
+		return nil, fmt.Errorf("%w: no files given", ErrBadRequest)
+	}
+	if len(shas) > MaxFiles {
+		return nil, fmt.Errorf("%w: at most %d files at once", ErrBadRequest, MaxFiles)
+	}
+	out := slices.Clone(shas)
+	slices.Sort(out)
+	out = slices.Compact(out)
+	for _, h := range out {
+		if len(h) != 64 || strings.Trim(h, "0123456789abcdef") != "" {
+			return nil, fmt.Errorf("%w: %q is not a file hash", ErrBadRequest, h)
+		}
+	}
+	return out, nil
+}
+
+// located is a staged file and the folder holding it.
+type located struct {
+	asset  catalog.Asset
+	folder catalog.StagingFolder
+	rel    string // path inside the folder
+}
+
+// locate finds staged files shas and their folders. A hash that isn't a
+// staged file inside a staging folder is ErrBadRequest.
+func (s *Service) locate(ctx context.Context, shas []string) ([]located, error) {
+	byHash, err := s.db.AssetsByHash(ctx, shas)
+	if err != nil {
+		return nil, err
+	}
+	all, err := s.db.StagingFolders(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byName := map[string]catalog.StagingFolder{}
+	for _, r := range all {
+		byName[r.Name] = r
+	}
+	out := make([]located, 0, len(shas))
+	for _, h := range shas {
+		a, ok := byHash[h]
+		if !ok {
+			return nil, fmt.Errorf("%w: no file %s", ErrBadRequest, h)
+		}
+		if a.State != catalog.StateStaged {
+			return nil, fmt.Errorf("%w: %s is not in staging (it is %s)", ErrBadRequest, h, a.State)
+		}
+		name, rel, ok := strings.Cut(strings.TrimPrefix(a.RelPath, Dir+"/"), "/")
+		row, known := byName[name]
+		if !strings.HasPrefix(a.RelPath, Dir+"/") || !ok || !known {
+			return nil, fmt.Errorf("%w: %s is not inside a staging folder", ErrBadRequest, a.RelPath)
+		}
+		out = append(out, located{asset: a, folder: row, rel: rel})
+	}
+	slices.SortFunc(out, func(a, b located) int { return strings.Compare(a.asset.RelPath, b.asset.RelPath) })
+	return out, nil
+}
+
+// lockLocated locates shas, locks their folders plus extra, and locates
+// again under the locks: a file that moved meanwhile is ErrChanged.
+func (s *Service) lockLocated(ctx context.Context, shas []string, extra ...int64) ([]located, map[int64]catalog.StagingFolder, func(), error) {
+	files, err := s.locate(ctx, shas)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	ids := slices.Clone(extra)
+	for _, f := range files {
+		ids = append(ids, f.folder.ID)
+	}
+	rows, release, err := s.lockFolders(ctx, uniqueIDs(ids))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	locked := map[int64]catalog.StagingFolder{}
+	for _, r := range rows {
+		locked[r.ID] = r
+	}
+	files, err = s.locate(ctx, shas)
+	if err == nil {
+		for _, f := range files {
+			if _, ok := locked[f.folder.ID]; !ok {
+				err = ErrChanged
+				break
+			}
+		}
+	}
+	if err != nil {
+		release()
+		return nil, nil, nil, err
+	}
+	return files, locked, release, nil
+}
+
+// dropIfEmpty removes row's directory and row when no staged file is left
+// in it and only junk remains on disk. It reports whether it removed them.
+func (s *Service) dropIfEmpty(ctx context.Context, row catalog.StagingFolder, touched map[string]bool) (bool, error) {
+	left, err := s.db.AssetsUnder(ctx, prefixOf(row.Name), catalog.StateStaged)
+	if err != nil || len(left) > 0 {
+		return false, err
+	}
+	gone, _, err := removeEmptyTree(s.folderDir(row.Name))
+	if err != nil || !gone {
+		return false, err
+	}
+	touched[filepath.Join(s.photosRoot, Dir)] = true
+	return true, s.db.DeleteStagingFolder(ctx, row.ID)
+}
+
+// moveDate is the folder date a moved file adds to its destination: its
+// capture date with today's day cutoff, else its source folder's date.
+func moveDate(a catalog.Asset, src catalog.StagingFolder, cutoff time.Duration) string {
+	if !a.CaptureTime.IsZero() {
+		return media.FolderDate(a.CaptureTime, cutoff)
+	}
+	return folderDate(src)
+}
+
+// Move moves staged files into an existing folder or a new one (§8 "Move
+// files"), keeping each file's path inside its folder. Source folders left
+// with no files are removed.
+func (s *Service) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
+	shas, err := checkSHAs(req.SHAs)
+	if err != nil {
+		return MoveResult{}, err
+	}
+	title := strings.TrimSpace(req.NewTitle)
+	switch {
+	case req.ToID > 0 && req.NewTitle != "", req.ToID <= 0 && req.NewTitle == "":
+		return MoveResult{}, fmt.Errorf("%w: give either a destination folder or a new folder's title", ErrBadRequest)
+	case req.ToID <= 0:
+		if title, err = CleanTitle(title); err != nil {
+			return MoveResult{}, err
+		}
+		if title == "" {
+			return MoveResult{}, fmt.Errorf("%w: a new folder needs a title", ErrBadTitle)
+		}
+	}
+	var extra []int64
+	if req.ToID > 0 {
+		extra = append(extra, req.ToID)
+	}
+	files, locked, release, err := s.lockLocated(ctx, shas, extra...)
+	if err != nil {
+		return MoveResult{}, err
+	}
+	defer release()
+	settings, err := s.db.Settings(ctx)
+	if err != nil {
+		return MoveResult{}, err
+	}
+	var sources []catalog.StagingFolder
+	for id, r := range locked {
+		if id != req.ToID {
+			sources = append(sources, r)
+		}
+	}
+	slices.SortFunc(sources, func(a, b catalog.StagingFolder) int { return strings.Compare(a.Name, b.Name) })
+
+	dest, ok := locked[req.ToID]
+	if !ok { // a new folder
+		name := FolderName(earliestDate(sources), title)
+		if err := checkName(name); err != nil {
+			return MoveResult{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+		}
+		releaseName, err := s.lockName(name)
+		if err != nil {
+			return MoveResult{}, err
+		}
+		defer releaseName()
+		if err := s.nameFree(ctx, name); err != nil {
+			return MoveResult{}, err
+		}
+		defer s.changed()
+		// The directory first, then the row (filesystem first, pre-flight G7).
+		if err := os.MkdirAll(s.folderDir(name), 0o777); err != nil {
+			return MoveResult{}, err
+		}
+		if dest, err = s.db.CreateStagingFolder(ctx, name, nil, oldestCreated(sources)); err != nil {
+			if rmErr := os.Remove(s.folderDir(name)); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+				err = errors.Join(err, rmErr)
+			}
+			return MoveResult{}, err
+		}
+		releaseNew, err := s.lockRows(HolderOperation, dest) // nobody else knows it yet
+		if err != nil {
+			return MoveResult{}, err
+		}
+		defer releaseNew()
+	} else {
+		defer s.changed()
+	}
+	res := MoveResult{Removed: []int64{}}
+	touched := map[string]bool{filepath.Join(s.photosRoot, Dir): true}
+	dates := slices.Clone(dest.Dates)
+	var moveErr error
+	for _, f := range files {
+		if f.folder.ID == dest.ID {
+			continue
+		}
+		from := s.abs(f.asset.RelPath)
+		dir := filepath.Join(s.folderDir(dest.Name), filepath.FromSlash(path.Dir(f.rel)))
+		to, err := s.moveFile(ctx, from, dir, path.Base(f.rel), f.asset.SHA256)
+		// moveFile returns the new path along with an error when the copy was
+		// verified but the original could not be removed: the file is at to now,
+		// so record that before returning the error.
+		if err != nil && to == "" {
+			moveErr = fmt.Errorf("moved %d of %d files: %w", res.Moved, len(files), err)
+			break
+		}
+		touched[filepath.Dir(from)], touched[filepath.Dir(to)] = true, true
+		newRel, relErr := s.relOf(to)
+		if relErr == nil {
+			relErr = s.db.MoveAsset(ctx, f.asset.SHA256, newRel, s.now())
+		}
+		if relErr != nil {
+			moveErr = errors.Join(err, fmt.Errorf("moved %s but could not record it (a rescan repairs this): %w", f.asset.RelPath, relErr))
+			break
+		}
+		res.Moved++
+		if d := moveDate(f.asset, f.folder, settings.DayStartsAt); d != "" {
+			dates = append(dates, d)
+		}
+		if err != nil {
+			moveErr = fmt.Errorf("moved %d of %d files: %w", res.Moved, len(files), err)
+			break
+		}
+	}
+	// Even after a failure, record the dates of the files that did move.
+	if err := s.db.SetStagingFolderInfo(ctx, dest.ID, dates, time.Time{}); err != nil {
+		return res, errors.Join(moveErr, err)
+	}
+	if moveErr != nil {
+		return res, errors.Join(moveErr, syncDirs(touched))
+	}
+	for _, src := range sources {
+		removed, err := s.dropIfEmpty(ctx, src, touched)
+		if err != nil {
+			return res, err
+		}
+		if removed {
+			res.Removed = append(res.Removed, src.ID)
+		}
+	}
+	if err := syncDirs(touched); err != nil {
+		return res, err
+	}
+	res.Folder, err = s.summary(ctx, dest.ID)
+	return res, err
+}
+
+// Cull deletes staged files and remembers them as culled (§6), so the card
+// never brings them back. Folders left with no files are removed.
+func (s *Service) Cull(ctx context.Context, shas []string) (CullResult, error) {
+	shas, err := checkSHAs(shas)
+	if err != nil {
+		return CullResult{}, err
+	}
+	files, locked, release, err := s.lockLocated(ctx, shas)
+	if err != nil {
+		return CullResult{}, err
+	}
+	defer release()
+	defer s.changed()
+	res := CullResult{Removed: []int64{}}
+	touched := map[string]bool{}
+	assets := make([]catalog.Asset, len(files))
+	for i, f := range files {
+		assets[i] = f.asset
+	}
+	culled, err := s.cullFiles(ctx, assets, touched)
+	s.removed(culled)
+	res.Culled = len(culled)
+	if err != nil {
+		return res, err
+	}
+	for _, row := range sortedRows(locked) {
+		removed, err := s.dropIfEmpty(ctx, row, touched)
+		if err != nil {
+			return res, err
+		}
+		if removed {
+			res.Removed = append(res.Removed, row.ID)
+		}
+	}
+	return res, syncDirs(touched)
+}
+
+// cullFiles deletes the files of staged assets and records each as culled,
+// one by one, and returns the hashes it culled (also on error). Cull and
+// Discard share it (pre-flight D10).
+func (s *Service) cullFiles(ctx context.Context, assets []catalog.Asset, touched map[string]bool) ([]string, error) {
+	var culled []string
+	for _, a := range assets {
+		p := s.abs(a.RelPath)
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return culled, fmt.Errorf("culled %d of %d files: %w", len(culled), len(assets), err)
+		}
+		touched[filepath.Dir(p)] = true
+		if err := s.db.CullAsset(ctx, a.SHA256, s.now()); err != nil {
+			return culled, fmt.Errorf("deleted %s but could not record it (a rescan repairs this): %w", a.RelPath, err)
+		}
+		culled = append(culled, a.SHA256)
+	}
+	return culled, nil
+}
+
+func sortedRows(m map[int64]catalog.StagingFolder) []catalog.StagingFolder {
+	out := make([]catalog.StagingFolder, 0, len(m))
+	for _, r := range m {
+		out = append(out, r)
+	}
+	slices.SortFunc(out, func(a, b catalog.StagingFolder) int { return strings.Compare(a.Name, b.Name) })
+	return out
+}
+
+// Discard culls every staged file of folder id and removes the folder. Files
+// SD2NAS doesn't track are never deleted: they keep the folder, and Kept
+// lists them (Decision 4).
+func (s *Service) Discard(ctx context.Context, id int64) (DiscardResult, error) {
+	rows, release, err := s.lockFolders(ctx, []int64{id})
+	if err != nil {
+		return DiscardResult{}, err
+	}
+	defer release()
+	row := rows[0]
+	assets, err := s.db.AssetsUnder(ctx, prefixOf(row.Name), catalog.StateStaged)
+	if err != nil {
+		return DiscardResult{}, err
+	}
+	defer s.changed()
+	res := DiscardResult{Kept: []string{}}
+	touched := map[string]bool{filepath.Join(s.photosRoot, Dir): true}
+	culled, err := s.cullFiles(ctx, assets, touched)
+	s.removed(culled)
+	res.Culled = len(culled)
+	if err != nil {
+		return res, err
+	}
+	gone, kept, err := removeEmptyTree(s.folderDir(row.Name))
+	if err != nil {
+		return res, err
+	}
+	if gone {
+		if err := s.db.DeleteStagingFolder(ctx, row.ID); err != nil {
+			return res, err
+		}
+		res.Removed = true
+	} else {
+		res.Kept = kept
+	}
+	return res, syncDirs(touched)
 }
