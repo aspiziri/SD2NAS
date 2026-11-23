@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
@@ -28,12 +30,152 @@ const MaxSamples = 5
 
 var ErrBadKind = errors.New("staging: kind must be jpg, raw or video")
 
+// Config wires a Service.
+type Config struct {
+	DB         *catalog.DB
+	PhotosRoot string
+	Locks      *Locks              // shared with ingest.Config.Locks; nil: a private set
+	Now        func() time.Time    // nil: time.Now
+	Log        *slog.Logger        // nil: slog.Default()
+	Removed    func(shas []string) // after files are culled, discarded or forgotten (thumbnail cleanup); nil: nothing
+}
+
+// Service reads and changes the folders under Staging/.
 type Service struct {
 	db         *catalog.DB
 	photosRoot string
+	locks      *Locks
+	now        func() time.Time
+	log        *slog.Logger
+	removedFn  func([]string)
+	rules      media.Rules
+	rename     func(oldpath, newpath string) error // os.Rename; tests inject EXDEV
+
+	bgCtx    context.Context // cancelled by Close; promote and rescan run on it
+	bgCancel context.CancelFunc
+	wg       sync.WaitGroup
+
+	mu     sync.Mutex // guards status, notify, closed
+	status Status
+	notify func(Status)
+	closed bool
 }
 
-func New(db *catalog.DB, photosRoot string) *Service { return &Service{db: db, photosRoot: photosRoot} }
+// New is NewService with only the catalog and the photos root.
+func New(db *catalog.DB, photosRoot string) *Service {
+	return NewService(Config{DB: db, PhotosRoot: photosRoot})
+}
+
+func NewService(cfg Config) *Service {
+	s := &Service{db: cfg.DB, photosRoot: cfg.PhotosRoot, locks: cfg.Locks, now: cfg.Now, log: cfg.Log,
+		removedFn: cfg.Removed, rules: media.DefaultRules(), rename: os.Rename}
+	if s.locks == nil {
+		s.locks = NewLocks()
+	}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	if s.log == nil {
+		s.log = slog.Default()
+	}
+	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
+	return s
+}
+
+// Status is what the staging.changed event carries (Decision 14).
+type Status struct {
+	Version    uint64        `json:"version"`     // bumps on every change to staging
+	Rescanning bool          `json:"rescanning"`  // a reconcile pass is running
+	LastRescan *RescanResult `json:"last_rescan"` // the last finished pass; nil before the first
+}
+
+// RescanResult is what one reconcile pass did (Task 8 fills it).
+type RescanResult struct {
+	StartedAt      time.Time `json:"started_at"`
+	FinishedAt     time.Time `json:"finished_at"`
+	AdoptedFolders int       `json:"adopted_folders"`   // directories that had no row
+	AddedFiles     int       `json:"added_files"`       // media files the catalog didn't know
+	MovedFiles     int       `json:"moved_files"`       // tracked files found at a new path
+	RestoredFiles  int       `json:"restored_files"`    // culled content put back
+	CulledFiles    int       `json:"culled_files"`      // tracked files gone from disk
+	RemovedFolders int       `json:"removed_folders"`   // rows whose directory is gone
+	Duplicates     int       `json:"duplicates"`        // copies of content tracked elsewhere, left alone
+	BusyFolders    int       `json:"busy_folders"`      // skipped: an import or operation held them
+	Errors         []string  `json:"errors"`            // at most maxRescanErrors
+	Skipped        string    `json:"skipped,omitempty"` // why nothing was done at all
+}
+
+var ErrClosed = errors.New("staging: shutting down")
+
+func (s *Service) Status() Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status
+}
+
+// OnChange registers fn to receive the status after every change. Call it
+// before serving. fn runs with the service's lock held, so the events it
+// publishes stay in order; it must not block or call back into s.
+func (s *Service) OnChange(fn func(Status)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notify = fn
+}
+
+// Touch records a change to staging made elsewhere (an import finished).
+func (s *Service) Touch() { s.changed() }
+
+func (s *Service) changed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Version++
+	s.notifyLocked()
+}
+
+func (s *Service) notifyLocked() {
+	if s.notify != nil {
+		s.notify(s.status)
+	}
+}
+
+// removed reports hashes whose files are gone for good.
+func (s *Service) removed(shas []string) {
+	if len(shas) > 0 && s.removedFn != nil {
+		s.removedFn(shas)
+	}
+}
+
+// Close stops a running promote or rescan between files and waits for it.
+// Calling it again does nothing.
+func (s *Service) Close() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.bgCancel()
+	s.wg.Wait()
+}
+
+func (s *Service) folderDir(name string) string { return filepath.Join(s.photosRoot, Dir, name) }
+
+// abs is the OS path of rel_path rel.
+func (s *Service) abs(rel string) string { return filepath.Join(s.photosRoot, filepath.FromSlash(rel)) }
+
+// relOf is OS path p as a rel_path; an error when p is outside the photos root.
+func (s *Service) relOf(p string) (string, error) {
+	rel, err := filepath.Rel(s.photosRoot, p)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("%s is not inside the photos share %s", p, s.photosRoot)
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+// safeName rejects a catalog folder name that isn't a single path element.
+func safeName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("staging folder name %q is not a single folder name", name)
+	}
+	return nil
+}
 
 type KindCounts struct {
 	JPG   int `json:"jpg"`
@@ -292,8 +434,8 @@ func (s *Service) Files(ctx context.Context, id int64, kind string) (FolderFiles
 	if err != nil {
 		return FolderFiles{}, err
 	}
-	if row.Name == "" || row.Name == "." || row.Name == ".." || strings.ContainsAny(row.Name, `/\`) {
-		return FolderFiles{}, fmt.Errorf("staging folder %d has a name that is not a single folder name: %q", id, row.Name)
+	if err := safeName(row.Name); err != nil {
+		return FolderFiles{}, fmt.Errorf("staging folder %d: %w", id, err)
 	}
 	prefix := Dir + "/" + row.Name + "/"
 	assets, err := s.db.AssetsUnder(ctx, prefix, catalog.StateStaged)
