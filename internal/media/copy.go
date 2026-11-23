@@ -20,7 +20,7 @@ const PartialSuffix = ".partial"
 // copying, fsyncs, sets the source's mtime, then renames into place. It
 // never overwrites an existing dst (error wraps fs.ErrExist) and removes
 // its partial on any failure. The parent directory must exist.
-func CopyHashed(src, dst string) (string, error) {
+func CopyHashed(src, dst string) (_ string, err error) {
 	if err := mustNotExist(dst); err != nil {
 		return "", err
 	}
@@ -28,7 +28,11 @@ func CopyHashed(src, dst string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer in.Close()
+	defer func() {
+		if cerr := in.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
 	info, err := in.Stat()
 	if err != nil {
 		return "", err
@@ -71,8 +75,8 @@ func copyToPartial(r io.Reader, partial string) (string, error) {
 	if err == nil {
 		err = f.Sync()
 	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
+	if cerr := f.Close(); cerr != nil {
+		err = errors.Join(err, cerr)
 	}
 	if err != nil {
 		return "", removePartial(partial, err)

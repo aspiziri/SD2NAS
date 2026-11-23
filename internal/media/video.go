@@ -2,6 +2,7 @@ package media
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -49,12 +50,16 @@ var (
 // ends the udta read, keeping what was read before it; neither is an error.
 // A udta that runs past the end of the file is an error, like any other
 // truncation.
-func ReadVideoMeta(path string) (*VideoMeta, error) {
+func ReadVideoMeta(path string) (_ *VideoMeta, err error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open video file: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		if cerr := file.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
 	info, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat video file: %w", err)

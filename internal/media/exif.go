@@ -29,12 +29,16 @@ type ExifData struct {
 }
 
 // ReadExif decodes the EXIF block of the file at path.
-func ReadExif(path string) (*ExifData, error) {
+func ReadExif(path string) (_ *ExifData, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
 	x, err := exif.Decode(f)
 	if err != nil && (x == nil || exif.IsCriticalError(err)) {
 		return nil, fmt.Errorf("exif %s: %w", path, err)
