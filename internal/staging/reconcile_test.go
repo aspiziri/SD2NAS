@@ -1,9 +1,11 @@
 package staging
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -423,7 +425,7 @@ func TestRescanDoesNotAdoptDirectoryBeingRenamed(t *testing.T) {
 	}()
 	waitEntered(t, entered)
 	r := e.reconcile(t)
-	if r.AdoptedFolders != 0 || r.BusyFolders != 2 { // the old row (its id is held) and the new directory name (its name key is held)
+	if r.AdoptedFolders != 0 || r.BusyFolders != 1 {
 		t.Fatalf("result = %+v", r)
 	}
 	for _, row := range e.folderRows(t) {
@@ -501,5 +503,117 @@ func TestStartRescan(t *testing.T) {
 	e.svc.Close()
 	if e.svc.StartRescan() {
 		t.Error("StartRescan after Close = true")
+	}
+}
+
+func TestReconcileStopsWhenStagingVanishesMidPass(t *testing.T) {
+	e := newOpsEnv(t)
+	a := e.folder(t, "2025-06-02 - A", "2025-06-02")
+	b := e.folder(t, "2025-06-03 - B", "2025-06-03")
+	sa := e.stage(t, a, "gone.JPG", "gone a", opsNow)
+	sb := e.stage(t, b, "gone.JPG", "gone b", opsNow)
+	e.write(t, "Staging/2025-06-02 - A/new.JPG", jpeg(t, "2025:06:02 10:00:00"))
+	if err := os.Remove(filepath.Join(e.photos, Dir, a.Name, "gone.JPG")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(e.photos, Dir, b.Name, "gone.JPG")); err != nil {
+		t.Fatal(err)
+	}
+	// The share drops while the new file is being hashed.
+	e.svc.afterHash = func(string) {
+		if err := os.RemoveAll(filepath.Join(e.photos, Dir)); err != nil {
+			t.Error(err)
+		}
+	}
+	r := e.reconcile(t)
+	if r.Skipped == "" || r.CulledFiles != 0 || r.RemovedFolders != 0 {
+		t.Fatalf("result = %+v", r)
+	}
+	for _, sha := range []string{sa, sb} {
+		if st := e.asset(t, sha).State; st != catalog.StateStaged {
+			t.Errorf("asset %s = %v, want staged", sha[:8], st)
+		}
+	}
+	if rows := e.folderRows(t); len(rows) != 2 {
+		t.Errorf("rows = %+v", rows)
+	}
+	e.lockFree(t, a.ID, b.ID)
+}
+
+func TestReconcileIgnoresNASMetadata(t *testing.T) {
+	e := newOpsEnv(t)
+	f := e.folder(t, "2025-06-02 - Beach", "2025-06-02")
+	img := jpeg(t, "2025:06:02 10:00:00")
+	for _, rel := range []string{
+		"2025-06-02 - Beach/@eaDir/real.JPG/SYNOPHOTO_THUMB_M.jpg",
+		"2025-06-02 - Beach/.@__thumb/a.JPG",
+		"2025-06-02 - Beach/.AppleDouble/b.JPG",
+		"2025-06-02 - Beach/#recycle/c.JPG",
+		"2025-06-02 - Beach/.hidden.JPG",
+		"@eaDir/top.JPG",
+		"#recycle/top.JPG",
+		".@__thumb/top.JPG",
+		".AppleDouble/top.JPG",
+	} {
+		e.write(t, "Staging/"+rel, img+rel)
+	}
+	e.write(t, "Staging/2025-06-02 - Beach/real.JPG", img)
+	r := e.reconcile(t)
+	if r.AddedFiles != 1 || r.AdoptedFolders != 0 {
+		t.Fatalf("result = %+v", r)
+	}
+	if all, err := e.db.AssetsUnder(t.Context(), "Staging/", catalog.StateStaged); err != nil || len(all) != 1 ||
+		all[0].RelPath != "Staging/2025-06-02 - Beach/real.JPG" {
+		t.Errorf("staged assets = %v, %v", all, err)
+	}
+	if rows := e.folderRows(t); len(rows) != 1 || rows[0].ID != f.ID {
+		t.Errorf("rows = %+v", rows)
+	}
+}
+
+func TestRescanKeepsEveryProblem(t *testing.T) {
+	e := newOpsEnv(t)
+	e.folder(t, "2025-06-02 - Beach", "2025-06-02")
+	img := jpeg(t, "2025:06:02 10:00:00")
+	for i := range 25 {
+		e.write(t, "Staging/2025-06-02 - Beach/f"+strconv.Itoa(1000+i)+".JPG", img+strconv.Itoa(i))
+	}
+	var logs strings.Builder
+	e.svc.log = slog.New(slog.NewTextHandler(&logs, nil))
+	n := 0
+	// Every file "changes while read"; the 23rd also stops the service.
+	e.svc.afterHash = func(p string) {
+		n++
+		w, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := w.Write([]byte{0}); err != nil {
+			t.Error(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+		if n == 23 {
+			e.svc.bgCancel()
+		}
+	}
+	if !e.svc.StartRescan() {
+		t.Fatal("StartRescan = false")
+	}
+	waitFor(t, "the rescan to finish", func() bool { return !e.svc.Status().Rescanning })
+	r := e.svc.Status().LastRescan
+	if r == nil || len(r.Errors) != maxRescanErrors+1 || r.ErrorsOmitted != 3 {
+		t.Fatalf("result = %+v", r)
+	}
+	if last := r.Errors[len(r.Errors)-1]; !strings.Contains(last, "shutting down") {
+		t.Errorf("last error = %q, want the stop message", last)
+	}
+	if got := strings.Count(logs.String(), "staging rescan problem"); got != 23+1 {
+		t.Errorf("logged %d problems, want 24:\n%s", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "err=") {
+		t.Error("problems are not logged under the err key")
 	}
 }

@@ -103,16 +103,18 @@ type Status struct {
 type RescanResult struct {
 	StartedAt      time.Time `json:"started_at"`
 	FinishedAt     time.Time `json:"finished_at"`
-	AdoptedFolders int       `json:"adopted_folders"`   // directories that had no row
-	AddedFiles     int       `json:"added_files"`       // media files the catalog didn't know
-	MovedFiles     int       `json:"moved_files"`       // tracked files found at a new path
-	RestoredFiles  int       `json:"restored_files"`    // culled content put back
-	CulledFiles    int       `json:"culled_files"`      // tracked files gone from disk
-	RemovedFolders int       `json:"removed_folders"`   // rows whose directory is gone
-	Duplicates     int       `json:"duplicates"`        // copies of content tracked elsewhere, left alone
-	BusyFolders    int       `json:"busy_folders"`      // skipped: an import or operation held them
-	Errors         []string  `json:"errors"`            // at most maxRescanErrors
-	Skipped        string    `json:"skipped,omitempty"` // why nothing was done at all
+	AdoptedFolders int       `json:"adopted_folders"`          // directories that had no row
+	AddedFiles     int       `json:"added_files"`              // media files the catalog didn't know
+	MovedFiles     int       `json:"moved_files"`              // tracked files found at a new path
+	RestoredFiles  int       `json:"restored_files"`           // culled content put back
+	CulledFiles    int       `json:"culled_files"`             // tracked files gone from disk
+	RemovedFolders int       `json:"removed_folders"`          // rows whose directory is gone
+	Duplicates     int       `json:"duplicates"`               // copies of content tracked elsewhere, left alone
+	BusyFolders    int       `json:"busy_folders"`             // skipped: an import or operation held them
+	Errors         []string  `json:"errors"`                   // at most maxRescanErrors problems, then why the pass stopped, if it did
+	ErrorsOmitted  int       `json:"errors_omitted,omitempty"` // problems past the cap, only logged
+	Skipped        string    `json:"skipped,omitempty"`        // why nothing (more) was done
+	log            *slog.Logger
 }
 
 var ErrClosed = errors.New("staging: shutting down")

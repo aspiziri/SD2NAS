@@ -18,10 +18,69 @@ import (
 // maxRescanErrors bounds RescanResult.Errors.
 const maxRescanErrors = 20
 
+// errorf records a problem: every one is logged, the first maxRescanErrors
+// are listed in the result and the rest are only counted (ErrorsOmitted).
 func (r *RescanResult) errorf(format string, args ...any) {
-	if len(r.Errors) < maxRescanErrors {
-		r.Errors = append(r.Errors, fmt.Sprintf(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	if r.log != nil {
+		r.log.Warn("staging rescan problem", "err", msg)
 	}
+	if len(r.Errors) < maxRescanErrors {
+		r.Errors = append(r.Errors, msg)
+		return
+	}
+	r.ErrorsOmitted++
+}
+
+// finalError records why the pass stopped. It is listed even past the cap.
+func (r *RescanResult) finalError(msg string) {
+	if r.log != nil {
+		r.log.Warn("staging rescan problem", "err", msg)
+	}
+	r.Errors = append(r.Errors, msg)
+}
+
+// errStagingVanished: Staging/ disappeared mid-pass (the share dropped).
+var errStagingVanished = errors.New("staging: Staging/ vanished during the rescan")
+
+// stagingPresent returns errStagingVanished when Staging/ is gone, so a
+// dropped share is never read as "everything was deleted".
+func (s *Service) stagingPresent() error {
+	if _, err := os.Stat(s.abs(Dir)); errors.Is(err, fs.ErrNotExist) {
+		return errStagingVanished
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
+// metadataNames are NAS and OS housekeeping directories that never hold the
+// user's photos. Same idea as ingest's skipDir (internal/ingest/scan.go,
+// which also skips every dot-name); staging can't import ingest.
+var metadataNames = []string{"@eaDir", "@Recycle", "@Recently-Snapshot", "#recycle", "#snapshot",
+	"$RECYCLE.BIN", "System Volume Information"}
+
+// skipName reports a file or directory name the rescan never looks into.
+func skipName(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	for _, m := range metadataNames {
+		if strings.EqualFold(name, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// skipRel reports a slash path inside a folder with any skipped element.
+func skipRel(rel string) bool {
+	for _, el := range strings.Split(rel, "/") {
+		if skipName(el) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *RescanResult) changedAnything() bool {
@@ -36,7 +95,12 @@ func (r *RescanResult) changedAnything() bool {
 // nothing: an unmounted share must not cull everything.
 func (s *Service) Reconcile(ctx context.Context) (RescanResult, error) {
 	r := RescanResult{StartedAt: s.now(), Errors: []string{}}
+	r.log = s.log
 	err := s.reconcile(ctx, &r)
+	if errors.Is(err, errStagingVanished) {
+		r.Skipped = Dir + "/ went missing during the rescan, so it was stopped (is the photos share still mounted?)"
+		err = nil
+	}
 	r.FinishedAt = s.now()
 	if r.changedAnything() {
 		s.changed()
@@ -67,7 +131,7 @@ func (s *Service) reconcile(ctx context.Context, r *RescanResult) error {
 	}
 	busyNames := 0
 	for _, name := range slices.Sorted(maps.Keys(onDisk)) {
-		if known[name] {
+		if known[name] || skipName(name) {
 			continue
 		}
 		// An operation renaming or creating this directory holds its name
@@ -116,7 +180,9 @@ func (s *Service) reconcile(ctx context.Context, r *RescanResult) error {
 	if err := s.reconcileOrphans(ctx, r); err != nil {
 		return err
 	}
-	r.BusyFolders = len(busy) + busyNames
+	// A folder being renamed is busy twice (its row and its new name); take
+	// the larger of the two counts so it is one.
+	r.BusyFolders = max(len(busy), busyNames)
 	return nil
 }
 
@@ -165,6 +231,9 @@ func (s *Service) reconcileAdditions(ctx context.Context, row catalog.StagingFol
 	for _, rel := range files {
 		if tracked[rel] {
 			continue
+		}
+		if skipRel(rel) {
+			continue // NAS metadata and dot-files: not photos
 		}
 		kind, ok := s.rules.KindOf(rel)
 		if !ok {
@@ -327,11 +396,19 @@ func (s *Service) reconcileRemovals(ctx context.Context, row catalog.StagingFold
 			r.errorf("%s: %v", a.RelPath, err)
 		}
 	}
+	if len(gone) > 0 {
+		if err := s.stagingPresent(); err != nil {
+			return err
+		}
+	}
 	if err := s.cullGone(ctx, gone); err != nil {
 		return err
 	}
 	r.CulledFiles += len(gone)
 	if _, err := os.Lstat(s.folderDir(row.Name)); errors.Is(err, fs.ErrNotExist) && len(gone) == len(assets) {
+		if err := s.stagingPresent(); err != nil {
+			return err
+		}
 		if err := s.db.DeleteStagingFolder(ctx, row.ID); err != nil {
 			return err
 		}
@@ -364,6 +441,11 @@ func (s *Service) reconcileOrphans(ctx context.Context, r *RescanResult) error {
 			gone[a.RelPath] = a
 		}
 	}
+	if len(gone) > 0 {
+		if err := s.stagingPresent(); err != nil {
+			return err
+		}
+	}
 	if err := s.cullGone(ctx, gone); err != nil {
 		return err
 	}
@@ -390,10 +472,10 @@ func (s *Service) StartRescan() bool {
 		switch {
 		case errors.Is(err, context.Canceled):
 			s.log.Info("staging rescan stopped: shutting down")
-			r.errorf("stopped: SD2NAS is shutting down")
+			r.finalError("stopped: SD2NAS is shutting down")
 		case err != nil:
 			s.log.Error("staging rescan failed", "err", err)
-			r.errorf("%v", err)
+			r.finalError(err.Error())
 		default:
 			s.log.Info("staging rescan", "adopted_folders", r.AdoptedFolders, "added", r.AddedFiles, "moved", r.MovedFiles,
 				"restored", r.RestoredFiles, "culled", r.CulledFiles, "removed_folders", r.RemovedFolders,
