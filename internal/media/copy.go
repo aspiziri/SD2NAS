@@ -18,8 +18,19 @@ const PartialSuffix = ".partial"
 // CopyHashed copies src to dst and returns the hex SHA-256 of the bytes
 // copied. It writes dst+PartialSuffix (created with O_EXCL), hashes while
 // copying, fsyncs, sets the source's mtime, then renames into place. It
-// never overwrites an existing dst (error wraps fs.ErrExist) and removes
-// its partial on any failure. The parent directory must exist.
+// never overwrites an existing dst and removes its partial on any failure.
+// The parent directory must exist.
+//
+// Two failures wrap fs.ErrExist, so errors.Is(err, fs.ErrExist) holds for
+// both:
+//   - dst exists (checked before copying and again before the rename). The
+//     error is not a *fs.PathError.
+//   - a stale dst+PartialSuffix exists, left by an earlier interrupted copy.
+//     It is not CopyHashed's, so it is left in place. The error is the
+//     *fs.PathError from creating it, whose Path ends in PartialSuffix.
+//
+// To tell them apart, use errors.As with a *fs.PathError and check
+// strings.HasSuffix(pathErr.Path, PartialSuffix).
 func CopyHashed(src, dst string) (_ string, err error) {
 	if err := mustNotExist(dst); err != nil {
 		return "", err

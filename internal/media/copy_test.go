@@ -83,6 +83,11 @@ func TestCopyFileRefusesToOverwrite(t *testing.T) {
 	if !errors.Is(err, fs.ErrExist) {
 		t.Errorf("error %v does not wrap fs.ErrExist", err)
 	}
+	// Documented: unlike the stale-partial case, not a *fs.PathError.
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		t.Errorf("dst-exists error is a *fs.PathError (Path %q)", pe.Path)
+	}
 	if _, err := os.Stat(dst + PartialSuffix); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("partial left behind: %v", err)
 	}
@@ -97,6 +102,11 @@ func TestCopyHashedStalePartial(t *testing.T) {
 	_, err := CopyHashed(src, dst)
 	if !errors.Is(err, fs.ErrExist) {
 		t.Fatalf("err = %v, want one wrapping fs.ErrExist", err)
+	}
+	// Documented: a *fs.PathError whose Path ends in PartialSuffix.
+	var pe *fs.PathError
+	if !errors.As(err, &pe) || !strings.HasSuffix(pe.Path, PartialSuffix) {
+		t.Errorf("err = %#v, want a *fs.PathError on the partial", err)
 	}
 	data, err2 := os.ReadFile(partial)
 	if err2 != nil {
