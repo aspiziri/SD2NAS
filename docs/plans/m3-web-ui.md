@@ -19,7 +19,7 @@
   - `GET /api/events`: `Content-Type: text/event-stream`, `Cache-Control: no-store`, `X-Accel-Buffering: no`. The first bytes are `retry: 3000\n\n`, then one frame per registered snapshot, then live frames. A frame is exactly `event: <type>\ndata: <one-line JSON>\n\n`. Keepalive is the comment `: keepalive\n\n` every 25 s (`DefaultKeepalive`). M3 event types: `ingest.current` (data = the `GET /api/ingest/current` body `{"running": view|null, "queued": [view…]}`) and `ingest.finished` (data = the ingest view of the job that just finished, without `progress`/`files`/`clock_details`). Reserved for later milestones: `staging.changed`, `promote.progress`, `indexer.progress`.
   - `GET /api/staging` → `{"folders":[Folder…],"untracked":["dir",…]}`. `GET /api/staging/{id}/files?kind=jpg|raw|video` → `{"folder":Folder,"files":[File…]}`. JSON fields of Folder: `id, name, date, title, dates, created_at, files, bytes, counts{jpg,raw,video}, first_capture?, last_capture?, samples[{sha256,kind}], clock_warnings, warnings[]`. JSON fields of File: `sha256, name, path, kind, size, capture_time?, tz_offset?, clock_warnings?`. API kinds are `jpg` (catalog kind `image`, which includes png/gif/tif), `raw` and `video`. Times are wall clock `2006-01-02T15:04:05` (`catalog.CaptureLayout`). An unknown kind → 400; an unknown folder → 404.
   - `GET /api/thumbs/{sha}` makes a JPEG whose longest edge is at most **400** px (`thumbs.ThumbSize`), and `GET /api/preview/{sha}` one of at most **1600** px (`thumbs.PreviewSize`). Neither ever upscales. JPEG quality is 80 for thumbs and 85 for previews. Success headers: `Content-Type: image/jpeg`, `Cache-Control: public, max-age=31536000, immutable`, `ETag: "<sha>-<size>"`. Errors are JSON `{"error": …}` with `Cache-Control: no-store`. The cache file is `<config>/thumbs/<sha[0:2]>/<sha>-<size>.jpg`, i.e. `/config/thumbs/…` in the container. `sha` must be 64 lowercase hex digits, or the response is 400.
-  - UI files: `assets/*` (Vite's content-hashed files) get `Cache-Control: public, max-age=31536000, immutable`. Everything else, `index.html` included, gets `Cache-Control: no-cache` plus a strong `ETag`. A GET for an extension-less path outside `/api/` serves `index.html` (SPA fallback). A missing path that has an extension → 404. An unknown `/api/…` path → JSON 404, or JSON 503 naming the `/healthz` problems when the server is degraded.
+  - UI files: `assets/*` (Vite's content-hashed files) get `Cache-Control: public, max-age=31536000, immutable`. Everything else, `index.html` included, gets `Cache-Control: no-cache` plus a strong `ETag`. A GET for an extension-less path outside `/api/` serves `index.html` (SPA fallback). A missing path that has an extension → 404. A non-GET/HEAD request outside `/api/` → 405 with `Allow: GET, HEAD`. An `/api/…` request that no route matches, whatever its method → JSON 404, or JSON 503 naming the `/healthz` problems when the server is degraded. `.js`, `.css` and `.webmanifest` get pinned types (`text/javascript; charset=utf-8`, `text/css; charset=utf-8`, `application/manifest+json`), never the OS's.
   - Request guard (exists, `internal/api/guard.go`): every non-GET/HEAD request needs the header `X-SD2NAS: 1`. The UI's fetch wrapper sends it on every non-GET request.
 - **UI look:** the mockup's tokens, verbatim: `--bg:#141c27; --nav:#0f151e; --panel:#1b2636; --panel2:#223047; --line:#2e3d55; --text:#e6edf6; --muted:#8d9bb0; --accent:#4f9cf9; --accent2:#3a7fd6; --ok:#3fbf7f; --warn:#e8b04a; --bad:#e5636b; --r:10px`, and the system font stack `system-ui,-apple-system,"Segoe UI",Roboto,sans-serif`. The phone breakpoint is `max-width: 760px`. On a phone there is a bottom tab bar, one-column folder cards and a full-screen preview. On desktop there is a 220 px left sidebar. Svelte 5 runes only (`$state`, `$derived`, `$effect`, `$props`), with no `{@html}` and no `export let`. Plain CSS (global tokens in `web/src/app.css`, component styles scoped).
 - Tests pass on Windows and Linux. Use `path/filepath` for OS paths and `path` for slash-separated `rel_path` values. Close every file, `*sql.Rows` and `*catalog.DB`. In tests, call `t.TempDir()` before registering a `Close` cleanup.
@@ -50,17 +50,17 @@
 
 1. **Dependencies.** Svelte 5.59.1, Vite 8.3.8 and `@sveltejs/vite-plugin-svelte` 7.3.1 are the current latest releases (checked with `npm view`, 2026-11-23), and the plugin's peer range `vite ^8, svelte ^5.46.4` fits. All three are exact-pinned `devDependencies`, and `package-lock.json` is committed. **`@sveltejs/vite-plugin-svelte` is approved by the owner ("Sure approved to use the official one").** Go: `imaging v1.6.2` (2019, the latest) pulls a 2019 `golang.org/x/image` whose TIFF decoder has known CVEs, and `.tif` is an imported image format. So `golang.org/x/image` is pinned to **v0.36.0**, the newest whose `go.mod` declares `go 1.24.0` (v0.37.0+ declare 1.25). `go get github.com/disintegration/imaging@v1.6.2 golang.org/x/image@v0.36.0` keeps `go 1.24.0` (verified).
 2. **Embedding without npm.** Package `web` (`web/embed.go`) holds `//go:embed all:dist` over a directory that always contains the committed `web/dist/.placeholder`, so `go build`, `go vet` and `go test` work on a fresh checkout. `.gitignore` becomes `/web/dist/*` plus `!/web/dist/.placeholder`. `npm run build` is `node scripts/clean-dist.mjs && vite build`: the script empties `dist/` except `.placeholder`, and Vite runs with `emptyOutDir: false` (Vite's own emptying would delete the placeholder and dirty the tree). Without `index.html`, `/` serves a short "web UI not built" page with the version, as today's placeholder does. Rejected: a `ui` build tag (a binary built without it silently ships no UI), and a Vite plugin that recreates the placeholder (a failed build leaves the tree dirty and the embed broken). The Dockerfile checks `web/dist/index.html` exists before `go build` (Task 12).
-3. **Serving.** `MountUI` walks the embedded FS once and computes strong ETags (SHA-256 prefix). Caching follows the Global Constraints. `.webmanifest` is served as `application/manifest+json`, because Go's MIME table lacks it. Dot-files (`.placeholder`) are never served. `New` no longer registers `GET /{$}`: the placeholder page moved into `ui.go`, and `main` always calls `MountUI(web.Dist())`.
+3. **Serving.** `MountUI` walks the embedded FS once and computes strong ETags (SHA-256 prefix). Caching follows the Global Constraints. `.js`, `.css` and `.webmanifest` types are pinned in `ui.go`: Go's MIME table lacks `.webmanifest`, and on Windows Go reads `.js` from the registry, which can say `application/javascript`. The UI handler is mounted on `/` (any method), not `GET /`, so a POST to an unknown `/api/` path gets a JSON 404 instead of the mux's plain-text 405 (`GET /` plus `/api/` would conflict and panic); it answers other non-GET requests with 405 itself. Dot-files (`.placeholder`) are never served. `New` no longer registers `GET /{$}`: the placeholder page moved into `ui.go`, and `main` always calls `MountUI(web.Dist())`.
 4. **SSE design.** One `Hub` per `Server` fans out pre-encoded frames. Each subscriber has a buffer of 16 frames, and a full buffer drops that subscriber (its stream ends and EventSource reconnects 3 s later), so a publisher never blocks. On connect, the handler subscribes first and then writes each registered snapshot, so a client never misses state: an event racing the snapshot can arrive twice, and both are idempotent states. `GET /api/events` is mounted in `New`, so it exists even when the catalog failed. `Server.Close()` ends all streams and background goroutines, and `main` calls it after `mgr.Close` and **before** `httpSrv.Shutdown`. New event types for M4+ are one `Publish` call each; EventSource ignores types a page doesn't listen for.
 5. **Ingest feed polls the manager.** `internal/ingest` is not touched. A goroutine started by `MountIngest` ticks every 500 ms (`DefaultFeedInterval`). It publishes `ingest.current` when the encoded body changes, so progress reaches clients at most twice a second, and `ingest.finished` for every watched job whose `Done()` is closed. `POST /api/ingest` registers each job it submits with the feed (`watch`), so a job that starts and finishes between two ticks still produces `ingest.finished`. The alternative was a change hook in `ingest.Progress`, which would touch M2 code and fire per file. The M6 fallback poller must also call the feed's `watch` (or rely on the tick, which only sees jobs alive at tick time). Note: progress updates once per file, so a single 4 GB video shows no byte progress until it finishes (follow-up, Task 13).
 6. **What a staging folder is, and its id.** A folder is a `staging_folders` row, and its `id` is the row id. Its files are the assets in state `staged` whose `rel_path` starts with `Staging/<name>/`, found with a range scan on the `assets_path` index (`rel_path >= 'Staging/<name>/' AND rel_path < 'Staging/<name>0'`; `0` is the byte after `/`). The range has no LIKE wildcards to escape, and it stays fast once M5 puts 150k archived rows in `assets`. This follows §8 ("read `Staging/`, join counts and sizes from `assets`"). The listing reads `Staging/` on disk only to find directories with no row (`untracked`, listed by name, not openable) and rows with no directory (warning "Not found on disk in Staging/"). Files are not scanned or hashed on disk: thumbnails, clock warnings and later cull/move need the content hash, which only the catalog has, and hashing on every page load is out of the question. Drift from SMB edits is M4's startup reconcile. `internal/staging` is created now (read-only `List`/`Files`); M4 adds the operations there.
 7. **Samples:** up to 5 per folder card (the mockup's strip), spread evenly over the folder in name (= time) order. Files sharing a name stem (a RAW+JPEG pair) count as one shot, shown by the JPEG if there is one (cheapest to render), else the RAW, else the video.
-8. **Thumbnail cache.** It is keyed by the resolved asset hash (`AssetBySHA` follows aliases) and the size. Renders are single-flight per file and size. Each render has a waiter count: a caller that leaves decrements it, and the last one to leave cancels the render and removes the entry, so the next request starts afresh. At most `Workers` renders run at once (default `min(NumCPU, 4)`), covering both exec'd tools and Go decoding (a 33 MP JPEG decode needs ~50 MB). The per-render timeout defaults to 60 s, enforced through the context with `exec.CommandContext` and `WaitDelay`. A result is written to `<name>.*.tmp` in the same directory, then renamed. `New` removes stale `*.tmp`. Failures are not cached: the next view retries, and the UI never retries by itself. Responses are cacheable forever because the URL is content-addressed.
-9. **RAW previews.** The first call is `exiftool -json -b -n -Orientation -PreviewImage -- <path>`. If `PreviewImage` is empty, a second call is `exiftool -json -b -n -Orientation -JpgFromRaw -- <path>` (two calls, so the large `JpgFromRaw` is only extracted when needed). Binary tags arrive as `"base64:…"` in the JSON. The embedded JPEG is turned upright with the RAW's own `Orientation` (the embedded preview usually carries none). A missing preview is `ErrNoImage` (404). Output is capped at 128 MiB. Verified with exiftool 13.30 in `alpine:3.22`: a TIFF named `.ARW` with `Make=SONY` and IFD0 tags 0x0201/0x0202 reports `PreviewImage`, and a missing tag gives exit status 0 with no field. Follow-up: `-stay_open` to save exiftool's ~0.2 s Perl start-up per file.
-10. **Video frames.** The call is `ffmpeg -nostdin -hide_banner -loglevel error -ss 1 -i file:<path> -frames:v 1 -an -sn -dn -f image2pipe -c:v mjpeg -q:v 2 pipe:1`. Empty output means the clip is shorter than 1 s, so the call is retried with `-ss 0`. ffmpeg applies rotation metadata itself, and Go resizes. `file:` keeps a path from being read as a protocol. Verified with ffmpeg 6.1.2 (Alpine) and 7.1 (Windows, drive-letter paths work).
+8. **Thumbnail cache.** It is keyed by the resolved asset hash (`AssetBySHA` follows aliases) and the size. Renders are single-flight per file and size. Each render has a waiter count: a caller that leaves decrements it, and the last one to leave cancels the render and removes the entry, so the next request starts afresh. At most `Workers` renders run at once (default `min(NumCPU, 4)`), covering both exec'd tools and Go decoding (a 33 MP JPEG decode needs ~50 MB). The per-render timeout defaults to 60 s and starts once the render has a worker slot (time queued behind other renders does not count). It is enforced through the context with `exec.CommandContext` and `WaitDelay`. A result is written to `<name>.*.tmp` in the same directory, then renamed. `New` removes stale `*.tmp`. Failures are not cached: the next view retries, and the UI never retries by itself. Responses are cacheable forever because the URL is content-addressed.
+9. **RAW previews.** The first call is `exiftool -json -b -n -Orientation -PreviewImage -- <path>`. If `PreviewImage` is empty, a second call is `exiftool -json -b -n -Orientation -JpgFromRaw -- <path>` (two calls, so the large `JpgFromRaw` is only extracted when needed). Binary tags arrive as `"base64:…"` in the JSON. The embedded JPEG is turned upright with the RAW's own `Orientation` (the embedded preview usually carries none). A missing preview is `ErrNoImage` (404). Output is capped at 128 MiB. Verified with exiftool 13.30 in `alpine:3.22` and 13.55 in `golang:1.26-alpine` (Alpine 3.24, the Linux test container): a TIFF named `.ARW` with `Make=SONY` and IFD0 tags 0x0201/0x0202 reports `PreviewImage`, and a missing tag gives exit status 0 with no field. Follow-up: `-stay_open` to save exiftool's ~0.2 s Perl start-up per file.
+10. **Video frames.** The call is `ffmpeg -nostdin -hide_banner -loglevel error -ss 1 -i file:<path> -frames:v 1 -an -sn -dn -f image2pipe -c:v mjpeg -q:v 2 pipe:1`. Past the end of a clip shorter than 1 s, ffmpeg 6.x exits 0 with empty output, while ffmpeg 7+ exits non-zero ("Nothing was written into output file"). So empty output **or** a failed exit at `-ss 1` retries the call with `-ss 0`, unless the render was cancelled, timed out or overflowed the output cap; when both calls fail, both errors are reported. ffmpeg applies rotation metadata itself, and Go resizes. `file:` keeps a path from being read as a protocol. Verified with ffmpeg 6.1.2 (`alpine:3.21`: exit 0, no output at `-ss 1`), 7.1 (Windows: exit status -22, drive-letter paths and spaces work) and 8.1.3 (`golang:1.26-alpine`, Alpine 3.24: exit status 234); the retry at 0 s gives the frame on all three.
 11. **Test inputs.** The committed fixtures have no embedded preview (`DSC00001.ARW` is a bare TIFF) and no frames (`GX010001.MP4` has no `mdat`), and they must stay byte-exact for M1/M2. So thumbnail tests make their own inputs. Exec behaviour (arguments, fallback, timeout, stderr, output cap) is tested with a fake tool: the test binary re-executes itself via `TestMain` when `SD2NAS_FAKE_TOOL` is set. Real-tool tests synthesize an ARW with a 64×32 preview and Orientation 6, and create clips with `ffmpeg -f lavfi -i testsrc=…`.
 12. **Warming after an ingest** (§7 step 7; M2 deferred it to M3). A finished ingest with new files queues its id (buffer 16; when full, log and skip). One goroutine then makes the 400 px thumbnail of each new file in turn, using at most one worker slot. Failures are logged at Warn.
-13. **Health.** A missing `exiftool`/`ffmpeg` becomes a `/healthz` **warning** ("exiftool not found: RAW thumbnails are unavailable"), so `/healthz` stays 200. A thumbnail cache that can't be created is a **problem** (503), like the catalog. `Server` gains `SetLogger`, `AddWarning` and `Close`.
+13. **Health.** A missing `exiftool`/`ffmpeg` becomes a `/healthz` **warning** ("exiftool not found: RAW thumbnails are unavailable"), so `/healthz` stays 200, and those tiles answer 404 without an error log per request. A thumbnail cache that can't be created is a **problem** (503), like the catalog. `Server` gains `SetLogger`, `AddWarning` and `Close`.
 14. **Frontend routing.** A 30-line History API router (`router.svelte.js`) handles the routes `/` and `/ingest` (ingest page), `/ingest/{id}`, `/staging` and `/staging/{id}`. The default tab is Card ingest, as in the mockup. Same-origin `<a>` clicks are intercepted in `App.svelte`. The full-screen preview pushes a history entry, so the phone's back gesture closes it.
 15. **Frontend tests.** The fetch wrapper (`api.js`: the guard header and error mapping), formatting and grouping (`format.js`) and path matching (`paths.js`) are plain ES modules tested with `node --test` (built in, no dependency). Components hold no logic worth a test runner. They are checked by `npm run build` (the Svelte compiler), Go tests of the served build output (`TestBuiltUI`), and the manual phone checklist in Task 11.
 16. **PWA.** The pieces are `manifest.webmanifest`, an SVG icon, and PNGs at 192, 512, maskable 512 and apple-touch 180. A build-ignored Go program (`go run web/icons/gen.go`) draws the PNGs, which are committed. There is **no service worker**: offline support is useless for a NAS console and would complicate SSE and caching. Full "install" needs HTTPS (e.g. `tailscale serve`). Over plain `http://tower:8080`, phones still add a home-screen shortcut, iOS honours the `apple-mobile-web-app-*` tags, and Android opens it as a browser tab. That is recorded in PLAN.md.
@@ -101,7 +101,8 @@ internal/thumbs/
   thumbs.go               Cache, Config, Source, Get, Close, ValidSHA                   (Task 5)
   tools.go                exiftool/ffmpeg renderers, MissingTools                       (Task 6)
 cmd/sd2nas/main.go        MountUI (1), SetLogger + Close order (2), MountStaging (4), thumbs (7)
-deploy/Dockerfile, .github/workflows/ci.yml                                            (Task 12)
+deploy/Dockerfile         copies package web (1); node stage (12)
+.github/workflows/ci.yml                                                                (Task 12)
 .gitignore, .gitattributes                                                              (Task 1)
 docs/PLAN.md                                                                            (Task 13)
 ```
@@ -114,10 +115,10 @@ Suggested implementer: sonnet.
 
 **Files:**
 - Create: `web/embed.go`, `web/embed_test.go`, `web/dist/.placeholder`, `internal/api/ui.go`, `internal/api/ui_test.go`
-- Modify: `internal/api/server.go` (drop `GET /{$}` and `handleIndex`), `internal/api/server_test.go` (`TestIndexAndUnknownPaths`), `cmd/sd2nas/main.go`, `.gitignore`, `.gitattributes`
+- Modify: `internal/api/server.go` (drop `GET /{$}` and `handleIndex`), `internal/api/server_test.go` (`TestIndexAndUnknownPaths`), `cmd/sd2nas/main.go`, `deploy/Dockerfile` (copy package `web`, so the image still builds), `.gitignore`, `.gitattributes`
 
 **Interfaces:**
-- Consumes (existing; read `internal/api/server.go` and `ingest.go`): `type Server struct{ version string; mux *http.ServeMux; problems []string; … }`, `New(version string, mounts []Mount) *Server` (registers `GET /healthz` and `GET /{$}`), `(s *Server) AddProblem(p string)`, `writeError(w, code int, msg string)` (JSON `{"error":msg}`, `Cache-Control: no-store`), and the test helper `get(t, s, path) *httptest.ResponseRecorder` in `server_test.go` (don't define another `get`).
+- Consumes (existing; read `internal/api/server.go` and `ingest.go`): `type Server struct{ version string; mux *http.ServeMux; problems []string; … }`, `New(version string, mounts []Mount) *Server` (registers `GET /healthz` and `GET /{$}`), `(s *Server) AddProblem(p string)`, `writeError(w, code int, msg string)` (JSON `{"error":msg}`, `Cache-Control: no-store`), and the test helpers `get(t, s, path) *httptest.ResponseRecorder` in `server_test.go` (don't define another `get`) and `wantJSONError(t, rec, code) string` in `fail_test.go`.
 - Produces:
 
 ```go
@@ -203,11 +204,12 @@ Helpers:
 // builtUI stands in for a Vite build.
 func builtUI() fstest.MapFS {
 	return fstest.MapFS{
-		"index.html":               {Data: []byte(`<!doctype html><div id="app"></div>`)},
-		"assets/index-AbC12345.js": {Data: []byte("console.log(1)")},
-		"manifest.webmanifest":     {Data: []byte(`{"name":"SD2NAS"}`)},
-		"icon-192.png":             {Data: []byte("png")},
-		".placeholder":             {Data: []byte("x")},
+		"index.html":                {Data: []byte(`<!doctype html><div id="app"></div>`)},
+		"assets/index-AbC12345.js":  {Data: []byte("console.log(1)")},
+		"assets/index-DeF67890.css": {Data: []byte("body{}")},
+		"manifest.webmanifest":      {Data: []byte(`{"name":"SD2NAS"}`)},
+		"icon-192.png":              {Data: []byte("png")},
+		".placeholder":              {Data: []byte("x")},
 	}
 }
 
@@ -224,14 +226,14 @@ func uiServer(t *testing.T, files fs.FS) *Server {
 Tests (use the existing `get` and read headers from `rec.Header()`):
 - `TestUIServesIndex`: `GET /` → 200, the body equals the `index.html` data, `Content-Type` is `text/html; charset=utf-8`, `Cache-Control` is `no-cache`, and `ETag` is a non-empty quoted string.
 - `TestUISPAFallback`: `/ingest`, `/staging/3` and `/ingest/12` each → 200 with the `index.html` body and `Cache-Control: no-cache`.
-- `TestUIHashedAssetsImmutable`: `/assets/index-AbC12345.js` → 200, body `console.log(1)`, `Cache-Control: public, max-age=31536000, immutable`, and a `Content-Type` starting with `text/javascript`.
+- `TestUIHashedAssetsImmutable`: `/assets/index-AbC12345.js` → 200, body `console.log(1)`, `Cache-Control: public, max-age=31536000, immutable`, and `Content-Type` exactly `text/javascript; charset=utf-8`. `/assets/index-DeF67890.css` → 200, the same `Cache-Control`, and `Content-Type` exactly `text/css; charset=utf-8`. (These types are pinned in `ui.go`, so a Windows registry entry such as `.js` → `application/javascript` can't change them.)
 - `TestUIManifestAndIcons`: `/manifest.webmanifest` → `Content-Type: application/manifest+json` and `Cache-Control: no-cache`. `/icon-192.png` → 200 with `Cache-Control: no-cache`.
 - `TestUIConditional`: a GET of `/` with `If-None-Match` set to the `ETag` from an earlier GET → 304. The same holds for `/assets/index-AbC12345.js`.
 - `TestUIMissingFile` (Review Focus 5): `/assets/nope.js`, `/favicon.ico` and `/.placeholder` → 404, and the body does not contain `id="app"`.
-- `TestUIAPIUnknown` (Review Focus 5, 8): `/api/nope` → 404, a JSON error, and `Cache-Control: no-store`. On a fresh `uiServer` after `s.AddProblem("catalog: boom")`, `/api/ingests` → 503 with a JSON error containing `catalog: boom`.
+- `TestUIAPIUnknown` (Review Focus 5, 8): `/api/nope` → 404, a JSON error, and `Cache-Control: no-store`. `POST /api/nope` with `X-SD2NAS: 1` → also a JSON 404 (`wantJSONError`), not the mux's plain-text 405. On a fresh `uiServer` after `s.AddProblem("catalog: boom")`, `/api/ingests` → 503 with a JSON error containing `catalog: boom`.
 - `TestUINotBuilt`: `uiServer(t, fstest.MapFS{".placeholder": {Data: []byte("x")}})`. `GET /` → 200, the body contains `not built` and `v9`, and `Cache-Control` is `no-store`. `/staging` serves the same page, and `/app.js` gets 404.
 - `TestUIHealthzUnaffected`: `GET /healthz` on a `uiServer` still returns the health JSON.
-- `TestUIPostIsNotServed`: `POST /` with `X-SD2NAS: 1` → 405.
+- `TestUIPostIsNotServed`: `POST /` and `POST /staging` with `X-SD2NAS: 1` → 405 with `Allow: GET, HEAD`.
 
 Rewrite `TestIndexAndUnknownPaths` in `server_test.go` to use `uiServer(t, fstest.MapFS{".placeholder": …})`: `/` → 200 containing `v9`, `/nope.txt` → 404, and `POST /healthz` with `X-SD2NAS: 1` → 405.
 
@@ -265,6 +267,15 @@ const (
 	cacheRevalidate = "no-cache"                            // everything else: revalidate with the ETag
 )
 
+// contentTypes pins the types of the files Vite writes. Go would otherwise
+// take them from the OS (the Windows registry, /etc/mime.types), which can
+// map .js to application/javascript, and its table lacks .webmanifest.
+var contentTypes = map[string]string{
+	".js":          "text/javascript; charset=utf-8",
+	".css":         "text/css; charset=utf-8",
+	".webmanifest": "application/manifest+json",
+}
+
 type uiHandler struct {
 	version  string
 	files    fs.FS
@@ -276,8 +287,9 @@ type uiHandler struct {
 // MountUI serves the single-page app in dist (web.Dist()). Files are served
 // by path, and every other extension-less GET outside /api/ gets index.html,
 // so client-side routes such as /staging/3 survive a reload. Without
-// index.html, "/" shows a page saying the UI isn't built. Call it before
-// serving.
+// index.html, "/" shows a page saying the UI isn't built. It also answers
+// every /api/ request no other route matches, whatever the method, with a
+// JSON error. Call it before serving.
 func (s *Server) MountUI(dist fs.FS) error {
 	h := &uiHandler{version: s.version, files: dist, etags: map[string]string{},
 		problems: func() []string { return s.problems }}
@@ -302,7 +314,10 @@ func (s *Server) MountUI(dist fs.FS) error {
 	if err != nil {
 		return fmt.Errorf("read embedded web UI: %w", err)
 	}
-	s.mux.Handle("GET /", h)
+	// Any method, not "GET /": the mux would answer a POST to an unknown
+	// /api/ path with a plain-text 405, and "GET /" plus "/api/" conflict
+	// (the mux panics). Every specific route still wins over "/".
+	s.mux.Handle("/", h)
 	return nil
 }
 
@@ -313,7 +328,12 @@ func (h *uiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "not available while SD2NAS is degraded: "+strings.Join(probs, "; "))
 			return
 		}
-		writeError(w, http.StatusNotFound, "no such API endpoint: "+r.URL.Path)
+		writeError(w, http.StatusNotFound, "no such API endpoint: "+r.Method+" "+r.URL.Path)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if etag, ok := h.etags[p]; ok && !hidden(p) {
@@ -362,8 +382,8 @@ func (h *uiHandler) serveFile(w http.ResponseWriter, r *http.Request, p, etag st
 	}
 	w.Header().Set("Cache-Control", cache)
 	w.Header().Set("ETag", etag)
-	if strings.HasSuffix(p, ".webmanifest") {
-		w.Header().Set("Content-Type", "application/manifest+json") // not in Go's MIME table
+	if ct, ok := contentTypes[path.Ext(p)]; ok {
+		w.Header().Set("Content-Type", ct) // ServeContent keeps a type that is already set
 	}
 	http.ServeContent(w, r, path.Base(p), time.Time{}, rs)
 }
@@ -397,14 +417,23 @@ Import `github.com/aspiziri/SD2NAS/web`, and right after `srv := api.New(...)` a
 	}
 ```
 
+`main` now imports package `web`, which `deploy/Dockerfile` doesn't copy, so the image would stop building until Task 12. In `deploy/Dockerfile`, right after `COPY internal ./internal`, add:
+
+```dockerfile
+COPY web/*.go ./web/
+# .dockerignore keeps web/dist out of the context. Until the node stage that
+# builds it exists, give go:embed the placeholder it needs.
+RUN mkdir -p web/dist && touch web/dist/.placeholder
+```
+
 - [ ] **Step 7: Run the tests and the full set**
 
-Run `go test ./internal/api/ ./web/` → PASS. Then run `gofmt -l .` (prints nothing), `go vet ./...`, `go test ./...` and the Linux command from the Global Constraints → PASS. `go build ./cmd/sd2nas && rm -f sd2nas sd2nas.exe` succeeds.
+Run `go test ./internal/api/ ./web/` → PASS. Then run `gofmt -l .` (prints nothing), `go vet ./...`, `go test ./...` and the Linux command from the Global Constraints → PASS. `go build ./cmd/sd2nas && rm -f sd2nas sd2nas.exe` succeeds. With Docker Desktop running, `docker build -f deploy/Dockerfile -t sd2nas:t1 . && docker rmi sd2nas:t1` succeeds.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add web/embed.go web/embed_test.go web/dist/.placeholder internal/api/ui.go internal/api/ui_test.go internal/api/server.go internal/api/server_test.go cmd/sd2nas/main.go .gitignore .gitattributes
+git add web/embed.go web/embed_test.go web/dist/.placeholder internal/api/ui.go internal/api/ui_test.go internal/api/server.go internal/api/server_test.go cmd/sd2nas/main.go deploy/Dockerfile .gitignore .gitattributes
 git commit -m "Serve the embedded web UI with SPA fallback and cache headers
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -483,7 +512,11 @@ func sseFrames(t *testing.T, url string) (<-chan string, context.CancelFunc) {
 		var lines []string
 		for sc.Scan() {
 			if sc.Text() == "" {
-				frames <- strings.Join(lines, "\n")
+				select {
+				case frames <- strings.Join(lines, "\n"):
+				case <-ctx.Done(): // the test stopped reading; don't block forever
+					return
+				}
 				lines = nil
 				continue
 			}
@@ -521,7 +554,7 @@ func eventsServer(t *testing.T, s *Server) string {
 
 Tests:
 - `TestHubPublishFanOut`: with two `subscribe()` channels, `Publish("x", map[string]int{"a": 1})` → both receive exactly `"event: x\ndata: {\"a\":1}\n\n"`.
-- `TestHubDropsSlowSubscriber` (Review Focus 1): subscriber A never reads, while subscriber B is drained by a goroutine. Publish 17 events. A's channel holds 16 frames and is then closed (drain it: 16 values, then `!ok`), B received all 17, and `Len()` is 1 afterwards. `Publish` never blocked, or the test would hang.
+- `TestHubDropsSlowSubscriber` (Review Focus 1): subscriber A never reads, while subscriber B is drained by a goroutine that counts its frames in an `atomic.Int32`. Publish 16 events, then `pollUntil(t, "B to read 16 frames", …)` so B's buffer is empty, then publish the 17th (otherwise B might not have read anything yet and would be dropped too). A's channel holds 16 frames and is then closed (drain it: 16 values, then `!ok`), `pollUntil` B's count is 17, and `Len()` is 1 afterwards. `Publish` never blocked, or the test would hang.
 - `TestHubClose`: after `Close()`, the existing subscriber's channel is closed, `Len()` is 0, `Publish` returns nil, a new `subscribe()` returns an already closed channel, and a second `Close()` does not panic.
 - `TestHubRejectsBadEvents`: `Publish("a\nb", 1)`, `Publish("", 1)` and `Publish("x", func() {})` (not JSON-encodable) all return errors.
 - `TestEventsStream`: `s := New("test", nil)` with `s.hub.AddSnapshot(func() (string, any, error) { return "snap", map[string]int{"n": 1}, nil })`, then `sseFrames(eventsServer(t, s)+"/api/events")`. In a separate sub-check, a plain `http.Get` (body closed right away) has the headers `Content-Type: text/event-stream`, `Cache-Control: no-store` and `X-Accel-Buffering: no`. The frames are `retry: 3000` and then `event: snap\ndata: {"n":1}`, in order. Then `s.hub.Publish("x", 2)` makes the next frame `event: x\ndata: 2`.
@@ -809,7 +842,7 @@ Suggested implementer: sonnet (reviewer: opus, because of the concurrency).
 
 **Files:**
 - Create: `internal/api/ingestfeed.go`, `internal/api/ingestfeed_test.go`
-- Modify: `internal/api/ingest.go` (use `currentOf`, have POST watch its job, start the feed in `MountIngest`), `internal/api/server.go` (feed interval, finished hooks), `internal/api/ingest_test.go` (`newIngestServer` adds `t.Cleanup(s.Close)` after mounting)
+- Modify: `internal/api/ingest.go` (use `currentOf`, have POST watch its job, start the feed in `MountIngest`), `internal/api/server.go` (feed interval, finished hooks), `internal/api/ingest_test.go` (`newIngestServer` adds `t.Cleanup(s.Close)` after mounting), `internal/api/fail_test.go` (`newBrokenIngestServer` does the same)
 
 **Interfaces:**
 - Consumes from Task 2: `Hub.Publish`, `Hub.AddSnapshot`, `Hub.subscribe`, `EventIngestCurrent`, `EventIngestFinished`, `s.log`, `s.hub`, `s.bgCtx`, `s.bg`, `Server.Close`, and the test helpers `sseFrames`, `nextFrame`, `eventsServer`. Existing in `ingest.go`: `ingestView`, `viewOf(row catalog.Ingest, job *ingest.Job) ingestView`, `ingestHandlers{m, db, maxWait}`, `MountIngest`. From `internal/ingest`: `Manager.Current() (running *Job, queued []*Job)` and `(*Job).ID/Done/Result`. Test helpers `newIngestServer`, `post`, `cardBody`, `plenty`, `decodeInto`, `pollUntil`.
@@ -1022,7 +1055,7 @@ In `ingest.go`:
 - In `post`, right after a successful `Submit` (before the `!wait` check), call `h.feed.watch(job)`.
 - `current` becomes `running, queued := h.m.Current(); writeJSON(w, http.StatusOK, currentOf(running, queued))`. Delete the inline struct.
 
-In `ingest_test.go`'s `newIngestServer`, add `t.Cleanup(s.Close)` after `s.MountIngest(...)`. Cleanups run in reverse, so it runs before the manager and catalog cleanups.
+In `ingest_test.go`'s `newIngestServer`, add `t.Cleanup(s.Close)` after `s.MountIngest(...)`. Cleanups run in reverse, so it runs before the manager and catalog cleanups. Every `MountIngest` now starts a feed goroutine, so do the same in `fail_test.go`'s `newBrokenIngestServer`: add `t.Cleanup(s.Close)` right after `s.MountIngest(m, db, time.Minute)`, or each of its tests leaks a feed that polls a never-closed manager for the life of the test binary.
 
 - [ ] **Step 5: Run the tests**
 
@@ -1031,7 +1064,7 @@ Run `go test ./internal/api/ -count=2`, then the full Windows set, the Linux com
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/api/ingestfeed.go internal/api/ingestfeed_test.go internal/api/ingest.go internal/api/ingest_test.go internal/api/server.go
+git add internal/api/ingestfeed.go internal/api/ingestfeed_test.go internal/api/ingest.go internal/api/ingest_test.go internal/api/fail_test.go internal/api/server.go
 git commit -m "Publish ingest progress and finished imports on /api/events
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -1095,12 +1128,12 @@ Insert assets with `InsertAsset`, using `UpdatedAt: time.Now()`, `Kind: media.Ki
 | 6 | `Staging/2025-05-30/d.JPG` | archived (state no longer staged) |
 
 - `TestAssetsUnderPrefixTrap` (Review Focus 4):
-  - `AssetsUnder(ctx, "Staging/2025-05-30/", StateStaged)` gives the shas `[hexN(2), hexN(1)]` in that order, because rel_path order puts `…/Capture/…` before `…/2025…`.
+  - `AssetsUnder(ctx, "Staging/2025-05-30/", StateStaged)` gives the shas `[hexN(1), hexN(2)]` in that order, because byte order (SQLite's BINARY collation) puts `…/2025…` (`'2'` = 0x32) before `…/Capture/…` (`'C'` = 0x43).
   - `AssetsUnder(ctx, "Staging/50%_off/", StateStaged)` gives only `hexN(4)`.
-  - `AssetsUnder(ctx, "Staging/", StateStaged)` gives 1, 2, 3 and 4.
+  - `AssetsUnder(ctx, "Staging/", StateStaged)` gives, in order, `[hexN(3), hexN(1), hexN(2), hexN(4)]` (`' '` in `2025-05-30 - Trip` sorts before `'/'`).
   - `AssetsUnder(ctx, "Staging", …)` and `AssetsUnder(ctx, "/", …)` return an error.
 - `TestStagingFolderByID`: a folder from `StagingFolderForDate(ctx, "2025-05-30", now)` round-trips by its id. Id 999 → `errors.Is(err, ErrNotFound)`.
-- `TestClockWarningsUnder`: `in, _ := CreateIngest(ctx, "/cards/X", "X", "", now)`, then `AddClockWarnings(ctx, in.ID, []ClockWarning{{CardPath: "DCIM/a.JPG", SHA256: hexN(1), Kind: ClockFuture, Detail: "in the future"}, {CardPath: "DCIM/c.JPG", SHA256: hexN(5), Kind: ClockFuture, Detail: "x"}})`. `ClockWarningsUnder(ctx, "Staging/2025-05-30/", StateStaged)` gives exactly one warning, with `SHA256 == hexN(1)` and `Detail == "in the future"`.
+- `TestClockWarningsUnder`: `in, err := d.CreateIngest(ctx, "/cards/X", "X", "", now); if err != nil { t.Fatal(err) }`, then `AddClockWarnings(ctx, in.ID, []ClockWarning{{CardPath: "DCIM/a.JPG", SHA256: hexN(1), Kind: ClockFuture, Detail: "in the future"}, {CardPath: "DCIM/c.JPG", SHA256: hexN(5), Kind: ClockFuture, Detail: "x"}})`. `ClockWarningsUnder(ctx, "Staging/2025-05-30/", StateStaged)` gives exactly one warning, with `SHA256 == hexN(1)` and `Detail == "in the future"`.
 
 - [ ] **Step 2: Catalog: implement** (in `internal/catalog/staging.go`)
 
@@ -1358,7 +1391,7 @@ type Config struct {
 	Exiftool string        // default "exiftool"
 	FFmpeg   string        // default "ffmpeg"
 	Workers  int           // renders at once; default max(1, min(runtime.NumCPU(), 4))
-	Timeout  time.Duration // per render; default 60 s
+	Timeout  time.Duration // per render, from when it gets a worker slot; default 60 s
 	Log      *slog.Logger  // default slog.Default()
 }
 type Cache struct{ /* … */ }
@@ -1370,6 +1403,8 @@ func ValidSHA(s string) bool
 //   c.cfg Config; c.renderSource(ctx, src) (image.Image, error) — its switch gains raw and video cases
 //   test helpers redBlueImage(w, h int) *image.RGBA; encodeJPEG(img image.Image, orientation uint16) ([]byte, error)
 //   reddish(c color.Color) bool; bluish(c color.Color) bool; decodeFile(t, path) image.Image
+//   newCache(t, cfg) *Cache; writeSource(t, dir, name, data) string; shaN(n) string
+//   pollUntil(t, what string, cond func() bool)
 ```
 
 - [ ] **Step 1: Add the dependency**
@@ -1404,10 +1439,10 @@ Build the EXIF segment like this:
 
 Every test that replaces `c.render` still needs `Source.Path` to exist, because `generate` stats it first: use `writeSource` with any bytes.
 
-`reddish(c)` is `r > 2*b` and `bluish(c)` is `b > 2*r`, on the 16-bit values from `c.RGBA()`. `decodeFile(t, path)` opens the file and returns `jpeg.Decode` of it. `newCache(t, cfg Config) *Cache` sets `cfg.Dir = t.TempDir()` when it is empty and registers `t.Cleanup(c.Close)`. `writeSource(t, dir, name string, data []byte) string` writes a file and returns its path. `shaN(n int) string` is `fmt.Sprintf("%064x", n)`.
+`reddish(c)` is `r > 2*b` and `bluish(c)` is `b > 2*r`, on the 16-bit values from `c.RGBA()`. `decodeFile(t, path)` opens the file and returns `jpeg.Decode` of it. `newCache(t, cfg Config) *Cache` sets `cfg.Dir = t.TempDir()` when it is empty and registers `t.Cleanup(c.Close)`. `writeSource(t, dir, name string, data []byte) string` writes a file and returns its path. `shaN(n int) string` is `fmt.Sprintf("%064x", n)`. `pollUntil(t, what string, cond func() bool)` polls `cond` every 10 ms with a 10 s deadline, then calls `t.Fatal("timed out waiting for " + what)`. It is the same as `internal/api/ingest_test.go`'s, which package `thumbs` can't use, so define it here (Task 6 uses it too).
 
 Tests:
-- `TestGetJPEGThumb`: a 1200×800 JPEG (no orientation). `Get(ctx, Source{shaN(1), path, media.KindImage}, ThumbSize)` returns `filepath.Join(dir, sha[:2], sha+"-400.jpg")`, and that file decodes to exactly 400×267.
+- `TestGetJPEGThumb`: a 1200×800 JPEG (no orientation). `Get(ctx, Source{shaN(1), path, media.KindImage}, ThumbSize)` returns `filepath.Join(dir, sha[:2], sha+"-400.jpg")`, and that file decodes to exactly 400×266 (`imaging.Fit` truncates the height: `int(400 / 1.5)`).
 - `TestGetPreviewNotUpscaled`: a 300×200 JPEG at `PreviewSize` → 300×200.
 - `TestGetAppliesOrientation`: a 64×32 JPEG with orientation 6 at `ThumbSize` → 32×64, with pixel (16, 8) reddish and (16, 56) bluish. Turning it 90° clockwise puts the left half on top.
 - `TestGetPNG`: a 500×500 PNG (`image/png`) at `ThumbSize` → 400×400.
@@ -1486,7 +1521,7 @@ type Config struct {
 	Exiftool string        // command for RAW previews; default "exiftool"
 	FFmpeg   string        // command for video frames; default "ffmpeg"
 	Workers  int           // renders at once; default max(1, min(NumCPU, 4))
-	Timeout  time.Duration // per render; default 60 s
+	Timeout  time.Duration // per render, from when it gets a worker slot; default 60 s
 	Log      *slog.Logger  // default slog.Default()
 }
 
@@ -1612,7 +1647,9 @@ func (c *Cache) Get(ctx context.Context, src Source, size int) (string, error) {
 	}
 	cl := c.calls[dst]
 	if cl == nil {
-		rctx, cancel := context.WithTimeout(c.ctx, c.cfg.Timeout)
+		// The timeout starts in generate, once the render has a worker
+		// slot: time spent queued behind other renders doesn't count.
+		rctx, cancel := context.WithCancel(c.ctx)
 		cl = &call{done: make(chan struct{}), cancel: cancel}
 		c.calls[dst] = cl
 		c.wg.Add(1)
@@ -1666,6 +1703,8 @@ func (c *Cache) generate(ctx context.Context, src Source, size int, dst string) 
 		return ctx.Err()
 	}
 	defer func() { <-c.sem }()
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout) // the per-render timeout
+	defer cancel()
 	img, err := c.render(ctx, src)
 	if err != nil {
 		return fmt.Errorf("%s: %w", src.Path, err)
@@ -1755,13 +1794,14 @@ Suggested implementer: sonnet.
 - Modify: `internal/thumbs/thumbs.go` (add the raw and video cases to `renderSource`)
 
 **Interfaces:**
-- Consumes (Task 5): `Cache` (fields `cfg`, `render`), `renderSource`, `Get`, `ErrNoImage`, `ThumbSize`, `Source`, `Config`, and the test helpers `redBlueImage`, `encodeJPEG`, `reddish`, `bluish`, `decodeFile`, `newCache`, `writeSource`, `shaN`, `pollUntil`-style loops. Exiftool and ffmpeg arguments: Decisions 9 and 10.
+- Consumes (Task 5): `Cache` (fields `cfg`, `render`), `renderSource`, `Get`, `ErrNoImage`, `ThumbSize`, `Source`, `Config`, and the test helpers `redBlueImage`, `encodeJPEG`, `reddish`, `bluish`, `decodeFile`, `newCache`, `writeSource`, `shaN`, `pollUntil`. Exiftool and ffmpeg arguments: Decisions 9 and 10.
 - Produces:
 
 ```go
 func (c *Cache) MissingTools() []string // "<tool> not found: RAW thumbnails are unavailable" / "…: video thumbnails are unavailable"
 // unexported:
 //   var maxToolOutput = 128 << 20
+//   var errTooLarge error // wrapped by runTool when the output passes maxToolOutput
 //   func (c *Cache) runTool(ctx context.Context, name string, args ...string) ([]byte, error)
 //   func (c *Cache) rawPreview(ctx context.Context, path string) (image.Image, error)
 //   func (c *Cache) videoFrame(ctx context.Context, path string) (image.Image, error)
@@ -1794,7 +1834,8 @@ Modes, where `jpg` is `encodeJPEG(redBlueImage(64, 32), 0)` and `b64 := "base64:
 - `garbage`: print `not json`.
 - `fail`: write `boom: bad file` to stderr and exit 3.
 - `hang`: `time.Sleep(time.Minute)`.
-- `ffmpeg-short`: write the `jpg` bytes to stdout only when the argument after `-ss` is `0`; otherwise write nothing and exit 0.
+- `ffmpeg-short`: when the argument after `-ss` is `0`, write the `jpg` bytes to stdout. Otherwise write `[out#0/image2pipe @ 0x0] Nothing was written into output file, because at least one of its streams received no packets.` to stderr and exit 234, as real ffmpeg 7.1 and 8.1 do past the end of a short clip.
+- `ffmpeg-short-old`: the same, except that the "otherwise" case writes nothing and exits 0 (ffmpeg 6.x).
 - `big`: write 2 MiB of zero bytes to stdout.
 - An unknown mode prints to stderr and exits 98. A failure to record the args prints to stderr and exits 99.
 
@@ -1817,7 +1858,7 @@ func needTool(t *testing.T, name string) string {
 }
 ```
 
-`writeARW(t, path string, preview []byte, orientation uint16)` writes a little-endian TIFF. Its IFD0 has five entries: Make `SONY` (0x010F, ASCII, count 5), Model `ILCE-7M4` (0x0110, ASCII, count 9), Orientation (0x0112, SHORT), `0x0201` (LONG, the preview's offset) and `0x0202` (LONG, the preview's length). After the IFD come the strings (`"SONY\x00\x00"` and `"ILCE-7M4\x00\x00"`) and then the preview bytes. This layout was verified to make exiftool 13.30 report `PreviewImage` for a `.ARW` file. Layout: header 8 bytes, IFD at 8 (2 + 5×12 + 4 = 66 bytes), Make at 74, Model at 80, preview at 90.
+`writeARW(t, path string, preview []byte, orientation uint16)` writes a little-endian TIFF. Its IFD0 has five entries: Make `SONY` (0x010F, ASCII, count 5), Model `ILCE-7M4` (0x0110, ASCII, count 9), Orientation (0x0112, SHORT), `0x0201` (LONG, the preview's offset) and `0x0202` (LONG, the preview's length). After the IFD come the strings (`"SONY\x00\x00"` and `"ILCE-7M4\x00\x00"`) and then the preview bytes. This layout was verified to make exiftool 13.30 and 13.55 report `PreviewImage` for a `.ARW` file. Layout: header 8 bytes, IFD at 8 (2 + 5×12 + 4 = 66 bytes), Make at 74, Model at 80, preview at 90.
 
 Tests (any source path the fakes get just has to exist; write a few bytes there):
 - `TestRawPreviewArgs` (Review Focus 3): mode `exif-preview`. `Get(…, Source{shaN(1), path, media.KindRaw}, ThumbSize)` → 32×64 (Orientation 6 applied), with the top reddish. The recorded args are exactly one call: `["-json","-b","-n","-Orientation","-PreviewImage","--",<path>]`.
@@ -1826,13 +1867,14 @@ Tests (any source path the fakes get just has to exist; write a few bytes there)
 - `TestToolFailureSurfacesStderr` (Review Focus 3): mode `fail` → an error containing `boom: bad file`.
 - `TestToolGarbage`: mode `garbage` → an error containing `exiftool output`.
 - `TestToolTimeoutKills` (Review Focus 3): mode `hang` with `Timeout: 300 * time.Millisecond`. `Get` returns within 10 s with `errors.Is(err, context.DeadlineExceeded)`.
-- `TestToolOutputCapped` (Review Focus 3): set `maxToolOutput = 1 << 20` (restore it with `t.Cleanup`), mode `big`, `Kind: media.KindVideo` → an error containing `larger than`.
-- `TestVideoShortClipRetriesAtZero` (Review Focus 3): mode `ffmpeg-short`, `Kind: media.KindVideo` → 64×32. Two calls were recorded. The first is exactly `["-nostdin","-hide_banner","-loglevel","error","-ss","1","-i","file:"+path,"-frames:v","1","-an","-sn","-dn","-f","image2pipe","-c:v","mjpeg","-q:v","2","pipe:1"]`, and the second is the same with `-ss` `0`.
+- `TestToolOutputCapped` (Review Focus 3): set `maxToolOutput = 1 << 20` (restore it with `t.Cleanup`), mode `big`, `Kind: media.KindVideo` → an error containing `larger than` and `errors.Is(err, errTooLarge)`. Exactly one call was recorded (runaway output is not retried at 0 s).
+- `TestVideoShortClipRetriesAtZero` (Review Focus 3): one subtest per mode, `ffmpeg-short` (ffmpeg 7+) and `ffmpeg-short-old` (6.x), each with `Kind: media.KindVideo` → 64×32. Two calls were recorded. The first is exactly `["-nostdin","-hide_banner","-loglevel","error","-ss","1","-i","file:"+path,"-frames:v","1","-an","-sn","-dn","-f","image2pipe","-c:v","mjpeg","-q:v","2","pipe:1"]`, and the second is the same with `-ss` `0`.
+- `TestVideoFailureReportsBoth`: mode `fail` with `Kind: media.KindVideo` → two calls were recorded (`-ss` `1`, then `0`), and the error contains `boom: bad file` (both failures are joined, none dropped).
 - `TestVideoBadFrame`: mode `garbage` with `Kind: media.KindVideo` (ffmpeg's stdout is not a JPEG) → an error containing `decode video frame`.
 - `TestOrientMatchesImaging`: for each `o` from 1 to 8, `b, _ := encodeJPEG(redBlueImage(8, 4), uint16(o))`. `want, _ := imaging.Decode(bytes.NewReader(b), imaging.AutoOrientation(true))`, `raw, _ := imaging.Decode(bytes.NewReader(b))` and `got := orient(raw, o)`. Both have the same bounds, and `imaging.Clone(got).Pix` equals `imaging.Clone(want).Pix`. This proves `orient` matches imaging's own EXIF handling.
 - `TestMissingTools`: `newCache(t, Config{Exiftool: "sd2nas-no-such-tool", FFmpeg: os.Args[0]})` → `MissingTools()` is exactly `["sd2nas-no-such-tool not found: RAW thumbnails are unavailable"]`.
 - `TestRealExiftoolARW`: `needTool(t, "exiftool")`. Write `x.ARW` with `writeARW` (a 64×32 red/blue preview, orientation 6). A default-config `Get` at `ThumbSize` → 32×64 with the top reddish.
-- `TestRealFFmpegVideo`: `ff := needTool(t, "ffmpeg")`. Create the clips with `exec.Command(ff, "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10", "-pix_fmt", "yuv420p", clip)` (and `duration=0.5` for a second `short.mp4`). A path with a space (`"my clip.mp4"`) works. `Get` at `ThumbSize` on each → 320×240 (Fit never upscales). The short clip proves the retry at 0 s.
+- `TestRealFFmpegVideo`: `ff := needTool(t, "ffmpeg")`. Create the clips with `exec.Command(ff, "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10", "-pix_fmt", "yuv420p", clip)` (and `duration=0.5` for a second `short.mp4`). A path with a space (`"my clip.mp4"`) works. `Get` at `ThumbSize` on each → 320×240 (Fit never upscales). The short clip proves the retry at 0 s against the installed ffmpeg (7.1 on the Windows box and 8.1 in the Linux container both exit non-zero at `-ss 1` there).
 
 - [ ] **Step 2: Run them and confirm they fail**
 
@@ -1848,6 +1890,9 @@ package thumbs
 // JpgFromRaw of a 61 MP body is ~20 MB and ~27 MB as base64. It is a var
 // so a test can lower it.
 var maxToolOutput = 128 << 20
+
+// errTooLarge is wrapped by runTool when the output passes maxToolOutput.
+var errTooLarge = errors.New("output is larger than the cap")
 
 // capBuffer keeps up to max bytes and drops the rest, so a chatty tool is
 // never blocked on a full pipe.
@@ -1890,7 +1935,7 @@ func (c *Cache) runTool(ctx context.Context, name string, args ...string) ([]byt
 		return nil, fmt.Errorf("%s: %w", tool, err)
 	}
 	if stdout.overflow {
-		return nil, fmt.Errorf("%s: output is larger than %d bytes", tool, maxToolOutput)
+		return nil, fmt.Errorf("%s: %w (%d bytes)", tool, errTooLarge, maxToolOutput)
 	}
 	if msg != "" {
 		c.cfg.Log.Warn("tool wrote to stderr", "tool", tool, "args", args, "stderr", msg)
@@ -1936,14 +1981,27 @@ func (c *Cache) rawPreview(ctx context.Context, path string) (image.Image, error
 }
 
 // videoFrame returns the frame at 1 s, or at 0 s for a clip shorter than
-// that (ffmpeg then writes nothing). ffmpeg applies rotation metadata
-// itself. The "file:" prefix stops a path from being read as a protocol.
+// that. Past the end of a short clip, ffmpeg 6.x exits 0 and writes
+// nothing, while ffmpeg 7+ exits non-zero ("Nothing was written into
+// output file"), so either result at 1 s means: try 0 s. ffmpeg applies
+// rotation metadata itself. The "file:" prefix stops a path from being
+// read as a protocol.
 func (c *Cache) videoFrame(ctx context.Context, path string) (image.Image, error) {
+	var first error // the failure at 1 s, reported with the one at 0 s
 	for _, at := range []string{"1", "0"} {
 		out, err := c.runTool(ctx, c.cfg.FFmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
 			"-ss", at, "-i", "file:"+path, "-frames:v", "1", "-an", "-sn", "-dn",
 			"-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "2", "pipe:1")
 		if err != nil {
+			// A cancelled or timed-out render, runaway output or a missing
+			// ffmpeg is not a short clip: don't run ffmpeg again.
+			if at == "1" && ctx.Err() == nil && !errors.Is(err, errTooLarge) && !errors.Is(err, exec.ErrNotFound) {
+				first = err
+				continue
+			}
+			if first != nil {
+				return nil, errors.Join(first, err)
+			}
 			return nil, err
 		}
 		if len(out) == 0 {
@@ -1954,6 +2012,9 @@ func (c *Cache) videoFrame(ctx context.Context, path string) (image.Image, error
 			return nil, fmt.Errorf("decode video frame: %w", err)
 		}
 		return img, nil
+	}
+	if first != nil {
+		return nil, errors.Join(ErrNoImage, first) // still errors.Is ErrNoImage
 	}
 	return nil, ErrNoImage
 }
@@ -2055,10 +2116,11 @@ In `full_test.go`, `newFullServer` also creates `thumbs.New(thumbs.Config{Dir: f
 - `TestThumbUnknownSHA`: a valid sha that isn't in the catalog → 404.
 - `TestThumbCulledAsset`: insert an asset with state `culled` and no `rel_path` → 404 with an error mentioning `no file`.
 - `TestThumbMissingFile`: stage a JPEG and delete the file → 404 with an error mentioning `missing`.
-- `TestThumbSourceOutsideRoot` (Review Focus 4): insert a staged asset whose `rel_path` is `../outside.JPG` → 500, and nothing outside the photos root is opened. Logging is fine.
+- `TestThumbSourceOutsideRoot` (Review Focus 4): first write a real JPEG at `filepath.Join(f.photos, "..", "outside.JPG")` (that parent is the test's own temp root, so it is cleaned up), so the test fails if the `filepath.IsLocal` check is missing. Insert a staged asset whose `rel_path` is `../outside.JPG` → 500, and `<config>/thumbs/<sha[:2]>/<sha>-400.jpg` does not exist (nothing outside the photos root was rendered). Logging is fine.
 - `TestThumbFailure`: unit-test the pure mapper `thumbFailure(err) (code int, msg string, logIt bool)`:
   - a wrapped `fs.ErrNotExist` → 404, not logged
   - `thumbs.ErrNoImage` → 404, not logged
+  - a missing tool, `fmt.Errorf("x.ARW: %w", &exec.Error{Name: "exiftool", Err: exec.ErrNotFound})` → 404, not logged
   - `thumbs.ErrClosed` and `context.Canceled` → 503, not logged
   - `context.DeadlineExceeded` and `errors.New("x")` → 500, logged
 - `TestThumbWarmAfterIngest`: `post(t, f.s, "?wait=1", cardBody(f.card))` → 200. Read the new JPEG's sha from `f.db.IngestFiles(ctx, id)`: the outcome-`new` row whose `card_path` ends in `.JPG`. `pollUntil(t, "the warmed thumbnail", …)` until `<config>/thumbs/<sha[:2]>/<sha>-400.jpg` exists. The ARW fixture has no preview, so warming it fails and is logged; nothing else must break.
@@ -2124,6 +2186,10 @@ func thumbFailure(err error) (code int, msg string, logIt bool) {
 		return http.StatusNotFound, "the file is missing from the photos share: " + err.Error(), false
 	case errors.Is(err, thumbs.ErrNoImage):
 		return http.StatusNotFound, err.Error(), false
+	case errors.Is(err, exec.ErrNotFound):
+		// exiftool or ffmpeg isn't installed: /healthz already warns, so
+		// don't log an error for every RAW or video tile.
+		return http.StatusNotFound, "no thumbnail: " + err.Error(), false
 	case errors.Is(err, thumbs.ErrClosed), errors.Is(err, context.Canceled):
 		return http.StatusServiceUnavailable, "SD2NAS is shutting down", false
 	}
@@ -2902,7 +2968,7 @@ h2 { font-size: 15px; margin: 0 0 12px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; margin-bottom: 16px; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .spacer { flex: 1; }
-.btn { background: var(--panel2); color: var(--text); border: 1px solid var(--line); padding: 7px 13px; border-radius: 8px; cursor: pointer; font: inherit; white-space: nowrap; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; min-height: 40px; }
+.btn { background: var(--panel2); color: var(--text); border: 1px solid var(--line); padding: 7px 13px; border-radius: 8px; cursor: pointer; font: inherit; white-space: nowrap; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; min-height: 44px; }
 .btn:hover { border-color: var(--accent); }
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
 .stat { background: var(--panel2); border-radius: 8px; padding: 12px 14px; }
@@ -2931,7 +2997,7 @@ details ul { margin: 8px 0 0; padding-left: 18px; color: var(--muted); }
 .note.warn { background: rgba(232,176,74,.1); border-color: rgba(232,176,74,.35); color: #f0d49b; }
 .note.bad { background: rgba(229,99,107,.1); border-color: rgba(229,99,107,.4); color: #f3b3b7; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
-.chip { background: var(--panel2); border: 1px solid var(--line); color: var(--muted); border-radius: 99px; padding: 6px 12px; cursor: pointer; font: inherit; font-size: 13px; min-height: 40px; }
+.chip { background: var(--panel2); border: 1px solid var(--line); color: var(--muted); border-radius: 99px; padding: 6px 12px; cursor: pointer; font: inherit; font-size: 13px; min-height: 44px; }
 .chip.on { color: var(--text); border-color: var(--accent); }
 .toolbar { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 10px 0; margin-bottom: 10px; border-bottom: 1px solid var(--line); }
 .only-phone { display: none; }
@@ -3642,6 +3708,16 @@ Suggested implementer: sonnet.
   const live_ = $derived(ingest && (ingest.status === 'queued' || ingest.status === 'running'));
 </script>
 
+{#snippet fileList(items, row)}
+  <ul>
+    {#each items.slice(0, MAX) as item, i (i)}<li>{@render row(item)}</li>{/each}
+    {#if items.length > MAX}<li>…and {formatCount(items.length - MAX)} more</li>{/if}
+  </ul>
+{/snippet}
+{#snippet pathRow(f)}<span class="mono">{f.card_path}</span>{/snippet}
+{#snippet errorRow(f)}<span class="mono">{f.card_path}</span>: {f.error}{/snippet}
+{#snippet clockRow(w)}<span class="mono">{w.card_path}</span>: {w.detail}{/snippet}
+
 <p><a href="/ingest" class="btn">← Card ingest</a></p>
 
 {#if error}
@@ -3680,43 +3756,32 @@ Suggested implementer: sonnet.
     <details>
       <summary>{formatCount(seenBefore.length)} files were imported before but are no longer kept</summary>
       <p class="muted small" style="margin:8px 0">They were culled or discarded after an earlier import, so they're skipped and deleted shots don't come back.</p>
-      <ul>
-        {#each seenBefore.slice(0, MAX) as f (f.card_path)}<li class="mono">{f.card_path}</li>{/each}
-        {#if seenBefore.length > MAX}<li>…and {formatCount(seenBefore.length - MAX)} more</li>{/if}
-      </ul>
+      {@render fileList(seenBefore, pathRow)}
     </details>
   {/if}
   {#if failed.length}
     <details open>
       <summary>{formatCount(failed.length)} files failed</summary>
-      <ul>
-        {#each failed.slice(0, MAX) as f (f.card_path)}<li><span class="mono">{f.card_path}</span>: {f.error}</li>{/each}
-        {#if failed.length > MAX}<li>…and {formatCount(failed.length - MAX)} more</li>{/if}
-      </ul>
+      {@render fileList(failed, errorRow)}
     </details>
   {/if}
   {#if unsupported.length}
     <details open>
       <summary>{formatCount(unsupported.length)} files not imported (format not supported)</summary>
-      <ul>
-        {#each unsupported.slice(0, MAX) as f (f.card_path)}<li class="mono">{f.card_path}</li>{/each}
-        {#if unsupported.length > MAX}<li>…and {formatCount(unsupported.length - MAX)} more</li>{/if}
-      </ul>
+      {@render fileList(unsupported, pathRow)}
     </details>
   {/if}
   {#if clock.length}
     <details open>
       <summary>{formatCount(clock.length)} suspicious capture times</summary>
-      <ul>
-        {#each clock.slice(0, MAX) as w, i (i)}<li><span class="mono">{w.card_path}</span>: {w.detail}</li>{/each}
-      </ul>
+      {@render fileList(clock, clockRow)}
     </details>
   {/if}
 {/if}
 ```
 
 Notes for the implementer:
-- `card_path` is unique within one ingest's files, so it is a safe key. If Svelte reports a duplicate key, key on the index instead.
+- The three file lists and the clock list share the `fileList(items, row)` snippet: at most `MAX` rows, then "…and N more". It keys rows on the index because a clock warning's `card_path` can repeat (two kinds of warning for one file). The rows are static, so that is fine.
 - `{@const}` directly inside `{:else}` is valid Svelte 5.
 - The variable is named `live_` because `live` is the imported store.
 
@@ -3991,7 +4056,7 @@ Suggested implementer: sonnet.
 
 ```svelte
 <script>
-  import { untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { api } from '../lib/api.js';
   import { isId } from '../lib/paths.js';
   import { formatBytes, formatCount, dateRange, kindChips, extLabel } from '../lib/format.js';
@@ -4003,16 +4068,21 @@ Suggested implementer: sonnet.
   let data = $state(null);
   let error = $state('');
   let open = $state(-1); // index into data.files shown full screen; -1 = none
+  let controller = null; // the load in flight; a newer one aborts it
 
+  // Switching chips quickly must not let an older, slower answer land last.
   async function load(k) {
     if (!isId(id)) {
       error = 'There is no such staging folder.';
       return;
     }
+    controller?.abort();
+    const c = (controller = new AbortController());
     try {
-      data = await api(`/api/staging/${id}/files` + (k ? `?kind=${k}` : ''));
+      data = await api(`/api/staging/${id}/files` + (k ? `?kind=${k}` : ''), { signal: c.signal });
       error = '';
     } catch (err) {
+      if (err.name === 'AbortError') return; // replaced by a newer load, or the page closed
       error = err.message;
     }
   }
@@ -4020,6 +4090,15 @@ Suggested implementer: sonnet.
   $effect(() => {
     const k = kind;
     untrack(() => load(k));
+    return () => controller?.abort();
+  });
+
+  // After a reload with the preview open, this page sits on the preview's
+  // history entry with nothing shown, so the first Back would seem to do
+  // nothing. Step back to the folder's own entry (same URL; popstate below
+  // keeps the preview closed), so the first Back leaves the folder.
+  onMount(() => {
+    if (history.state?.lightbox) history.back();
   });
 
   // The preview takes a history entry, so the phone's back gesture closes
@@ -4093,9 +4172,9 @@ In `web/`, `npm run build` must finish with no errors and no Svelte warnings (fi
 
 The implementer runs what they can and reports the rest, which the controller or owner checks in a browser at 375×812 and at desktop width. Setup: `go build -o tmp/sd2nas.exe ./cmd/sd2nas`, run it on `testdata/cards` as in Task 10, and import `SONY_A7IV` once.
 1. `/staging` lists one card, `2025-05-30`, with tags `1 RAW` and `1 JPG`, "2 files", and a one-thumb strip (the JPEG). On a phone it is one column, and the bottom tab bar shows Card ingest and Staging with Staging highlighted. The last card is not hidden under the bar.
-2. Tapping the card opens `/staging/<id>`. The chips are All 2, RAW 1 and JPG 1, and tapping RAW shows only the ARW. Its tile shows the RAW placeholder: the fixture has no embedded preview, so `/api/thumbs` answers 404 and the badge is still visible.
+2. Tapping the card opens `/staging/<id>`. The chips are All 2, RAW 1 and JPG 1, and tapping RAW shows only the ARW. Its tile shows the RAW placeholder: `/api/thumbs` answers 404 (the fixture has no embedded preview, or exiftool is not installed, as on the Windows box) and the badge is still visible.
 3. Tapping the JPEG tile opens the full-screen preview. Swiping left or right steps, as do the ←/→ keys and the ‹ › buttons on desktop. Escape, ✕, swiping down and the browser/phone back gesture each close it and leave you on the folder page.
-4. Reloading `/staging/<id>` stays there. Every button and tab is at least 44 px tall, and nothing scrolls sideways at 375 px.
+4. Reloading `/staging/<id>` stays there. Reloading with the preview open shows the folder without it, and one Back then leaves the folder. Tapping JPG then RAW quickly ends on the RAW list. Every button and tab is at least 44 px tall, and nothing scrolls sideways at 375 px.
 5. With a real RAW and video (optional, if the implementer has one): the ARW thumbnail shows the embedded preview on Linux/Docker with exiftool, and an MP4 shows a frame.
 
 Clean up `tmp/`.
@@ -4119,12 +4198,12 @@ Suggested implementer: sonnet.
 - Modify: `deploy/Dockerfile`, `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Consumes: `web/package.json` scripts `test` and `build` (Task 8); `web/*.go` (package `web`, Task 1); `SD2NAS_REQUIRE_TOOLS` (Task 6) and `SD2NAS_REQUIRE_UI` (Task 8). `.dockerignore` already excludes `web/node_modules` and `web/dist`, so the context carries neither. Leave it as it is.
+- Consumes: `web/package.json` scripts `test` and `build` (Task 8); `web/*.go` (package `web`, Task 1); `SD2NAS_REQUIRE_TOOLS` (Task 6) and `SD2NAS_REQUIRE_UI` (Task 8). Task 1 added `COPY web/*.go ./web/` and a stand-in `RUN mkdir -p web/dist && touch web/dist/.placeholder` to the build stage; the block below replaces both. `.dockerignore` already excludes `web/node_modules` and `web/dist`, so the context carries neither. Leave it as it is.
 - Produces: an image whose binary embeds the UI, and CI that builds and tests the web app and runs the thumbnail tool tests for real.
 
 - [ ] **Step 1: `deploy/Dockerfile`**
 
-Replace the top of the file, through the Go `RUN … go build` line, with the block below. Everything from `FROM alpine:3.22` down stays the same.
+Replace the top of the file, through the Go `RUN … go build` line (Task 1's `web` lines and the stand-in placeholder included), with the block below. Everything from `FROM alpine:3.22` down stays the same.
 
 ```dockerfile
 # Build from the repo root:  docker build -f deploy/Dockerfile -t sd2nas .
@@ -4304,6 +4383,17 @@ shortcut.
      - ``- [ ] Byte-level copy progress for long videos (progress currently updates once per file)``
      - ``- [ ] Keep one `exiftool -stay_open` process for RAW thumbnails instead of one process per file``
      - ``- [ ] HTTPS (e.g. `tailscale serve`) so the PWA installs fully``
+6. In §8, right after the operations table (before the paragraph that starts `**Folder naming follows the existing archive:**`), add this paragraph, since M3 deliberately departs from "The filesystem is the truth for what files exist" and from the table's "List folders" row until M4 (this plan's Decision 6):
+
+```markdown
+**M3 (read-only) lists from the catalog.** Until M4's startup reconcile, a
+staging folder's files are the `staged` assets under `Staging/<name>/` in the
+catalog, not a directory scan (thumbnails and clock warnings need the content
+hash, which only the catalog has). `Staging/` is read only to report
+directories with no catalog row ("untracked") and rows whose directory is
+gone ("Not found on disk"). Files added or removed over SMB therefore don't
+show in the UI until M4's reconcile picks them up.
+```
 
 - [ ] **Step 2: Final verification of the whole branch**
 
