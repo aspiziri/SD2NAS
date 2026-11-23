@@ -131,6 +131,7 @@ type classified struct {
 	outcome catalog.Outcome
 	sha     string // the matched asset's, for a known outcome
 	err     error  // the reason, for a failed outcome
+	skipped bool   // not classified: the job was cancelled first
 }
 
 func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
@@ -167,6 +168,9 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 
 	var fresh []newFile
 	for _, c := range results {
+		if c.skipped {
+			continue
+		}
 		switch c.outcome {
 		case catalog.OutcomeNew:
 			fresh = append(fresh, newFile{CardFile: c.CardFile, fp: c.fp})
@@ -182,6 +186,14 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 	}
 	for _, row := range rows {
 		j.addOutcome(row.Outcome)
+	}
+	if j.ctx.Err() != nil {
+		return catalog.StatusCancelled, ""
+	}
+	if j.counts.Failed > 0 {
+		if err := j.cardErr(); err != nil {
+			return catalog.StatusFailed, "card removed during import: " + err.Error()
+		}
 	}
 	if len(fresh) == 0 {
 		return catalog.StatusDone, ""
@@ -213,7 +225,13 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 		s.Phase, s.FilesTotal, s.FilesDone, s.BytesTotal, s.BytesDone = PhaseCopying, len(fresh), 0, needBytes, 0
 	})
 	for _, f := range fresh {
+		if j.ctx.Err() != nil {
+			return catalog.StatusCancelled, ""
+		}
 		res := j.importOne(f)
+		if res.canceled {
+			return catalog.StatusCancelled, ""
+		}
 		if !res.recorded {
 			if err := j.cat().AddIngestFiles(j.dbctx, j.id, []catalog.IngestFile{res.row}); err != nil {
 				return catalog.StatusFailed, "record files: " + err.Error()
@@ -222,8 +240,19 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 		j.addOutcome(res.row.Outcome)
 		j.warnings = append(j.warnings, res.warnings...)
 		j.p.update(func(s *ProgressSnapshot) { s.FilesDone++; s.BytesDone += f.Size })
+		if res.row.Outcome == catalog.OutcomeFailed {
+			if err := j.cardErr(); err != nil {
+				return catalog.StatusFailed, "card removed during import: " + err.Error()
+			}
+		}
 	}
 	return catalog.StatusDone, ""
+}
+
+// cardErr is non-nil when the card root can no longer be read (pulled card).
+func (j *ingestRun) cardErr() error {
+	_, err := os.Stat(j.card)
+	return err
 }
 
 // addOutcome counts one file in the run's totals and the live progress.
@@ -242,6 +271,10 @@ func (j *ingestRun) classifyAll(files []CardFile) []classified {
 		go func() {
 			defer wg.Done()
 			for i := range idx {
+				if j.ctx.Err() != nil {
+					results[i] = classified{CardFile: files[i], skipped: true}
+					continue
+				}
 				results[i] = j.classifyOne(files[i])
 				j.p.update(func(s *ProgressSnapshot) { s.FilesDone++ })
 			}
@@ -299,6 +332,9 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 		}
 		c.outcome, c.sha = o, a.SHA256
 		return c
+	}
+	if f.Size == 0 {
+		return fail(errors.New("empty file"))
 	}
 	fp, err := r.fingerprint(f.Path)
 	if err != nil {
@@ -360,6 +396,7 @@ type fileResult struct {
 	row      catalog.IngestFile
 	recorded bool // RecordNew already wrote row (and the asset)
 	warnings []catalog.ClockWarning
+	canceled bool // the job was cancelled mid-copy; row is not to be recorded
 }
 
 // captureOf resolves f's capture time and, for a video, returns the
@@ -421,6 +458,9 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 	dst, sum, dup, err := j.copyNew(f, dir, name)
 	j.copyDur += time.Since(start)
 	if err != nil {
+		if media.ClassifyCopyError(err, f.Path, dst) == media.CopyFailCanceled {
+			return fileResult{canceled: true}
+		}
 		return fail(err)
 	}
 	rel, err := j.rel(dst)
@@ -478,14 +518,39 @@ func (j *ingestRun) rel(dst string) (string, error) {
 	return filepath.ToSlash(rel), nil
 }
 
-// copyNew copies f into dir under name (or a free variant of it).
+// copyNew picks a free name in dir and copies f there, retrying the
+// failures a retry can fix (Decision 13). dup reports identical content
+// already at dst, so nothing was copied.
 func (j *ingestRun) copyNew(f newFile, dir, name string) (dst, sum string, dup bool, err error) {
-	dst, dup, err = media.FreeName(f.Path, dir, name)
-	if err != nil || dup {
-		return dst, "", dup, err
+	const attempts = 3
+	for range attempts {
+		dst, dup, err = media.FreeName(f.Path, dir, name)
+		if err != nil || dup {
+			return dst, "", dup, err
+		}
+		sum, err = j.r.copyFile(j.ctx, f.Path, dst)
+		if err == nil {
+			return dst, sum, false, nil
+		}
+		switch media.ClassifyCopyError(err, f.Path, dst) {
+		case media.CopyFailDestTaken:
+			j.log.Warn("destination appeared during the copy; choosing another name", "dst", filepath.ToSlash(dst))
+		case media.CopyFailStalePartial:
+			// Ingest is the only writer of partials in Staging and runs alone,
+			// so this one was left by an earlier, interrupted copy.
+			if rmErr := os.Remove(dst + media.PartialSuffix); rmErr != nil {
+				return dst, "", false, errors.Join(err, rmErr)
+			}
+			j.log.Warn("removed a stale partial", "path", filepath.ToSlash(dst+media.PartialSuffix))
+		case media.CopyFailDestDirMissing:
+			if mkErr := mkdirDurable(dir); mkErr != nil {
+				return dst, "", false, errors.Join(err, mkErr)
+			}
+		default: // cancelled, source missing, or anything else: a retry can't help
+			return dst, "", false, err
+		}
 	}
-	sum, err = j.r.copyFile(j.ctx, f.Path, dst)
-	return dst, sum, false, err
+	return dst, "", false, fmt.Errorf("gave up after %d attempts: %w", attempts, err)
 }
 
 func knownRow(f newFile, a catalog.Asset) (catalog.IngestFile, error) {
@@ -511,9 +576,38 @@ func (j *ingestRun) recordExisting(f newFile, dst, rel string) fileResult {
 		}
 		return j.knownResult(f, a)
 	case errors.Is(err, catalog.ErrNotFound):
-		return fail(fmt.Errorf("identical file already at %s but not in the catalog", rel))
+		return j.adopt(f, dst, rel, sum)
 	}
 	return fail(fmt.Errorf("catalog lookup: %w", err))
+}
+
+// adopt records the copy at dst, whose content (sum) the catalog lacks: an
+// earlier import copied it and stopped before writing the catalog row
+// (Decision 14).
+func (j *ingestRun) adopt(f newFile, dst, rel, sum string) fileResult {
+	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
+	if err := media.SyncDir(filepath.Dir(dst)); err != nil {
+		return fail(fmt.Errorf("adopting %s: could not sync its folder: %w", rel, err))
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		return fail(fmt.Errorf("adopting %s: %w", rel, err))
+	}
+	a := catalog.Asset{SHA256: sum, Size: f.Size, Kind: f.Kind, State: catalog.StateStaged,
+		RelPath: rel, Mtime: info.ModTime().UnixNano(), UpdatedAt: j.now}
+	c, err := media.CaptureTime(f.Path, f.Kind)
+	if err != nil {
+		j.log.Warn("adopted copy has no capture time", "file", f.Rel, "reason", err)
+	} else {
+		a.CaptureTime, a.TZOffset = c.Time, c.Offset
+	}
+	row := catalog.IngestFile{CardPath: f.Rel, Size: f.Size, QuickFP: f.fp, SHA256: sum,
+		Outcome: catalog.OutcomeInStaging, RelPath: rel}
+	if err := j.cat().RecordNew(j.dbctx, j.id, a, f.fp, row); err != nil {
+		return fail(fmt.Errorf("adopting %s: not recorded: %w", rel, err))
+	}
+	j.log.Warn("adopted a copy left in staging without a catalog row", "path", rel)
+	return fileResult{row: row, recorded: true}
 }
 
 // dropCopy deletes the fresh copy at dst, whose content the catalog already has as a.
