@@ -2,11 +2,16 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
+
+	"github.com/aspiziri/SD2NAS/internal/catalog"
 )
 
 // PathInfo describes one of the mounted directories.
@@ -33,6 +38,21 @@ type Server struct {
 	mux      *http.ServeMux
 	handler  http.Handler // mux behind the request guard
 	problems []string     // permanent /healthz problems added after startup
+	warnings []string     // permanent /healthz warnings added after startup
+
+	log       *slog.Logger // SetLogger; slog.Default() until then
+	hub       *Hub
+	keepalive time.Duration   // DefaultKeepalive; tests shorten it
+	bgCtx     context.Context // cancelled by Close; background goroutines stop on it
+	bgCancel  context.CancelFunc
+	bg        sync.WaitGroup // background goroutines (ingest feed, thumbnail warm-up)
+	closers   []func()       // run by Close once bg has stopped (e.g. the thumbnail cache)
+	closeOnce sync.Once
+
+	feedInterval time.Duration // DefaultFeedInterval; set before MountIngest
+	feed         *ingestFeed   // set by MountIngest
+	hookMu       sync.Mutex
+	finished     []func(catalog.Ingest)
 }
 
 // New builds the server and probes writable mounts once. Probing on every
@@ -50,17 +70,59 @@ func New(version string, mounts []Mount) *Server {
 			s.writable[m.Name] = probeWrite(m.Path)
 		}
 	}
+	s.log = slog.Default()
+	s.hub = NewHub()
+	s.keepalive = DefaultKeepalive
+	s.feedInterval = DefaultFeedInterval
+	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
-	s.mux.HandleFunc("GET /{$}", s.handleIndex)
+	s.mux.HandleFunc("GET /api/events", s.handleEvents)
 	s.handler = guard(s.mux)
 	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
 
+// SetLogger sets the logger for errors the server can only log (event
+// snapshots, thumbnail failures). Call it before any Mount method.
+func (s *Server) SetLogger(l *slog.Logger) { s.log = l }
+
+// Close ends every /api/events stream, stops the server's background work
+// and runs the registered closers (the thumbnail cache). Call it before
+// http.Server.Shutdown, which would otherwise wait for the open streams.
+// Calling it again does nothing.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		s.bgCancel()
+		s.bg.Wait()
+		s.hub.Close()
+		for _, c := range s.closers {
+			c()
+		}
+	})
+}
+
+// addFinishedHook registers fn to run, on the feed goroutine, for every
+// ingest that finishes. fn must not block.
+func (s *Server) addFinishedHook(fn func(catalog.Ingest)) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.finished = append(s.finished, fn)
+}
+
+func (s *Server) finishedHooks() []func(catalog.Ingest) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	return append([](func(catalog.Ingest))(nil), s.finished...)
+}
+
 // AddProblem adds a permanent /healthz problem (for example, the catalog
 // failed to open). Call it before serving.
 func (s *Server) AddProblem(p string) { s.problems = append(s.problems, p) }
+
+// AddWarning adds a permanent /healthz warning (healthz stays 200). Call it
+// before serving.
+func (s *Server) AddWarning(w string) { s.warnings = append(s.warnings, w) }
 
 // WriteProblems lists mounts that failed the startup write probe, for logging.
 func (s *Server) WriteProblems() []string {
@@ -101,6 +163,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if h.TZ == "" {
 		h.Warnings = append(h.Warnings, "TZ is not set: video and file times will be read as UTC")
 	}
+	h.Warnings = append(h.Warnings, s.warnings...)
 	for _, m := range s.mounts {
 		info := PathInfo{Path: m.Path}
 		fi, err := os.Stat(m.Path)
@@ -137,23 +200,6 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(h) // the client hung up; nothing useful to do with the error
-}
-
-// handleIndex is a placeholder until the Svelte UI is embedded in M3.
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SD2NAS</title>
-<style>body{font-family:system-ui,sans-serif;background:#16181d;color:#e6e6e6;margin:0;padding:24px 16px}
-a{color:#7fb4ff}code{background:#24272e;padding:2px 6px;border-radius:4px}</style>
-</head><body>
-<h1>SD2NAS</h1>
-<p>Version <code>%s</code>. The web UI arrives in a later milestone.</p>
-<p><a href="/healthz">/healthz</a> shows the time zone, user and mount checks.</p>
-</body></html>
-`, s.version)
 }
 
 // probeWrite creates and removes a temporary file to confirm the directory is

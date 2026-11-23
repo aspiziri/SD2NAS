@@ -63,15 +63,24 @@ type ingestHandlers struct {
 	m       *ingest.Manager
 	db      *catalog.DB
 	maxWait time.Duration
+	feed    *ingestFeed
 }
 
 // MountIngest registers the ingest endpoints. Call it before serving.
 func (s *Server) MountIngest(m *ingest.Manager, db *catalog.DB, maxWait time.Duration) {
-	h := &ingestHandlers{m: m, db: db, maxWait: maxWait}
+	f := &ingestFeed{m: m, hub: s.hub, log: s.log, hooks: s.finishedHooks, watched: map[int64]*ingest.Job{}}
+	s.feed = f
+	s.hub.AddSnapshot(f.snapshot)
+	h := &ingestHandlers{m: m, db: db, maxWait: maxWait, feed: f}
 	s.mux.HandleFunc("POST /api/ingest", h.post)
 	s.mux.HandleFunc("GET /api/ingest/current", h.current)
 	s.mux.HandleFunc("GET /api/ingests", h.list)
 	s.mux.HandleFunc("GET /api/ingests/{id}", h.detail)
+	s.bg.Add(1)
+	go func() {
+		defer s.bg.Done()
+		f.run(s.bgCtx, s.feedInterval)
+	}()
 }
 
 type ingestView struct {
@@ -143,6 +152,7 @@ func (h *ingestHandlers) post(w http.ResponseWriter, r *http.Request) {
 		writeFail(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.feed.watch(job)
 	if !wait {
 		h.respond(w, http.StatusAccepted, job, text)
 		return
@@ -180,18 +190,7 @@ func finishedCode(s catalog.IngestStatus) int {
 
 func (h *ingestHandlers) current(w http.ResponseWriter, r *http.Request) {
 	running, queued := h.m.Current()
-	out := struct {
-		Running *ingestView  `json:"running"`
-		Queued  []ingestView `json:"queued"`
-	}{Queued: []ingestView{}}
-	if running != nil {
-		v := viewOf(running.Result(), running)
-		out.Running = &v
-	}
-	for _, j := range queued {
-		out.Queued = append(out.Queued, viewOf(j.Result(), j))
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, currentOf(running, queued))
 }
 
 // positiveInt parses a query or path value that must be a positive integer.

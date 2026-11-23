@@ -1,5 +1,12 @@
 # Build from the repo root:  docker build -f deploy/Dockerfile -t sd2nas .
-# A node stage that builds web/dist is added in M3, when the UI exists.
+
+# The web UI: web/dist, embedded into the binary by package web.
+FROM node:24-alpine AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm test && npm run build
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
@@ -7,6 +14,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
+COPY web/*.go ./web/
+COPY --from=web /web/dist ./web/dist
+# Fail loudly rather than ship a binary whose UI is the "not built" page.
+RUN test -f web/dist/index.html
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/sd2nas ./cmd/sd2nas
 

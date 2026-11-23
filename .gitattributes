@@ -8,3 +8,15 @@
 
 # Synthesized camera fixtures are byte-exact; never convert line endings.
 testdata/cards/** binary
+
+# Web sources and config stay LF on every OS (npm, Vite and reviews see the same bytes).
+web/**/*.svelte text eol=lf
+web/**/*.js text eol=lf
+web/**/*.mjs text eol=lf
+web/**/*.json text eol=lf
+web/**/*.css text eol=lf
+web/**/*.html text eol=lf
+web/**/*.svg text eol=lf
+web/**/*.webmanifest text eol=lf
+web/dist/.placeholder text eol=lf
+*.png binary

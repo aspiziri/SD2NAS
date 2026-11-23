@@ -1,0 +1,1 @@
+Placeholder so go:embed matches on a fresh checkout. npm run build (in web/) writes the UI here and keeps this file.

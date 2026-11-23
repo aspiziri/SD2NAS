@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func get(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
@@ -95,11 +96,11 @@ func TestHealthzWarnsWithoutTZ(t *testing.T) {
 }
 
 func TestIndexAndUnknownPaths(t *testing.T) {
-	s := New("v9", nil)
+	s := uiServer(t, fstest.MapFS{".placeholder": {Data: []byte("x")}})
 	if rec := get(t, s, "/"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "v9") {
 		t.Errorf("index: %d %s", rec.Code, rec.Body)
 	}
-	if rec := get(t, s, "/nope"); rec.Code != http.StatusNotFound {
+	if rec := get(t, s, "/nope.txt"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown path: %d", rec.Code)
 	}
 	rec := httptest.NewRecorder()
@@ -121,5 +122,22 @@ func TestHealthzReportsAddedProblem(t *testing.T) {
 	h := decode(t, rec)
 	if h.Status != "degraded" || len(h.Problems) != 1 || h.Problems[0] != "catalog: boom" {
 		t.Errorf("health: %+v", h)
+	}
+}
+
+func TestHealthzReportsWarning(t *testing.T) {
+	const warning = "exiftool not found: RAW thumbnails are unavailable"
+	s := New("test", nil)
+	s.AddWarning(warning)
+	rec := get(t, s, "/healthz")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a warning must not degrade healthz: status %d", rec.Code)
+	}
+	var found bool
+	for _, w := range decode(t, rec).Warnings {
+		found = found || w == warning
+	}
+	if !found {
+		t.Errorf("warning missing: %s", rec.Body)
 	}
 }

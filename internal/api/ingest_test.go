@@ -49,6 +49,7 @@ func newIngestServer(t *testing.T, free func(string) (uint64, error), maxWait ti
 	})
 	s = New("test", nil)
 	s.MountIngest(m, db, maxWait)
+	t.Cleanup(s.Close)
 	return s, card
 }
 

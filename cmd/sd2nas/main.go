@@ -19,6 +19,9 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/config"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
+	"github.com/aspiziri/SD2NAS/internal/staging"
+	"github.com/aspiziri/SD2NAS/internal/thumbs"
+	"github.com/aspiziri/SD2NAS/web"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -63,6 +66,10 @@ func run(log *slog.Logger) error {
 		{Name: "photos", Path: cfg.Photos, NeedWrite: true},
 		{Name: "config", Path: cfg.Data, NeedWrite: true},
 	})
+	srv.SetLogger(log)
+	if err := srv.MountUI(web.Dist()); err != nil {
+		return err
+	}
 	// Keep serving so /healthz can explain the problem, but make it loud.
 	for _, p := range srv.WriteProblems() {
 		log.Error("directory is not usable", "detail", p)
@@ -91,6 +98,18 @@ func run(log *slog.Logger) error {
 		}
 		mgr.Start()
 		srv.MountIngest(mgr, db, api.DefaultMaxWait)
+		srv.MountStaging(staging.New(db, cfg.Photos))
+		cache, err := thumbs.New(thumbs.Config{Dir: filepath.Join(cfg.Data, "thumbs"), Log: log})
+		if err != nil {
+			log.Error("thumbnail cache unavailable", "err", err)
+			srv.AddProblem("thumbnails: " + err.Error())
+		} else {
+			for _, w := range cache.MissingTools() {
+				log.Warn(w)
+				srv.AddWarning(w)
+			}
+			srv.MountThumbs(db, cache, cfg.Photos) // srv.Close closes the cache
+		}
 	}
 
 	httpSrv := &http.Server{
@@ -110,6 +129,7 @@ func run(log *slog.Logger) error {
 			defer cancel()
 			err = errors.Join(err, wrap("stopping ingest", mgr.Close(closeCtx)))
 		}
+		srv.Close()
 		return err
 	case <-ctx.Done():
 	}
@@ -123,6 +143,9 @@ func run(log *slog.Logger) error {
 	if mgr != nil {
 		mgrErr = wrap("stopping ingest", mgr.Close(shutdownCtx))
 	}
+	// Ends /api/events streams and background work, which Shutdown would
+	// otherwise wait for until its deadline.
+	srv.Close()
 	return errors.Join(mgrErr, wrap("stopping http server", httpSrv.Shutdown(shutdownCtx)))
 }
 
