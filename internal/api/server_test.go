@@ -61,6 +61,30 @@ func TestHealthzOK(t *testing.T) {
 	}
 }
 
+func TestHealthzContentType(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	s := New("test", []Mount{{Name: "cards", Path: t.TempDir()}})
+	for _, tc := range []struct{ accept, want string }{
+		{"", "application/json"},
+		{"*/*", "application/json"},
+		{"application/json", "application/json"},
+		{"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "text/plain; charset=utf-8"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		if tc.accept != "" {
+			req.Header.Set("Accept", tc.accept)
+		}
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Content-Type"); got != tc.want {
+			t.Errorf("Accept %q: Content-Type = %q, want %q", tc.accept, got, tc.want)
+		}
+		if h := decode(t, rec); h.Status != "ok" {
+			t.Errorf("Accept %q: status %q", tc.accept, h.Status)
+		}
+	}
+}
+
 func TestHealthzMissingMount(t *testing.T) {
 	t.Setenv("TZ", "UTC")
 	dir := t.TempDir()

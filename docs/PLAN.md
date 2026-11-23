@@ -346,6 +346,7 @@ never across user think time.
 | Merge N → 1 | move files into the target folder (collision loop), remove empty sources | union `dates`, update paths |
 | Move files | same as merge, per file; "New folder…" creates one | update paths and dates |
 | Cull files / discard folder | delete files | `state = culled`, `rel_path = NULL` |
+| Forget an import | optionally delete the import's files still in `Staging/` | delete the import's `staged` and `culled` asset rows and their fingerprints, so the same card imports them again; `archived` rows are never forgotten (that would import archive duplicates); the ingest stays in the history marked as forgotten |
 | Promote | `os.Rename(Staging/X, Archive/<pattern>)`, instant within the share. If the target folder already exists, merge into it file by file with the collision loop. If a rename ever returns `EXDEV`, fall back to copy, verify hash, delete. | `state = archived`, new paths, drop the `staging_folders` row |
 
 **M3 (read-only) lists from the catalog.** Until M4's startup reconcile, a
@@ -431,6 +432,7 @@ CameraImport's polling. Event types: `ingest.current` and `ingest.finished` (M3)
 POST   /api/ingest                       {path,label,uuid}  ?wait=1 blocks until done
 GET    /api/ingest/current
 POST   /api/ingest/{id}/reimport-culled
+POST   /api/ingest/{id}/forget           {deleteFiles}  (M4)
 GET    /api/ingests                      history
 GET    /api/ingests/{id}                 summary + skipped-file breakdown + clock warnings
 
@@ -741,6 +743,7 @@ dev dependency alongside `svelte` 5.59.1 and `vite` 8.3.8.
 - [ ] Startup reconcile for changes made over SMB
 - [ ] Adopt staging directories that have no catalog row (shown as "untracked" since M3) in the startup reconcile
 - [ ] Staging age warnings
+- [ ] "Forget this import" on the import detail page (§8): the same card can be imported again, e.g. to retest; archived files stay known
 - [ ] Touch-friendly selection (long-press to start selecting, swipe-select in grids)
 
 ### M5: Archive indexer
