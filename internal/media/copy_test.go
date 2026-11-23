@@ -1,7 +1,11 @@
 package media
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -16,7 +20,7 @@ func TestCopyHashedCopiesAndHashes(t *testing.T) {
 	src := writeSourceFile(t, dir, "src.jpg", "hello")
 	dst := filepath.Join(dir, "out.jpg")
 
-	sum, err := CopyHashed(src, dst)
+	sum, err := CopyHashed(t.Context(), src, dst)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +51,7 @@ func TestCopyHashedLargeFile(t *testing.T) {
 	src := writeBytes(t, dir, "big.bin", pattern(200000))
 	dst := filepath.Join(dir, "big-out.bin")
 
-	sum, err := CopyHashed(src, dst)
+	sum, err := CopyHashed(t.Context(), src, dst)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +73,7 @@ func TestCopyFileRefusesToOverwrite(t *testing.T) {
 	src := writeSourceFile(t, dir, "src.jpg", "new content")
 	dst := writeSourceFile(t, dir, "dst.jpg", "existing content")
 
-	_, err := CopyHashed(src, dst)
+	_, err := CopyHashed(t.Context(), src, dst)
 	if err == nil {
 		t.Fatal("CopyHashed overwrote an existing file")
 	}
@@ -99,7 +103,7 @@ func TestCopyHashedStalePartial(t *testing.T) {
 	dst := filepath.Join(dir, "out.jpg")
 	partial := writeSourceFile(t, dir, "out.jpg"+PartialSuffix, "stale")
 
-	_, err := CopyHashed(src, dst)
+	_, err := CopyHashed(t.Context(), src, dst)
 	if !errors.Is(err, fs.ErrExist) {
 		t.Fatalf("err = %v, want one wrapping fs.ErrExist", err)
 	}
@@ -124,7 +128,7 @@ func TestCopyHashedMissingSource(t *testing.T) {
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "out.jpg")
 
-	_, err := CopyHashed(filepath.Join(dir, "missing.jpg"), dst)
+	_, err := CopyHashed(t.Context(), filepath.Join(dir, "missing.jpg"), dst)
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("err = %v, want one wrapping fs.ErrNotExist", err)
 	}
@@ -140,7 +144,7 @@ func TestCopyHashedMissingDestDir(t *testing.T) {
 	src := writeSourceFile(t, dir, "src.jpg", "x")
 	dst := filepath.Join(dir, "nope", "out.jpg")
 
-	if _, err := CopyHashed(src, dst); err == nil {
+	if _, err := CopyHashed(t.Context(), src, dst); err == nil {
 		t.Fatal("expected an error for a missing destination directory")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "nope")); !errors.Is(err, fs.ErrNotExist) {
@@ -156,7 +160,7 @@ func TestCopyHashedSourceIsDirectory(t *testing.T) {
 	}
 	dst := filepath.Join(dir, "out.jpg")
 
-	if _, err := CopyHashed(src, dst); err == nil {
+	if _, err := CopyHashed(t.Context(), src, dst); err == nil {
 		t.Fatal("expected an error for a directory source")
 	}
 	if _, err := os.Stat(dst + PartialSuffix); !errors.Is(err, fs.ErrNotExist) {
@@ -215,5 +219,190 @@ func TestRemovePartialJoinsRemovalFailure(t *testing.T) {
 	var pe *fs.PathError
 	if !errors.As(err, &pe) || pe.Path != partial {
 		t.Errorf("err %v does not wrap the removal failure for %s", err, partial)
+	}
+}
+
+// fakeSource stands in for the opened card file.
+type fakeSource struct {
+	r        io.Reader
+	info     fs.FileInfo
+	closeErr error
+	onClose  func()
+	closed   bool
+}
+
+func (f *fakeSource) Read(p []byte) (int, error) { return f.r.Read(p) }
+func (f *fakeSource) Stat() (fs.FileInfo, error) { return f.info, nil }
+func (f *fakeSource) Close() error {
+	f.closed = true
+	if f.onClose != nil {
+		f.onClose()
+	}
+	return f.closeErr
+}
+
+type readFunc func([]byte) (int, error)
+
+func (f readFunc) Read(p []byte) (int, error) { return f(p) }
+
+// fakeOpen serves f, with src's real FileInfo (so ModTime and IsRegular work).
+func fakeOpen(t *testing.T, src string, f *fakeSource) func(string) (sourceFile, error) {
+	t.Helper()
+	info, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.info = info
+	return func(string) (sourceFile, error) { return f, nil }
+}
+
+func assertAbsent(t *testing.T, paths ...string) {
+	t.Helper()
+	for _, p := range paths {
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s exists: %v", p, err)
+		}
+	}
+}
+
+func TestCopyHashedCloseErrorLeavesNoDst(t *testing.T) {
+	dir := t.TempDir()
+	src := writeSourceFile(t, dir, "src.jpg", "content")
+	dst := filepath.Join(dir, "out.jpg")
+	boom := errors.New("close failed")
+	f := &fakeSource{r: strings.NewReader("content"), closeErr: boom}
+
+	_, err := copyHashed(t.Context(), src, dst, fakeOpen(t, src, f))
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want %v", err, boom)
+	}
+	assertAbsent(t, dst, dst+PartialSuffix)
+}
+
+func TestCopyHashedClosesSourceBeforeRename(t *testing.T) {
+	dir := t.TempDir()
+	src := writeSourceFile(t, dir, "src.jpg", "content")
+	dst := filepath.Join(dir, "out.jpg")
+	f := &fakeSource{r: strings.NewReader("content")}
+	f.onClose = func() {
+		if _, err := os.Stat(dst); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("dst existed when the source was closed: %v", err)
+		}
+		if _, err := os.Stat(dst + PartialSuffix); err != nil {
+			t.Errorf("partial should exist when the source is closed: %v", err)
+		}
+	}
+
+	sum, err := copyHashed(t.Context(), src, dst, fakeOpen(t, src, f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256([]byte("content"))
+	if sum != hex.EncodeToString(want[:]) || !f.closed {
+		t.Errorf("sum = %s, closed = %v", sum, f.closed)
+	}
+	if data, err := os.ReadFile(dst); err != nil || string(data) != "content" {
+		t.Errorf("dst = %q, %v", data, err)
+	}
+}
+
+func TestCopyHashedCanceledBeforeStart(t *testing.T) {
+	dir := t.TempDir()
+	src := writeSourceFile(t, dir, "src.jpg", "content")
+	dst := filepath.Join(dir, "out.jpg")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	opened := 0
+	open := func(string) (sourceFile, error) { opened++; return nil, errors.New("must not open") }
+
+	_, err := copyHashed(ctx, src, dst, open)
+	if !errors.Is(err, context.Canceled) || opened != 0 {
+		t.Fatalf("err = %v, opened = %d; want context.Canceled and no open", err, opened)
+	}
+	assertAbsent(t, dst, dst+PartialSuffix)
+}
+
+// Review Focus 4: SIGTERM during a long copy.
+func TestCopyHashedCanceledMidCopy(t *testing.T) {
+	dir := t.TempDir()
+	data := pattern(1 << 20)
+	src := writeBytes(t, dir, "src.MP4", data)
+	dst := filepath.Join(dir, "out.MP4")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	off, reads := 0, 0
+	f := &fakeSource{r: readFunc(func(p []byte) (int, error) {
+		reads++
+		if reads == 2 {
+			cancel() // SIGTERM arrives while the second chunk is being read
+		}
+		n := copy(p, data[off:])
+		off += n
+		if n == 0 {
+			return 0, io.EOF
+		}
+		return n, nil
+	})}
+
+	_, err := copyHashed(ctx, src, dst, fakeOpen(t, src, f))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if reads != 2 || !f.closed {
+		t.Errorf("reads = %d (want 2: no read after the cancel), closed = %v", reads, f.closed)
+	}
+	assertAbsent(t, dst, dst+PartialSuffix)
+}
+
+func TestClassifyCopyError(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, dir string) (ctx context.Context, src, dst string)
+		want  CopyFailure
+	}{
+		{"source missing", func(t *testing.T, dir string) (context.Context, string, string) {
+			return t.Context(), filepath.Join(dir, "missing.jpg"), filepath.Join(dir, "out.jpg")
+		}, CopyFailSourceMissing},
+		{"dest dir missing", func(t *testing.T, dir string) (context.Context, string, string) {
+			return t.Context(), writeSourceFile(t, dir, "src.jpg", "x"), filepath.Join(dir, "nope", "out.jpg")
+		}, CopyFailDestDirMissing},
+		{"dest taken", func(t *testing.T, dir string) (context.Context, string, string) {
+			return t.Context(), writeSourceFile(t, dir, "src.jpg", "x"), writeSourceFile(t, dir, "out.jpg", "old")
+		}, CopyFailDestTaken},
+		{"stale partial", func(t *testing.T, dir string) (context.Context, string, string) {
+			writeSourceFile(t, dir, "out.jpg"+PartialSuffix, "old")
+			return t.Context(), writeSourceFile(t, dir, "src.jpg", "x"), filepath.Join(dir, "out.jpg")
+		}, CopyFailStalePartial},
+		{"canceled", func(t *testing.T, dir string) (context.Context, string, string) {
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			return ctx, writeSourceFile(t, dir, "src.jpg", "x"), filepath.Join(dir, "out.jpg")
+		}, CopyFailCanceled},
+		{"source is a directory", func(t *testing.T, dir string) (context.Context, string, string) {
+			sub := filepath.Join(dir, "srcdir")
+			if err := os.Mkdir(sub, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			return t.Context(), sub, filepath.Join(dir, "out.jpg")
+		}, CopyFailOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, src, dst := tc.setup(t, t.TempDir())
+			_, err := CopyHashed(ctx, src, dst)
+			if err == nil {
+				t.Fatal("CopyHashed succeeded, want an error")
+			}
+			if got := ClassifyCopyError(err, src, dst); got != tc.want {
+				t.Errorf("ClassifyCopyError(%v) = %d, want %d", err, got, tc.want)
+			}
+		})
+	}
+	if got := ClassifyCopyError(errors.New("x"), "s", "d"); got != CopyFailOther {
+		t.Errorf("plain error = %d, want CopyFailOther", got)
+	}
+	joined := errors.Join(fmt.Errorf("wrapped: %w", context.DeadlineExceeded))
+	if got := ClassifyCopyError(joined, "s", "d"); got != CopyFailCanceled {
+		t.Errorf("joined deadline = %d, want CopyFailCanceled", got)
 	}
 }

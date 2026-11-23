@@ -29,7 +29,7 @@ func importOne(t *testing.T, path, destBase string) {
 	if duplicate {
 		return // identical file already imported
 	}
-	if _, err := CopyHashed(path, dst); err != nil {
+	if _, err := CopyHashed(t.Context(), path, dst); err != nil {
 		t.Fatalf("CopyHashed(%s): %v", path, err)
 	}
 }
@@ -162,7 +162,7 @@ func TestImportFixtureCard(t *testing.T) {
 		if err != nil || dup {
 			t.Fatalf("FreeName: dup=%v err=%v", dup, err)
 		}
-		got, err := CopyHashed(path, dst)
+		got, err := CopyHashed(t.Context(), path, dst)
 		if err != nil {
 			t.Fatal(err)
 		}

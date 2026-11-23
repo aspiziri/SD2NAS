@@ -1,6 +1,7 @@
 package media
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -21,6 +22,11 @@ const PartialSuffix = ".partial"
 // never overwrites an existing dst and removes its partial on any failure.
 // The parent directory must exist.
 //
+// ctx is checked before starting and before every read, so a cancelled copy
+// stops within one read; the error then wraps ctx.Err(). The source is
+// closed before the partial is renamed into place, so whenever CopyHashed
+// returns an error, dst was not created.
+//
 // Two failures wrap fs.ErrExist, so errors.Is(err, fs.ErrExist) holds for
 // both:
 //   - dst exists (checked before copying and again before the rename). The
@@ -29,38 +35,113 @@ const PartialSuffix = ".partial"
 //     It is not CopyHashed's, so it is left in place. The error is the
 //     *fs.PathError from creating it, whose Path ends in PartialSuffix.
 //
-// To tell them apart, use errors.As with a *fs.PathError and check
-// strings.HasSuffix(pathErr.Path, PartialSuffix).
-func CopyHashed(src, dst string) (_ string, err error) {
+// ClassifyCopyError tells these apart, and also a missing source from a
+// missing destination folder (both wrap fs.ErrNotExist).
+func CopyHashed(ctx context.Context, src, dst string) (string, error) {
+	return copyHashed(ctx, src, dst, openSource)
+}
+
+// sourceFile is the part of *os.File CopyHashed uses; tests substitute it.
+type sourceFile interface {
+	io.Reader
+	Stat() (fs.FileInfo, error)
+	Close() error
+}
+
+// openSource must not return a typed-nil *os.File inside the interface.
+func openSource(name string) (sourceFile, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+func copyHashed(ctx context.Context, src, dst string, open func(string) (sourceFile, error)) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := mustNotExist(dst); err != nil {
 		return "", err
 	}
-	in, err := os.Open(src)
+	in, err := open(src)
 	if err != nil {
 		return "", err
 	}
-	defer func() {
-		if cerr := in.Close(); cerr != nil {
-			err = errors.Join(err, cerr)
-		}
-	}()
 	info, err := in.Stat()
-	if err != nil {
-		return "", err
+	if err == nil && !info.Mode().IsRegular() {
+		err = fmt.Errorf("copy %s: not a regular file", src)
 	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("copy %s: not a regular file", src)
+	if err != nil {
+		return "", errors.Join(err, in.Close())
 	}
 	partial := dst + PartialSuffix
-	sum, err := copyToPartial(in, partial)
-	if err != nil {
-		return "", err
+	sum, err := copyToPartial(ctxReader{ctx, in}, partial)
+	// Close the card file before the partial becomes dst: nothing may fail
+	// after the rename, so that any error means no dst.
+	if cerr := in.Close(); cerr != nil {
+		if err == nil { // the partial is complete and ours: remove it
+			return "", removePartial(partial, cerr)
+		}
+		err = errors.Join(err, cerr)
 	}
-	// The partial exists and is ours: remove it on any later failure.
+	if err != nil {
+		return "", err // copyToPartial already removed its own partial
+	}
 	if err := finishPartial(partial, dst, info.ModTime()); err != nil {
 		return "", removePartial(partial, err)
 	}
 	return sum, nil
+}
+
+// ctxReader stops a copy at the next read once ctx is done. It has no
+// WriteTo, so io.Copy reads through it chunk by chunk.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// CopyFailure says why CopyHashed failed, so a caller can choose to retry.
+type CopyFailure int
+
+const (
+	CopyFailOther          CopyFailure = iota // anything else (I/O error, source not a regular file, ...)
+	CopyFailCanceled                          // ctx was cancelled or timed out
+	CopyFailSourceMissing                     // src does not exist (card pulled, file gone)
+	CopyFailDestDirMissing                    // dst's directory does not exist
+	CopyFailDestTaken                         // dst already exists
+	CopyFailStalePartial                      // dst+PartialSuffix already exists, left by an earlier copy
+)
+
+// ClassifyCopyError classifies a non-nil error returned by CopyHashed(ctx, src, dst).
+func ClassifyCopyError(err error, src, dst string) CopyFailure {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return CopyFailCanceled
+	}
+	var pathErr *fs.PathError
+	hasPath := errors.As(err, &pathErr)
+	switch {
+	case errors.Is(err, fs.ErrExist):
+		if hasPath && pathErr.Path == dst+PartialSuffix {
+			return CopyFailStalePartial
+		}
+		return CopyFailDestTaken
+	case errors.Is(err, fs.ErrNotExist) && hasPath:
+		switch pathErr.Path {
+		case src:
+			return CopyFailSourceMissing
+		case dst + PartialSuffix:
+			return CopyFailDestDirMissing
+		}
+	}
+	return CopyFailOther
 }
 
 // removePartial removes the partial file CopyHashed created, after err
