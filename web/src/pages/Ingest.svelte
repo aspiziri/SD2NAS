@@ -111,7 +111,7 @@
                 <td class="num" style="color:var(--ok)">{formatCount(i.counts.new)}</td>
                 <td class="num">{formatCount(i.counts.in_archive + i.counts.in_staging)}</td>
                 <td class="num">{formatCount(i.counts.seen_before)}</td>
-                <td><span class="pill {statusClass(i)}" title={i.message}>{statusLabel(i.status)}</span></td>
+                <td><span class="pill {statusClass(i)}" title={i.message}>{statusLabel(i.status)}</span>{#if i.forgotten_at}<span class="pill" title="Forgotten {formatWhen(i.forgotten_at)}">Forgotten</span>{/if}</td>
               </tr>
             {/each}
           </tbody>
@@ -121,7 +121,7 @@
         {#each ingests as i (i.id)}
           <li>
             <a href="/ingest/{i.id}">
-              <span class="row"><b>{cardName(i)}</b><span class="spacer"></span><span class="pill {statusClass(i)}">{statusLabel(i.status)}</span></span>
+              <span class="row"><b>{cardName(i)}</b><span class="spacer"></span><span class="pill {statusClass(i)}">{statusLabel(i.status)}</span>{#if i.forgotten_at}<span class="pill" title="Forgotten {formatWhen(i.forgotten_at)}">Forgotten</span>{/if}</span>
               <span class="muted small">{formatWhen(i.started_at)} · {formatCount(i.counts.new)} new · {formatCount(knownCount(i.counts))} known</span>
             </a>
           </li>

@@ -5,11 +5,67 @@
   import { isId } from '../lib/paths.js';
   import { cardName, formatWhen, formatBytes, formatCount, levelClass, groupKnown, outcomeFiles } from '../lib/format.js';
   import LiveIngest from '../components/LiveIngest.svelte';
+  import { navigate } from '../lib/router.svelte.js';
+  import { describeError, plural } from '../lib/messages.js';
+  import { toast } from '../lib/toast.svelte.js';
+  import Dialog from '../components/Dialog.svelte';
 
   let { id } = $props();
   let ingest = $state(null);
   let error = $state('');
   const MAX = 200; // longest file list shown
+
+  let forget = $state(null); // GET /api/ingest/{id}/forget, for finished imports
+  let dialog = $state(''); // '' | 'forget' | 'reimport'
+  let busy = $state(false);
+  let dialogError = $state('');
+  let deleteFiles = $state(false); // Decision 10: starts unticked
+
+  // What forgetting would do; fetched after every successful load of a
+  // finished import. A failure only hides the two actions: the page itself
+  // already shows API trouble.
+  async function loadForget() {
+    try {
+      forget = await api(`/api/ingest/${id}/forget`);
+    } catch (err) {
+      forget = null;
+      console.warn('could not load what forgetting this import would do', err);
+    }
+  }
+
+  const importing = $derived(live.current.running !== null || live.current.queued.length > 0);
+
+  async function run(fn) {
+    busy = true;
+    dialogError = '';
+    try {
+      await fn();
+      dialog = '';
+    } catch (err) {
+      dialogError = describeError(err);
+    } finally {
+      busy = false;
+      load();
+    }
+  }
+
+  function doForget() {
+    run(async () => {
+      const res = await api(`/api/ingest/${id}/forget`, { method: 'POST', body: { deleteFiles } });
+      const r = res.result;
+      toast(deleteFiles
+        ? `Forgot this import and deleted ${plural(r.deleted_files, 'file', 'files')} from staging. The card imports them again next time.`
+        : `Forgot this import. Its files stay in staging untracked until the next import or rescan.`, 'ok', 7000);
+    });
+  }
+
+  function doReimport() {
+    run(async () => {
+      const res = await api(`/api/ingest/${id}/reimport-culled`, { method: 'POST' });
+      toast(res.message, res.forgotten ? 'ok' : 'warn', 7000);
+      if (res.started) navigate('/ingest');
+    });
+  }
 
   let ctl = null; // the in-flight request; starting another aborts it
 
@@ -25,6 +81,7 @@
       const data = await api(`/api/ingests/${id}`, { signal: mine.signal });
       ingest = data;
       error = '';
+      if (data.status !== 'queued' && data.status !== 'running') loadForget();
     } catch (err) {
       if (err.name === 'AbortError') return;
       error = err.status === 503 ? `Ingest is unavailable: ${err.message}` : err.message;
@@ -85,6 +142,7 @@
   {@const c = ingest.counts}
   {#if error}<div class="note bad" role="alert">Couldn't refresh this import: {error}</div>{/if}
   <h1>{cardName(ingest)}</h1>
+  {#if ingest.forgotten_at}<span class="pill">Forgotten {formatWhen(ingest.forgotten_at)}</span>{/if}
   <p class="sub">
     {formatWhen(ingest.started_at)} · <span class="mono">{ingest.card_path}</span>{#if ingest.card_size} · {formatBytes(ingest.card_size)} of photos and videos{/if}
   </p>
@@ -114,6 +172,10 @@
     <details>
       <summary>{formatCount(seenBefore.length)} files were imported before but are no longer kept</summary>
       <p class="muted small" style="margin:8px 0">They were culled or discarded after an earlier import, so they're skipped and deleted shots don't come back.</p>
+      {#if forget?.reimportable}
+        <button class="btn" disabled={importing} onclick={() => { dialogError = ''; dialog = 'reimport'; }}>Re-import these anyway</button>
+        {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
+      {/if}
       {@render fileList(seenBefore, pathRow)}
     </details>
   {/if}
@@ -136,3 +198,50 @@
     </details>
   {/if}
 {/if}
+
+{#if ingest}
+  {#if forget && !forget.forgotten}
+    <div class="card forget">
+      <h2>Forget this import</h2>
+      <p class="muted small" style="margin:0 0 10px">SD2NAS forgets the files this import brought in or skipped as culled, so inserting the same card imports them again (to retest a card, say). Files already in the archive stay known, and the import stays in this history.</p>
+      <button class="btn danger" disabled={importing} onclick={() => { dialogError = ''; deleteFiles = false; dialog = 'forget'; }}>Forget this import…</button>
+      {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
+    </div>
+  {/if}
+{/if}
+
+<Dialog open={dialog === 'forget'} title="Forget this import?" onclose={() => !busy && (dialog = '')} {busy} danger>
+  {#if forget}
+    <ul class="muted list">
+      <li>{plural(forget.staged, 'file', 'files')} still in staging ({formatBytes(forget.staged_bytes)})</li>
+      <li>{plural(forget.culled, 'culled file', 'culled files')}</li>
+      <li>{plural(forget.archived, 'file', 'files')} already in the archive stay known</li>
+    </ul>
+    {#if forget.staged}
+      <label class="toggle"><input type="checkbox" bind:checked={deleteFiles} /> <span>Also delete the {plural(forget.staged, 'file', 'files')} still in staging</span></label>
+    {/if}
+    <div class="note warn">{deleteFiles
+      ? 'The files are deleted from staging and SD2NAS forgets them. The next time this card goes in, they are imported again as new.'
+      : 'SD2NAS forgets these files. Their copies stay in staging, untracked, until the next import of this card or a rescan picks them up again.'}</div>
+  {/if}
+  {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
+  {#snippet actions()}
+    <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
+    <button class="btn bad" onclick={doForget} disabled={busy}>{busy ? 'Forgetting…' : deleteFiles ? `Forget and delete ${plural(forget?.staged ?? 0, 'file', 'files')}` : 'Forget'}</button>
+  {/snippet}
+</Dialog>
+
+<Dialog open={dialog === 'reimport'} title="Re-import {plural(forget?.reimportable ?? 0, 'file', 'files')}?" onclose={() => !busy && (dialog = '')} {busy}>
+  <p class="muted">SD2NAS forgets that you culled {forget?.reimportable === 1 ? 'this file' : 'these files'}. If the card is still inserted they are imported right away; otherwise they come back the next time it goes in.</p>
+  {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
+  {#snippet actions()}
+    <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
+    <button class="btn primary" onclick={doReimport} disabled={busy}>{busy ? 'Working…' : 'Re-import'}</button>
+  {/snippet}
+</Dialog>
+
+<style>
+  .list { margin: 0 0 10px; padding-left: 18px; }
+  .toggle { display: flex; gap: 10px; align-items: center; min-height: 44px; cursor: pointer; }
+  .forget { margin-top: 16px; }
+</style>
