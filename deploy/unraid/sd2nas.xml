@@ -13,7 +13,7 @@
   <Overview>Imports SD cards into a staging folder as soon as they are inserted, skips anything already imported or archived, and serves a phone-friendly web UI for merging, renaming, culling and promoting staging folders into the archive.&#xD;
 &#xD;
 Before the first start, create the appdata folder owned by nobody:users:&#xD;
-mkdir -p /mnt/cache/appdata/sd2nas &amp;&amp; chown 99:100 /mnt/cache/appdata/sd2nas&#xD;
+mkdir -p /mnt/user/appdata/sd2nas &amp;&amp; chown 99:100 /mnt/user/appdata/sd2nas&#xD;
 &#xD;
 After starting, open /healthz to check the time zone, user and mounts.</Overview>
   <Category>MediaApp:Photos Tools:</Category>
@@ -28,7 +28,7 @@ After starting, open /healthz to check the time zone, user and mounts.</Overview
   <Config Name="Web UI port" Target="8080" Default="8080" Mode="tcp" Description="Port for the web UI and the card script" Type="Port" Display="always" Required="true" Mask="false">8080</Config>
   <Config Name="Cards" Target="/cards" Default="/mnt/disks" Mode="rw,slave" Description="Where Unassigned Devices mounts cards. Must be RW/Slave so cards inserted after the container starts are visible. SD2NAS never writes to cards." Type="Path" Display="always" Required="true" Mask="false">/mnt/disks</Config>
   <Config Name="Photos share" Target="/photos" Default="/mnt/user/photos" Mode="rw" Description="The photos share. Contains Archive/; SD2NAS creates Staging/ and Management/SD2NAS/ next to it." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/photos</Config>
-  <Config Name="Appdata" Target="/config" Default="/mnt/cache/appdata/sd2nas" Mode="rw" Description="Database and thumbnail cache. Use the cache path directly, not /mnt/user, to avoid SQLite locking problems." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/sd2nas</Config>
+  <Config Name="Appdata" Target="/config" Default="/mnt/user/appdata/sd2nas" Mode="rw" Description="Database and thumbnail cache. appdata must be an exclusive share (or use the pool path, e.g. /mnt/poolname/appdata/sd2nas) so SQLite bypasses the FUSE share layer." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/sd2nas</Config>
   <Config Name="UMASK" Target="UMASK" Default="000" Mode="" Description="000 keeps imported files editable over SMB" Type="Variable" Display="advanced" Required="false" Mask="false">000</Config>
   <Config Name="Token" Target="SD2NAS_TOKEN" Default="" Mode="" Description="Optional. When set, the web UI and the card script must send this token." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
 </Container>

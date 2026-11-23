@@ -71,7 +71,7 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
 |---|---|---|---|
 | `/cards` | `/mnt/disks` | RW/Slave, used read-only | Cards mounted by Unassigned Devices. Slave propagation is required so cards mounted after the container starts are visible. |
 | `/photos` | `/mnt/user/photos` | RW | The `photos` share (array only, no cache). Contains `Archive/` (existing), `Staging/` (created by SD2NAS) and `Management/SD2NAS/` for catalog backups. |
-| `/config` | `/mnt/cache/appdata/sd2nas` | RW | SQLite database, thumbnail and preview cache, settings, on the cache SSD for fast browsing. Use the cache path directly, not `/mnt/user`, to avoid SQLite locking problems on Unraid's share filesystem. |
+| `/config` | `/mnt/user/appdata/sd2nas` | RW | SQLite database, thumbnail and preview cache, settings, on the ZFS pool for fast browsing. `appdata` is an exclusive share, so `/mnt/user/appdata` goes straight to the pool and skips Unraid's FUSE share layer, which SQLite's WAL locking doesn't work well on. Without an exclusive share, use the pool path (`/mnt/<pool>/appdata`). |
 
 The container runs as `99:100` (nobody:users) with `UMASK=000` so files stay
 editable over SMB, and must have `TZ` set (§13).
@@ -594,7 +594,7 @@ about 280 MB uncompressed, mostly ffmpeg and its libraries. Exposes 8080, runs a
   container automatically, so the template doesn't set it; `/healthz` shows the
   value and warns if it's missing.
 - The appdata folder must be owned by `99:100` before the first start
-  (`mkdir -p /mnt/cache/appdata/sd2nas && chown 99:100 …`), or `/healthz`
+  (`mkdir -p /mnt/user/appdata/sd2nas && chown 99:100 …`), or `/healthz`
   reports `/config` as not writable.
 - Install by adding the repo's `deploy/unraid` URL under Docker → Template
   repositories, or by pasting the values into Add Container. Updates show up in
@@ -613,7 +613,7 @@ about 280 MB uncompressed, mostly ffmpeg and its libraries. Exposes 8080, runs a
 | Topic | Decision |
 |---|---|
 | Archive layout | One flat list of `YYYY-MM-DD - Title` folders, about 150k photos. Each is a Capture One session with CameraImport's layout inside. Promote pattern defaults to `{name}`. |
-| Storage | Everything on the array in the `photos` share (dual parity, no cache): `/mnt/user/photos/Archive` and `/mnt/user/photos/Staging`. Only the database and thumbnail cache live on the cache SSD. No safety copy. |
+| Storage | Everything on the array in the `photos` share (dual parity, no cache): `/mnt/user/photos/Archive` and `/mnt/user/photos/Staging`. Only the database and thumbnail cache live in `appdata` on the ZFS pool. No safety copy. |
 | Capture One | Sessions are created by hand after promoting; SD2NAS ignores them for now |
 | Day cutoff | Setting `day_starts_at`, default 04:00 |
 | Clock errors | Automatic warnings for certain cases and GPS mismatches in v1; manual shift tool in M7 |
