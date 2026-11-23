@@ -652,3 +652,30 @@ func TestValidSHA(t *testing.T) {
 		}
 	}
 }
+
+func TestRemove(t *testing.T) {
+	c := newCache(t, Config{})
+	src := Source{shaN(7), writeJPEGSource(t, 1200, 800, 0), media.KindImage}
+	var paths []string
+	for _, size := range []int{ThumbSize, PreviewSize} {
+		p, err := c.Get(context.Background(), src, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	if err := c.Remove(src.SHA256); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s still there (stat err %v)", p, err)
+		}
+	}
+	if err := c.Remove(src.SHA256); err != nil {
+		t.Errorf("second Remove: %v", err)
+	}
+	if err := c.Remove("xyz"); !errors.Is(err, ErrBadSHA) {
+		t.Errorf("Remove(xyz) = %v, want ErrBadSHA", err)
+	}
+}

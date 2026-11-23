@@ -164,6 +164,22 @@ func (c *Cache) path(sha string, size int) string {
 	return filepath.Join(c.cfg.Dir, sha[:2], fmt.Sprintf("%s-%d.jpg", sha, size))
 }
 
+// Remove deletes sha's cached thumbnail and preview (a culled or forgotten
+// file, Decision 12). A render still running for sha may write its file
+// afterwards; that one stays until the cache is cleared.
+func (c *Cache) Remove(sha string) error {
+	if !ValidSHA(sha) {
+		return ErrBadSHA
+	}
+	var errs []error
+	for _, size := range []int{ThumbSize, PreviewSize} {
+		if err := os.Remove(c.path(sha, size)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // Get returns the path of src's cached JPEG at size, rendering it first
 // when needed. Concurrent calls for the same file and size share one
 // render, which is cancelled only once every caller has gone. At most
