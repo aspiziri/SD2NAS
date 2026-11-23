@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
@@ -33,6 +35,28 @@ func writeText(w http.ResponseWriter, code int, level, msg string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	_, _ = fmt.Fprintf(w, "%s\n%s\n", level, msg) // the client hung up
+}
+
+// wantsText reports whether the client asked for the card script's two-line
+// replies (?format=text).
+func wantsText(r *http.Request) bool { return r.URL.Query().Get("format") == "text" }
+
+// writeFail answers a request that failed before an ingest could report on
+// it: the two lines "alert" and msg (control characters replaced by spaces)
+// when r asked for ?format=text, else a JSON error. Either way with code, so
+// curl -f fails and the card stays mounted.
+func writeFail(w http.ResponseWriter, r *http.Request, code int, msg string) {
+	if wantsText(r) {
+		line := strings.TrimSpace(strings.Map(func(c rune) rune {
+			if unicode.IsControl(c) {
+				return ' '
+			}
+			return c
+		}, msg))
+		writeText(w, code, ingest.LevelAlert, line)
+		return
+	}
+	writeError(w, code, msg)
 }
 
 type ingestHandlers struct {
@@ -79,6 +103,19 @@ func (h *ingestHandlers) respond(w http.ResponseWriter, code int, job *ingest.Jo
 }
 
 func (h *ingestHandlers) post(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	text := wantsText(r)
+	wait := false
+	if q.Has("wait") {
+		switch v := q.Get("wait"); v {
+		case "1", "true":
+			wait = true
+		case "0", "false":
+		default:
+			writeFail(w, r, http.StatusBadRequest, fmt.Sprintf("wait must be 1, true, 0 or false, not %q", v))
+			return
+		}
+	}
 	var body struct {
 		Path  string `json:"path"`
 		Label string `json:"label"`
@@ -87,28 +124,26 @@ func (h *ingestHandlers) post(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "bad request body: "+err.Error())
+		writeFail(w, r, http.StatusBadRequest, "bad request body: "+err.Error())
 		return
 	}
 	if body.Path == "" {
-		writeError(w, http.StatusBadRequest, "path is required")
+		writeFail(w, r, http.StatusBadRequest, "path is required")
 		return
 	}
 	job, err := h.m.Submit(r.Context(), ingest.Request{Path: body.Path, Label: body.Label, UUID: body.UUID})
 	switch {
 	case errors.Is(err, ingest.ErrBadCardPath):
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeFail(w, r, http.StatusBadRequest, err.Error())
 		return
 	case errors.Is(err, ingest.ErrQueueFull), errors.Is(err, ingest.ErrClosed):
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeFail(w, r, http.StatusServiceUnavailable, err.Error())
 		return
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeFail(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	q := r.URL.Query()
-	text := q.Get("format") == "text"
-	if v := q.Get("wait"); v != "1" && v != "true" {
+	if !wait {
 		h.respond(w, http.StatusAccepted, job, text)
 		return
 	}
