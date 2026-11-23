@@ -512,7 +512,9 @@ unmount or notify through Unraid.
 - A container with `/mnt/disks:/cards:rw,slave` sees cards mounted after it
   starts and sees them disappear on unmount.
 - `notify` shows in the Unraid UI. Phone delivery needs a notification agent
-  with **Agents** ticked for each level in Settings → Notification Settings.
+  with **Agents** ticked for each level in Settings → Notification Settings,
+  including **Notices**: successful imports are sent at the `normal` level and
+  are silently dropped if only Warnings and Alerts reach the phone.
 
 ---
 
@@ -627,7 +629,7 @@ is what "done" means.
 ### M0: Skeleton and hardware check
 - [x] Card reader tested with Unassigned Devices: insert-triggered with the reader left plugged in (results in §11)
 - [x] Unassigned Devices passes `ACTION`, `DEVICE`, `LABEL`, `SERIAL`, `MOUNTPOINT`; `SERIAL` belongs to the reader, so cards are identified by filesystem UUID
-- [ ] Phone notifications: configure an Unraid notification agent
+- [x] Phone notifications: Unraid notification agent configured, with Agents ticked for Notices as well (successful imports are sent as `normal`)
 - [ ] Go module, `cmd/sd2nas` serving "hello" and `/healthz`
 - [ ] Dockerfile builds; image runs locally
 - [ ] CI and release workflows publish `ghcr.io/aspiziri/sd2nas:edge`
