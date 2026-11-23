@@ -395,3 +395,69 @@ func TestRunMissingCard(t *testing.T) {
 		t.Errorf("ingest = %+v", out)
 	}
 }
+
+func TestKnownOutcomeRefusesUnknownState(t *testing.T) {
+	for state, want := range map[catalog.AssetState]catalog.Outcome{
+		catalog.StateArchived: catalog.OutcomeInArchive,
+		catalog.StateStaged:   catalog.OutcomeInStaging,
+		catalog.StateCulled:   catalog.OutcomeSeenBefore,
+		catalog.StateMissing:  catalog.OutcomeSeenBefore,
+	} {
+		if got, err := knownOutcome(state); err != nil || got != want {
+			t.Errorf("knownOutcome(%q) = %q, %v; want %q", state, got, err, want)
+		}
+		if _, err := stateRank(state); err != nil {
+			t.Errorf("stateRank(%q): %v", state, err)
+		}
+	}
+	if o, err := knownOutcome("bogus"); err == nil || o != "" || !strings.Contains(err.Error(), `"bogus"`) {
+		t.Errorf("knownOutcome(bogus) = %q, %v; want an error naming the state", o, err)
+	}
+	if _, err := stateRank("bogus"); err == nil {
+		t.Error("stateRank(bogus) succeeded")
+	}
+	f := newFile{CardFile: CardFile{Rel: "x.JPG", Size: 1}, fp: "ab"}
+	if _, err := knownRow(f, catalog.Asset{State: "bogus"}); err == nil {
+		t.Error("knownRow accepted an unknown state")
+	}
+}
+
+func TestRelRefusesPathOutsidePhotosRoot(t *testing.T) {
+	e := newEnv(t)
+	j := &ingestRun{r: e.r}
+	if got, err := j.rel(filepath.Join(e.photos, "Staging", "a b.JPG")); err != nil || got != "Staging/a b.JPG" {
+		t.Errorf("rel inside = %q, %v", got, err)
+	}
+	for _, dst := range []string{filepath.Join(e.photos, "..", "elsewhere.JPG"), filepath.Dir(e.photos)} {
+		if got, err := j.rel(dst); err == nil {
+			t.Errorf("rel(%s) = %q, want an error", dst, got)
+		}
+	}
+}
+
+// A failed clock-warning write must not hide the error that failed the run.
+func TestFinishKeepsPipelineErrorWhenWarningsFail(t *testing.T) {
+	e := newEnv(t)
+	bad := []catalog.ClockWarning{{CardPath: "a.JPG", SHA256: "not hex", Kind: catalog.ClockFuture}}
+	for name, tc := range map[string]struct{ errText, want string }{
+		"earlier error": {"scan card: boom", "scan card: boom; record clock warnings: "},
+		"no error":      {"", "record clock warnings: "},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// A fresh row per case: finish can only run once per ingest.
+			in, err := e.cat.CreateIngest(t.Context(), e.cards, "card", "1234-ABCD", testNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			j := &ingestRun{r: e.r, ctx: t.Context(), dbctx: t.Context(), id: in.ID, p: NewProgress(),
+				log: e.r.log(), warnings: bad}
+			out, err := j.finish(catalog.StatusDone, tc.errText)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.Status != catalog.StatusFailed || !strings.HasPrefix(out.Error, tc.want) || out.SafeToFormat {
+				t.Errorf("ingest = %+v, want failed with error starting %q", out, tc.want)
+			}
+		})
+	}
+}

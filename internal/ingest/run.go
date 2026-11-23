@@ -256,27 +256,33 @@ func (j *ingestRun) classifyAll(files []CardFile) []classified {
 }
 
 // stateRank orders asset states for a fingerprint matching several assets
-// (Decision 8): archived, staged, culled, missing.
-func stateRank(s catalog.AssetState) int {
+// (Decision 8): archived, staged, culled, missing. An unknown state has no rank.
+func stateRank(s catalog.AssetState) (int, error) {
 	switch s {
 	case catalog.StateArchived:
-		return 0
+		return 0, nil
 	case catalog.StateStaged:
-		return 1
+		return 1, nil
 	case catalog.StateCulled:
-		return 2
+		return 2, nil
+	case catalog.StateMissing:
+		return 3, nil
 	}
-	return 3
+	return 0, fmt.Errorf("catalog asset has unknown state %q", s)
 }
 
-func knownOutcome(s catalog.AssetState) catalog.Outcome {
+// knownOutcome maps an asset state to the outcome of a card file matching it
+// (Decision 8). An unknown state is an error, never a safe outcome.
+func knownOutcome(s catalog.AssetState) (catalog.Outcome, error) {
 	switch s {
 	case catalog.StateArchived:
-		return catalog.OutcomeInArchive
+		return catalog.OutcomeInArchive, nil
 	case catalog.StateStaged:
-		return catalog.OutcomeInStaging
+		return catalog.OutcomeInStaging, nil
+	case catalog.StateCulled, catalog.StateMissing:
+		return catalog.OutcomeSeenBefore, nil
 	}
-	return catalog.OutcomeSeenBefore
+	return "", fmt.Errorf("catalog asset has unknown state %q", s)
 }
 
 func (j *ingestRun) classifyOne(f CardFile) classified {
@@ -287,7 +293,11 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 		return c
 	}
 	known := func(a catalog.Asset) classified {
-		c.outcome, c.sha = knownOutcome(a.State), a.SHA256
+		o, err := knownOutcome(a.State)
+		if err != nil {
+			return fail(err)
+		}
+		c.outcome, c.sha = o, a.SHA256
 		return c
 	}
 	fp, err := r.fingerprint(f.Path)
@@ -304,10 +314,14 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 		return c
 	}
 	if j.settings.VerifyKnown != catalog.VerifyFull {
-		best := matches[0]
-		for _, a := range matches[1:] {
-			if stateRank(a.State) < stateRank(best.State) {
-				best = a
+		best, bestRank := matches[0], 0
+		for i, a := range matches {
+			rank, err := stateRank(a.State)
+			if err != nil {
+				return fail(err)
+			}
+			if i == 0 || rank < bestRank {
+				best, bestRank = a, rank
 			}
 		}
 		return known(best)
@@ -409,26 +423,30 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 	if err != nil {
 		return fail(err)
 	}
+	rel, err := j.rel(dst)
+	if err != nil {
+		return fail(fmt.Errorf("copied but cannot record it: %w", err))
+	}
 	if dup {
-		return j.recordExisting(f, dst)
+		return j.recordExisting(f, dst, rel)
 	}
 	j.copyBytes += f.Size
 	if err := media.SyncDir(filepath.Dir(dst)); err != nil {
-		return fail(fmt.Errorf("copied to %s but could not sync its folder: %w", j.rel(dst), err))
+		return fail(fmt.Errorf("copied to %s but could not sync its folder: %w", rel, err))
 	}
 	existing, err := j.cat().AssetBySHA(j.dbctx, sum)
 	switch {
 	case err == nil:
-		return j.dropCopy(f, dst, existing) // fingerprint collision or alias (§6)
+		return j.dropCopy(f, dst, rel, existing) // fingerprint collision or alias (§6)
 	case !errors.Is(err, catalog.ErrNotFound):
-		return fail(fmt.Errorf("copied to %s but the catalog lookup failed: %w", j.rel(dst), err))
+		return fail(fmt.Errorf("copied to %s but the catalog lookup failed: %w", rel, err))
 	}
 	info, err := os.Stat(dst)
 	if err != nil {
-		return fail(fmt.Errorf("copied to %s but could not stat it: %w", j.rel(dst), err))
+		return fail(fmt.Errorf("copied to %s but could not stat it: %w", rel, err))
 	}
 	a := catalog.Asset{SHA256: sum, Size: f.Size, Kind: f.Kind, CaptureTime: c.Time, TZOffset: c.Offset,
-		State: catalog.StateStaged, RelPath: j.rel(dst), Mtime: info.ModTime().UnixNano(), UpdatedAt: j.now}
+		State: catalog.StateStaged, RelPath: rel, Mtime: info.ModTime().UnixNano(), UpdatedAt: j.now}
 	row := catalog.IngestFile{CardPath: f.Rel, Size: f.Size, QuickFP: f.fp, SHA256: sum, Outcome: catalog.OutcomeNew, RelPath: a.RelPath}
 	if f.Kind == media.KindVideo && meta == nil {
 		row.Error = "named without video metadata: " + c.Fallback.Error() // imported, but not silently (Decision 25)
@@ -447,13 +465,17 @@ func failedRow(f newFile, err error) catalog.IngestFile {
 	return catalog.IngestFile{CardPath: f.Rel, Size: f.Size, QuickFP: f.fp, Outcome: catalog.OutcomeFailed, Error: err.Error()}
 }
 
-// rel is dst as a slash path relative to the photos root.
-func (j *ingestRun) rel(dst string) string {
+// rel is dst as a slash path relative to the photos root; it is an error
+// when dst is not below that root.
+func (j *ingestRun) rel(dst string) (string, error) {
 	rel, err := filepath.Rel(j.r.cfg.PhotosRoot, dst)
 	if err != nil {
-		return filepath.ToSlash(dst)
+		return "", fmt.Errorf("%s is not under the photos root: %w", dst, err)
 	}
-	return filepath.ToSlash(rel)
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s is not under the photos root %s", dst, j.r.cfg.PhotosRoot)
+	}
+	return filepath.ToSlash(rel), nil
 }
 
 // copyNew copies f into dir under name (or a free variant of it).
@@ -466,12 +488,16 @@ func (j *ingestRun) copyNew(f newFile, dir, name string) (dst, sum string, dup b
 	return dst, sum, false, err
 }
 
-func knownRow(f newFile, a catalog.Asset) catalog.IngestFile {
-	return catalog.IngestFile{CardPath: f.Rel, Size: f.Size, QuickFP: f.fp, SHA256: a.SHA256, Outcome: knownOutcome(a.State)}
+func knownRow(f newFile, a catalog.Asset) (catalog.IngestFile, error) {
+	o, err := knownOutcome(a.State)
+	if err != nil {
+		return catalog.IngestFile{}, err
+	}
+	return catalog.IngestFile{CardPath: f.Rel, Size: f.Size, QuickFP: f.fp, SHA256: a.SHA256, Outcome: o}, nil
 }
 
 // recordExisting handles a file whose identical content is already at dst.
-func (j *ingestRun) recordExisting(f newFile, dst string) fileResult {
+func (j *ingestRun) recordExisting(f newFile, dst, rel string) fileResult {
 	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
 	sum, err := j.r.hashFile(f.Path)
 	if err != nil {
@@ -483,33 +509,45 @@ func (j *ingestRun) recordExisting(f newFile, dst string) fileResult {
 		if err := j.cat().AddFingerprint(j.dbctx, f.fp, a.SHA256); err != nil {
 			return fail(fmt.Errorf("record fingerprint: %w", err))
 		}
-		return fileResult{row: knownRow(f, a)}
+		return j.knownResult(f, a)
 	case errors.Is(err, catalog.ErrNotFound):
-		return fail(fmt.Errorf("identical file already at %s but not in the catalog", j.rel(dst)))
+		return fail(fmt.Errorf("identical file already at %s but not in the catalog", rel))
 	}
 	return fail(fmt.Errorf("catalog lookup: %w", err))
 }
 
 // dropCopy deletes the fresh copy at dst, whose content the catalog already has as a.
-func (j *ingestRun) dropCopy(f newFile, dst string, a catalog.Asset) fileResult {
+func (j *ingestRun) dropCopy(f newFile, dst, rel string, a catalog.Asset) fileResult {
 	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
 	if err := os.Remove(dst); err != nil {
-		return fail(fmt.Errorf("duplicate copy %s could not be removed: %w", j.rel(dst), err))
+		return fail(fmt.Errorf("duplicate copy %s could not be removed: %w", rel, err))
 	}
 	if err := media.SyncDir(filepath.Dir(dst)); err != nil {
-		return fail(fmt.Errorf("duplicate copy %s removed but its folder could not be synced: %w", j.rel(dst), err))
+		return fail(fmt.Errorf("duplicate copy %s removed but its folder could not be synced: %w", rel, err))
 	}
 	if err := j.cat().AddFingerprint(j.dbctx, f.fp, a.SHA256); err != nil {
 		return fail(fmt.Errorf("record fingerprint: %w", err))
 	}
-	return fileResult{row: knownRow(f, a)}
+	return j.knownResult(f, a)
+}
+
+func (j *ingestRun) knownResult(f newFile, a catalog.Asset) fileResult {
+	row, err := knownRow(f, a)
+	if err != nil {
+		return fileResult{row: failedRow(f, err)}
+	}
+	return fileResult{row: row}
 }
 
 func (j *ingestRun) finish(status catalog.IngestStatus, errText string) (catalog.Ingest, error) {
 	j.p.update(func(s *ProgressSnapshot) { s.Phase = PhaseFinishing })
 	if len(j.warnings) > 0 {
 		if err := j.cat().AddClockWarnings(j.dbctx, j.id, j.warnings); err != nil {
-			status, errText = catalog.StatusFailed, "record clock warnings: "+err.Error()
+			msg := "record clock warnings: " + err.Error()
+			if errText != "" {
+				msg = errText + "; " + msg
+			}
+			status, errText = catalog.StatusFailed, msg
 		}
 	}
 	c := j.counts
