@@ -31,6 +31,8 @@ type Server struct {
 	mounts   []Mount
 	writable map[string]PathInfo // startup write probes, keyed by mount name
 	mux      *http.ServeMux
+	handler  http.Handler // mux behind the request guard
+	problems []string     // permanent /healthz problems added after startup
 }
 
 // New builds the server and probes writable mounts once. Probing on every
@@ -50,10 +52,15 @@ func New(version string, mounts []Mount) *Server {
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /{$}", s.handleIndex)
+	s.handler = guard(s.mux)
 	return s
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
+
+// AddProblem adds a permanent /healthz problem (for example, the catalog
+// failed to open). Call it before serving.
+func (s *Server) AddProblem(p string) { s.problems = append(s.problems, p) }
 
 // WriteProblems lists mounts that failed the startup write probe, for logging.
 func (s *Server) WriteProblems() []string {
@@ -90,6 +97,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		GID:     os.Getgid(),
 		Paths:   map[string]PathInfo{},
 	}
+	h.Problems = append(h.Problems, s.problems...)
 	if h.TZ == "" {
 		h.Warnings = append(h.Warnings, "TZ is not set: video and file times will be read as UTC")
 	}

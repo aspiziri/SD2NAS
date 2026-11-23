@@ -651,17 +651,32 @@ modified time with `ErrExifUnsupported`. Reading CR3's `CMT1`/`CMT2` boxes is
 left for later.
 
 ### M2: Catalog and ingest (headless)
-- [ ] Schema and migrations; catalog tests on a temp database
-- [ ] Ingest job against a folder of fixtures: new, known, seen before, failed
-- [ ] Space check and `safe_to_format` logic
-- [ ] Clock checks (future date, reset default, GPS mismatch)
-- [ ] `POST /api/ingest?wait=1` returns the summary
-- [ ] Re-running on the same folder imports 0 files
-- [ ] Before copying, clean up stale `*.partial` files left by a crash or a pulled card (`CopyHashed` refuses to overwrite them)
-- [ ] After `CopyHashed`, fsync the destination folder on Linux before counting the file toward "safe to format"
-- [ ] `CopyHashed` closes the source explicitly before the final rename, so any error means no destination file was created
-- [ ] Tell a missing destination folder from a missing card file (both wrap `fs.ErrNotExist`; check `PathError.Path`) and a taken name from a stale partial (both wrap `fs.ErrExist`)
+- [x] Schema and migrations; catalog tests on a temp database
+- [x] Ingest job against a folder of fixtures: new, known, seen before, failed
+- [x] Space check and `safe_to_format` logic
+- [x] Clock checks (future date, reset default, GPS mismatch)
+- [x] `POST /api/ingest?wait=1` returns the summary
+- [x] Re-running on the same folder imports 0 files
+- [x] Before copying, clean up stale `*.partial` files left by a crash or a pulled card (`CopyHashed` refuses to overwrite them)
+- [x] After `CopyHashed`, fsync the destination folder on Linux before counting the file toward "safe to format"
+- [x] `CopyHashed` closes the source explicitly before the final rename, so any error means no destination file was created
+- [x] Tell a missing destination folder from a missing card file (both wrap `fs.ErrNotExist`; check `PathError.Path`) and a taken name from a stale partial (both wrap `fs.ErrExist`)
 - [ ] Measure RAW ingest on the NAS: EXIF reading and the copy each read the whole file from the card
+
+Implementation plan: `docs/plans/m2-catalog-ingest.md`. The schema in
+`internal/catalog/schema.go` is authoritative; it extends §6 with a `queued`
+ingest status, `ingests.card_path`/`unsupported`/`clock_warnings` columns, an
+`unsupported` file outcome and a `clock_warnings` table. A card is safe to
+format only when the import finished, nothing failed, no file was in a format
+SD2NAS doesn't import (e.g. `.HIF`), and at least one photo or video was found.
+Refused, failed and cancelled imports answer `?wait=1` with a non-2xx status, so
+the card stays mounted; M6's script should use `curl --fail-with-body` so the
+reason reaches the notification. **To measure RAW ingest:** insert a card holding
+at least 50 RAW files not yet imported, then read the `ingest finished` line in
+the container log: `capture` is the time spent reading capture times, `copy` the
+time spent copying, `copy_bytes` the bytes copied. Record the numbers here and
+tick the item. If `capture` is more than a quarter of `copy`, reading EXIF from
+the staged copy instead of the card is the follow-up.
 
 ### M3: Web UI, read-only
 - [ ] Svelte app embedded; request guard on all changing endpoints

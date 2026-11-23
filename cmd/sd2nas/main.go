@@ -6,15 +6,19 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/api"
+	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/config"
+	"github.com/aspiziri/SD2NAS/internal/ingest"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -41,6 +45,15 @@ func run(log *slog.Logger) error {
 			return err
 		}
 	}
+	// Absolute paths, so the request path the card script sends and the
+	// logged paths agree.
+	for _, p := range []*string{&cfg.Cards, &cfg.Photos, &cfg.Data} {
+		abs, err := filepath.Abs(*p)
+		if err != nil {
+			return err
+		}
+		*p = abs
+	}
 	log.Info("starting sd2nas", "version", version, "addr", cfg.Addr,
 		"cards", cfg.Cards, "photos", cfg.Photos, "config", cfg.Data,
 		"tz", os.Getenv("TZ"), "uid", os.Getuid(), "gid", os.Getgid())
@@ -55,25 +68,68 @@ func run(log *slog.Logger) error {
 		log.Error("directory is not usable", "detail", p)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var mgr *ingest.Manager
+	db, err := catalog.Open(filepath.Join(cfg.Data, "sd2nas.db"))
+	if err != nil {
+		// Keep serving so /healthz can explain; without the routes the card
+		// script's request fails and the card stays mounted.
+		log.Error("catalog unavailable; ingest is disabled", "err", err)
+		srv.AddProblem("catalog: " + err.Error())
+	} else {
+		defer func() {
+			if err := db.Close(); err != nil {
+				log.Error("closing catalog", "err", err)
+			}
+		}()
+		mgr = ingest.NewManager(ingest.NewRunner(ingest.Config{Catalog: db, PhotosRoot: cfg.Photos, Log: log}), cfg.Cards)
+		if err := mgr.Recover(ctx); err != nil {
+			log.Error("startup recovery failed", "err", err)
+			srv.AddProblem("startup recovery: " + err.Error())
+		}
+		mgr.Start()
+		srv.MountIngest(mgr, db, api.DefaultMaxWait)
+	}
+
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           srv,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.ListenAndServe() }()
 
 	select {
 	case err := <-errc:
+		if mgr != nil {
+			// The server never ran, so no handler waits on a job.
+			closeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			err = errors.Join(err, wrap("stopping ingest", mgr.Close(closeCtx)))
+		}
 		return err
 	case <-ctx.Done():
 	}
 	log.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// One budget inside Docker's default 10 s stop timeout. The manager goes
+	// first: it cancels the running copy so ?wait=1 handlers return before
+	// the HTTP server waits for them. It is nil when the catalog failed to open.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	return httpSrv.Shutdown(shutdownCtx)
+	var mgrErr error
+	if mgr != nil {
+		mgrErr = wrap("stopping ingest", mgr.Close(shutdownCtx))
+	}
+	return errors.Join(mgrErr, wrap("stopping http server", httpSrv.Shutdown(shutdownCtx)))
+}
+
+// wrap adds what was being stopped to err; a nil err stays nil.
+func wrap(what string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }

@@ -103,8 +103,23 @@ func TestIndexAndUnknownPaths(t *testing.T) {
 		t.Errorf("unknown path: %d", rec.Code)
 	}
 	rec := httptest.NewRecorder()
-	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/healthz", nil))
+	req := httptest.NewRequest(http.MethodPost, "/healthz", nil)
+	req.Header.Set("X-SD2NAS", "1") // pass the request guard to reach the router
+	s.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST /healthz: %d", rec.Code)
+	}
+}
+
+func TestHealthzReportsAddedProblem(t *testing.T) {
+	s := New("test", nil)
+	s.AddProblem("catalog: boom")
+	rec := get(t, s, "/healthz")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", rec.Code)
+	}
+	h := decode(t, rec)
+	if h.Status != "degraded" || len(h.Problems) != 1 || h.Problems[0] != "catalog: boom" {
+		t.Errorf("health: %+v", h)
 	}
 }
