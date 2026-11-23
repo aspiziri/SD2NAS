@@ -165,3 +165,45 @@ func TestCopyToPartialRemovesPartialOnReadError(t *testing.T) {
 		t.Errorf("partial left behind after a failed copy: %v", err)
 	}
 }
+
+func TestFinishPartialRefusesToOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	partial := writeSourceFile(t, dir, "out.jpg"+PartialSuffix, "partial content")
+	dst := writeSourceFile(t, dir, "out.jpg", "existing")
+
+	err := finishPartial(partial, dst, fixedMtime)
+	if !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("err = %v, want one wrapping fs.ErrExist", err)
+	}
+	data, err2 := os.ReadFile(dst)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if string(data) != "existing" {
+		t.Errorf("dst was modified: %q", data)
+	}
+	if _, err := os.Stat(partial); err != nil {
+		t.Errorf("partial should remain for the caller to remove: %v", err)
+	}
+}
+
+func TestRemovePartialJoinsRemovalFailure(t *testing.T) {
+	// A non-empty directory cannot be removed with os.Remove on any OS.
+	partial := filepath.Join(t.TempDir(), "x.jpg"+PartialSuffix)
+	if err := os.Mkdir(partial, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(partial, "child"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := errors.New("original failure")
+
+	err := removePartial(partial, orig)
+	if !errors.Is(err, orig) {
+		t.Errorf("err %v does not wrap the original error", err)
+	}
+	var pe *fs.PathError
+	if !errors.As(err, &pe) || pe.Path != partial {
+		t.Errorf("err %v does not wrap the removal failure for %s", err, partial)
+	}
+}
