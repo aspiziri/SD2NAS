@@ -24,6 +24,24 @@ func (e *opsEnv) lockFree(t *testing.T, ids ...int64) {
 	release()
 }
 
+// nameKeyFree fails unless the lock of directory name Staging/<name> can be taken.
+func (e *opsEnv) nameKeyFree(t *testing.T, name string) {
+	t.Helper()
+	release, err := e.locks.TryLockSet(HolderRescan, LockSet{Names: []string{Dir + "/" + name}})
+	if err != nil {
+		t.Fatalf("the name lock of %q is still held: %v", name, err)
+	}
+	release()
+}
+
+// bumped fails unless the version went up since v.
+func (e *opsEnv) bumped(t *testing.T, v uint64) {
+	t.Helper()
+	if e.version() <= v {
+		t.Errorf("version = %d, did not go up from %d", e.version(), v)
+	}
+}
+
 func (e *opsEnv) exists(rel string) bool {
 	_, err := os.Lstat(filepath.Join(e.photos, filepath.FromSlash(rel)))
 	return err == nil
@@ -73,15 +91,15 @@ func TestRenameKeepsDatePrefix(t *testing.T) {
 	if p := e.relPath(t, s2); p != "Staging/2025-05-30 - Trip/Capture/a.ARW" {
 		t.Errorf("a.ARW rel_path = %q", p)
 	}
-	if e.version() <= v {
-		t.Error("version did not go up")
-	}
+	e.bumped(t, v)
 	e.lockFree(t, f.ID)
+	e.nameKeyFree(t, got.Name)
 }
 
 func TestRenameEmptyTitleKeepsDate(t *testing.T) {
 	e := newOpsEnv(t)
 	f := e.folder(t, "2025-05-30 - Trip", "2025-05-30")
+	v := e.version()
 	got, err := e.svc.Rename(t.Context(), f.ID, "")
 	if err != nil {
 		t.Fatal(err)
@@ -91,12 +109,15 @@ func TestRenameEmptyTitleKeepsDate(t *testing.T) {
 	}
 	e.mustExist(t, "Staging/2025-05-30")
 	e.mustNotExist(t, "Staging/2025-05-30 - Trip")
+	e.bumped(t, v)
 	e.lockFree(t, f.ID)
+	e.nameKeyFree(t, "2025-05-30")
 }
 
 func TestRenameNoDatePrefix(t *testing.T) {
 	e := newOpsEnv(t)
 	f := e.folder(t, "Holiday", "2025-06-01")
+	v := e.version()
 	got, err := e.svc.Rename(t.Context(), f.ID, "Beach")
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +125,9 @@ func TestRenameNoDatePrefix(t *testing.T) {
 	if got.Name != "2025-06-01 - Beach" {
 		t.Fatalf("name = %q", got.Name)
 	}
+	e.bumped(t, v)
 	g := e.folder(t, "Holiday")
+	v = e.version()
 	got, err = e.svc.Rename(t.Context(), g.ID, "Beach")
 	if err != nil {
 		t.Fatal(err)
@@ -112,8 +135,9 @@ func TestRenameNoDatePrefix(t *testing.T) {
 	if got.Name != "Beach" {
 		t.Fatalf("name = %q", got.Name)
 	}
+	e.bumped(t, v)
 	h := e.folder(t, "Other")
-	v := e.version()
+	v = e.version()
 	if _, err := e.svc.Rename(t.Context(), h.ID, ""); !errors.Is(err, ErrBadTitle) {
 		t.Fatalf("undated, untitled: err = %v, want ErrBadTitle", err)
 	}
@@ -122,6 +146,8 @@ func TestRenameNoDatePrefix(t *testing.T) {
 	}
 	e.mustExist(t, "Staging/Other")
 	e.lockFree(t, f.ID, g.ID, h.ID)
+	e.nameKeyFree(t, "2025-06-01 - Beach")
+	e.nameKeyFree(t, "Beach")
 }
 
 func TestRenameNameTaken(t *testing.T) {
@@ -182,7 +208,6 @@ func TestRenameBusy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer release()
 	v := e.version()
 	_, err = e.svc.Rename(t.Context(), f.ID, "Trip")
 	var busy *BusyError
@@ -193,6 +218,9 @@ func TestRenameBusy(t *testing.T) {
 	if e.version() != v {
 		t.Error("a failed rename bumped the version")
 	}
+	e.nameKeyFree(t, "2025-05-30 - Trip")
+	release()
+	e.lockFree(t, f.ID)
 }
 
 func TestRenameMissingDir(t *testing.T) {
@@ -201,6 +229,7 @@ func TestRenameMissingDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	v := e.version()
 	got, err := e.svc.Rename(t.Context(), f.ID, "Trip")
 	if err != nil {
 		t.Fatal(err)
@@ -209,16 +238,21 @@ func TestRenameMissingDir(t *testing.T) {
 		t.Fatalf("name = %q", got.Name)
 	}
 	e.mustNotExist(t, "Staging/2025-05-30", "Staging/2025-05-30 - Trip")
+	e.bumped(t, v)
 	e.lockFree(t, f.ID)
+	e.nameKeyFree(t, got.Name)
 }
 
 func TestRenameNonASCII(t *testing.T) {
 	e := newOpsEnv(t)
 	f := e.folder(t, "2025-05-30", "2025-05-30")
 	s := e.stage(t, f, "a.JPG", "jpg", opsNow)
+	v := e.version()
 	if _, err := e.svc.Rename(t.Context(), f.ID, "Zürich"); err != nil {
 		t.Fatal(err)
 	}
+	e.bumped(t, v)
+	v = e.version()
 	if p := e.relPath(t, s); p != "Staging/2025-05-30 - Zürich/a.JPG" {
 		t.Fatalf("rel_path = %q", p)
 	}
@@ -231,6 +265,10 @@ func TestRenameNonASCII(t *testing.T) {
 	}
 	e.mustExist(t, "Staging/2025-05-30 - Zug/a.JPG")
 	e.mustNotExist(t, "Staging/2025-05-30 - Zürich")
+	e.bumped(t, v)
+	e.lockFree(t, f.ID)
+	e.nameKeyFree(t, "2025-05-30 - Zürich")
+	e.nameKeyFree(t, "2025-05-30 - Zug")
 }
 
 func TestRenameUnknown(t *testing.T) {
@@ -244,10 +282,12 @@ func TestRenameCaseOnly(t *testing.T) {
 	e := newOpsEnv(t)
 	f := e.folder(t, "2025-05-30 - trip", "2025-05-30")
 	s := e.stage(t, f, "a.JPG", "jpg", opsNow)
+	v := e.version()
 	got, err := e.svc.Rename(t.Context(), f.ID, "Trip")
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.bumped(t, v)
 	if got.Name != "2025-05-30 - Trip" {
 		t.Fatalf("name = %q", got.Name)
 	}
@@ -262,6 +302,7 @@ func TestRenameCaseOnly(t *testing.T) {
 		t.Fatalf("Staging/ holds %v, want only the renamed directory", entries)
 	}
 	e.lockFree(t, f.ID)
+	e.nameKeyFree(t, got.Name)
 }
 
 func TestRenameTakesTheNameKey(t *testing.T) {
@@ -291,11 +332,9 @@ func TestRenameTakesTheNameKey(t *testing.T) {
 	if _, err := e.svc.Rename(t.Context(), f.ID, "Trip"); err != nil {
 		t.Fatalf("after release: %v", err)
 	}
-	release, err := e.locks.TryLockSet(HolderRescan, LockSet{Names: []string{"Staging/2025-05-30 - Trip"}})
-	if err != nil {
-		t.Fatalf("the name key was not released: %v", err)
-	}
-	release()
+	e.bumped(t, v)
+	e.lockFree(t, f.ID, g.ID)
+	e.nameKeyFree(t, "2025-05-30 - Trip")
 }
 
 func TestOperationsAfterClose(t *testing.T) {
@@ -303,6 +342,7 @@ func TestOperationsAfterClose(t *testing.T) {
 	f := e.folder(t, "2025-05-30", "2025-05-30")
 	g := e.folder(t, "2025-05-31", "2025-05-31")
 	e.svc.Close()
+	v := e.version()
 	if _, err := e.svc.Rename(t.Context(), f.ID, "Trip"); !errors.Is(err, ErrClosed) {
 		t.Errorf("Rename: err = %v, want ErrClosed", err)
 	}
@@ -311,6 +351,9 @@ func TestOperationsAfterClose(t *testing.T) {
 	}
 	// Task 6 adds Move, Cull and Discard here.
 	e.mustExist(t, "Staging/2025-05-30", "Staging/2025-05-31")
+	if e.version() != v {
+		t.Error("an operation after Close bumped the version")
+	}
 	e.lockFree(t, f.ID, g.ID)
 }
 
@@ -371,10 +414,9 @@ func TestMergeMovesFilesAndRemovesSources(t *testing.T) {
 			t.Errorf("rel_path = %q, want %q", p, rel)
 		}
 	}
-	if e.version() <= v {
-		t.Error("version did not go up")
-	}
+	e.bumped(t, v)
 	e.lockFree(t, m.a.ID, m.b.ID)
+	e.nameKeyFree(t, got.Name)
 }
 
 func TestMergePicksFolderWithFinalName(t *testing.T) {
@@ -383,6 +425,7 @@ func TestMergePicksFolderWithFinalName(t *testing.T) {
 	f2 := e.folder(t, "2025-05-30 - Dinner", "2025-05-30")
 	s1 := e.stage(t, f1, "a.JPG", "one", opsNow)
 	s2 := e.stage(t, f2, "b.JPG", "two", opsNow)
+	v := e.version()
 	got, err := e.svc.Merge(t.Context(), []int64{f1.ID, f2.ID}, "Dinner")
 	if err != nil {
 		t.Fatal(err)
@@ -397,7 +440,9 @@ func TestMergePicksFolderWithFinalName(t *testing.T) {
 		t.Errorf("rel_path = %q", p)
 	}
 	e.mustNotExist(t, "Staging/2025-05-30")
+	e.bumped(t, v)
 	e.lockFree(t, f1.ID, f2.ID)
+	e.nameKeyFree(t, got.Name)
 }
 
 func TestMergeIdenticalFile(t *testing.T) {
@@ -406,6 +451,7 @@ func TestMergeIdenticalFile(t *testing.T) {
 	b := e.folder(t, "2025-05-31", "2025-05-31")
 	e.write(t, "Staging/2025-05-30/notes.txt", "same")
 	e.write(t, "Staging/2025-05-31/notes.txt", "same")
+	v := e.version()
 	if _, err := e.svc.Merge(t.Context(), []int64{a.ID, b.ID}, "Trip"); err != nil {
 		t.Fatal(err)
 	}
@@ -413,6 +459,9 @@ func TestMergeIdenticalFile(t *testing.T) {
 		t.Fatalf("files = %v", files)
 	}
 	e.mustNotExist(t, "Staging/2025-05-31")
+	e.bumped(t, v)
+	e.lockFree(t, a.ID, b.ID)
+	e.nameKeyFree(t, "2025-05-30 - Trip")
 }
 
 func TestMergeCullsMissingTracked(t *testing.T) {
@@ -424,6 +473,7 @@ func TestMergeCullsMissingTracked(t *testing.T) {
 	if err := os.Remove(filepath.Join(e.photos, Dir, b.Name, "b.JPG")); err != nil {
 		t.Fatal(err)
 	}
+	v := e.version()
 	if _, err := e.svc.Merge(t.Context(), []int64{a.ID, b.ID}, "Trip"); err != nil {
 		t.Fatal(err)
 	}
@@ -434,6 +484,9 @@ func TestMergeCullsMissingTracked(t *testing.T) {
 		t.Fatalf("removed = %v, want [%s]", got, gone)
 	}
 	e.mustNotExist(t, "Staging/2025-05-31")
+	e.bumped(t, v)
+	e.lockFree(t, a.ID, b.ID)
+	e.nameKeyFree(t, "2025-05-30 - Trip")
 }
 
 func TestMergeOldestCreated(t *testing.T) {
@@ -444,6 +497,7 @@ func TestMergeOldestCreated(t *testing.T) {
 	if err := e.db.SetStagingFolderInfo(t.Context(), b.ID, b.Dates, older); err != nil {
 		t.Fatal(err)
 	}
+	v := e.version()
 	got, err := e.svc.Merge(t.Context(), []int64{a.ID, b.ID}, "Trip")
 	if err != nil {
 		t.Fatal(err)
@@ -451,11 +505,21 @@ func TestMergeOldestCreated(t *testing.T) {
 	if !got.CreatedAt.Equal(older) {
 		t.Fatalf("created_at = %v, want %v", got.CreatedAt, older)
 	}
+	e.bumped(t, v)
+	e.lockFree(t, a.ID, b.ID)
+	e.nameKeyFree(t, got.Name)
 }
 
 func TestMergeNeedsTwo(t *testing.T) {
 	e := newOpsEnv(t)
 	a := e.folder(t, "2025-05-30", "2025-05-30")
+	v := e.version()
+	defer func() {
+		if e.version() != v {
+			t.Error("a refused merge bumped the version")
+		}
+		e.lockFree(t, a.ID)
+	}()
 	for _, ids := range [][]int64{{a.ID}, {a.ID, a.ID}, nil} {
 		if _, err := e.svc.Merge(t.Context(), ids, "Trip"); !errors.Is(err, ErrBadRequest) {
 			t.Errorf("ids %v: err = %v, want ErrBadRequest", ids, err)
@@ -482,6 +546,7 @@ func TestMergeNameTaken(t *testing.T) {
 		t.Error("a failed merge bumped the version")
 	}
 	e.lockFree(t, a.ID, b.ID)
+	e.nameKeyFree(t, "2025-05-30 - Trip")
 }
 
 func TestMergeBusy(t *testing.T) {
@@ -494,14 +559,20 @@ func TestMergeBusy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer release()
+	v := e.version()
 	_, err = e.svc.Merge(t.Context(), []int64{a.ID, b.ID}, "Trip")
 	var busy *BusyError
 	if !errors.As(err, &busy) || busy.ID != b.ID || busy.Name != "2025-05-31" || busy.Holder != HolderIngest {
 		t.Fatalf("err = %#v, want an import BusyError naming B", err)
 	}
 	e.mustExist(t, "Staging/2025-05-30/a.JPG", "Staging/2025-05-31/b.JPG")
+	if e.version() != v {
+		t.Error("a failed merge bumped the version")
+	}
 	e.lockFree(t, a.ID)
+	e.nameKeyFree(t, "2025-05-30 - Trip")
+	release()
+	e.lockFree(t, a.ID, b.ID)
 }
 
 func TestMergeKeepsSourceWithSpecialFile(t *testing.T) {
@@ -517,9 +588,11 @@ func TestMergeKeepsSourceWithSpecialFile(t *testing.T) {
 	if err := os.Symlink("b.JPG", link); err != nil {
 		t.Fatal(err)
 	}
+	v := e.version()
 	if _, err := e.svc.Merge(t.Context(), []int64{a.ID, b.ID}, "Trip"); err != nil {
 		t.Fatal(err)
 	}
+	e.bumped(t, v)
 	if p := e.relPath(t, sb); p != "Staging/2025-05-30 - Trip/b.JPG" {
 		t.Errorf("rel_path = %q", p)
 	}
@@ -529,7 +602,8 @@ func TestMergeKeepsSourceWithSpecialFile(t *testing.T) {
 		t.Fatalf("B's row should stay: %v", err)
 	}
 	if len(row.Dates) != 0 {
-		t.Errorf("B's dates = %v, want none", row.Dates)
+		t.Errorf("kept source dates = %v, want none", row.Dates)
 	}
 	e.lockFree(t, a.ID, b.ID)
+	e.nameKeyFree(t, "2025-05-30 - Trip")
 }
