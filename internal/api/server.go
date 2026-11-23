@@ -38,6 +38,7 @@ type Server struct {
 	mux      *http.ServeMux
 	handler  http.Handler // mux behind the request guard
 	problems []string     // permanent /healthz problems added after startup
+	warnings []string     // permanent /healthz warnings added after startup
 
 	log       *slog.Logger // SetLogger; slog.Default() until then
 	hub       *Hub
@@ -119,6 +120,10 @@ func (s *Server) finishedHooks() []func(catalog.Ingest) {
 // failed to open). Call it before serving.
 func (s *Server) AddProblem(p string) { s.problems = append(s.problems, p) }
 
+// AddWarning adds a permanent /healthz warning (healthz stays 200). Call it
+// before serving.
+func (s *Server) AddWarning(w string) { s.warnings = append(s.warnings, w) }
+
 // WriteProblems lists mounts that failed the startup write probe, for logging.
 func (s *Server) WriteProblems() []string {
 	var out []string
@@ -158,6 +163,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if h.TZ == "" {
 		h.Warnings = append(h.Warnings, "TZ is not set: video and file times will be read as UTC")
 	}
+	h.Warnings = append(h.Warnings, s.warnings...)
 	for _, m := range s.mounts {
 		info := PathInfo{Path: m.Path}
 		fi, err := os.Stat(m.Path)

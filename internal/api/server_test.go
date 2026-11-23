@@ -124,3 +124,20 @@ func TestHealthzReportsAddedProblem(t *testing.T) {
 		t.Errorf("health: %+v", h)
 	}
 }
+
+func TestHealthzReportsWarning(t *testing.T) {
+	const warning = "exiftool not found: RAW thumbnails are unavailable"
+	s := New("test", nil)
+	s.AddWarning(warning)
+	rec := get(t, s, "/healthz")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a warning must not degrade healthz: status %d", rec.Code)
+	}
+	var found bool
+	for _, w := range decode(t, rec).Warnings {
+		found = found || w == warning
+	}
+	if !found {
+		t.Errorf("warning missing: %s", rec.Body)
+	}
+}

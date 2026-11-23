@@ -20,6 +20,7 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/config"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
 	"github.com/aspiziri/SD2NAS/internal/staging"
+	"github.com/aspiziri/SD2NAS/internal/thumbs"
 	"github.com/aspiziri/SD2NAS/web"
 )
 
@@ -98,6 +99,17 @@ func run(log *slog.Logger) error {
 		mgr.Start()
 		srv.MountIngest(mgr, db, api.DefaultMaxWait)
 		srv.MountStaging(staging.New(db, cfg.Photos))
+		cache, err := thumbs.New(thumbs.Config{Dir: filepath.Join(cfg.Data, "thumbs"), Log: log})
+		if err != nil {
+			log.Error("thumbnail cache unavailable", "err", err)
+			srv.AddProblem("thumbnails: " + err.Error())
+		} else {
+			for _, w := range cache.MissingTools() {
+				log.Warn(w)
+				srv.AddWarning(w)
+			}
+			srv.MountThumbs(db, cache, cfg.Photos) // srv.Close closes the cache
+		}
 	}
 
 	httpSrv := &http.Server{

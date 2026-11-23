@@ -11,6 +11,7 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/ingest"
 	"github.com/aspiziri/SD2NAS/internal/media/mediatest"
 	"github.com/aspiziri/SD2NAS/internal/staging"
+	"github.com/aspiziri/SD2NAS/internal/thumbs"
 )
 
 // fullServer serves ingest and staging (and, from Task 7, thumbnails) over
@@ -19,6 +20,7 @@ type fullServer struct {
 	s                    *Server
 	card, photos, config string
 	db                   *catalog.DB
+	cache                *thumbs.Cache
 }
 
 func newFullServer(t *testing.T) fullServer {
@@ -48,8 +50,14 @@ func newFullServer(t *testing.T) fullServer {
 		}
 	})
 	s := New("test", nil)
+	s.SetLogger(slog.New(slog.DiscardHandler))
 	s.MountIngest(m, db, time.Minute)
 	s.MountStaging(staging.New(db, photos))
+	cache, err := thumbs.New(thumbs.Config{Dir: filepath.Join(config, "thumbs"), Log: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.MountThumbs(db, cache, photos)
 	t.Cleanup(s.Close)
-	return fullServer{s: s, card: card, photos: photos, config: config, db: db}
+	return fullServer{s: s, card: card, photos: photos, config: config, db: db, cache: cache}
 }
