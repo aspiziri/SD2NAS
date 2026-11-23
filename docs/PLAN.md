@@ -286,7 +286,8 @@ skipped on future ingests. The ingest summary offers "Re-import anyway".
    Information`, `$RECYCLE.BIN`) and dot files. Each remaining regular file is
    **imported** if its extension matches the import rules, **ignored** if its
    extension is on the ignore list of camera sidecars and metadata (`xml bin
-   ctg thm lrv lrf dat ind bdm mpl cpi smi bnp int inp txt`, case-insensitive),
+   ctg thm lrv lrf dat ind bdm mpl cpi smi bnp int inp txt url`, case-insensitive;
+   `url` is GoPro's root `Get_started_with_GoPro.url`),
    and otherwise **unsupported**. Unsupported files (an unknown format such as
    `.360`, `.CRM`, `.MKV` or `.HIF`, or a file with no extension) are recorded,
    named by extension in the summary ("3 files not imported (.360, .mkv)") and

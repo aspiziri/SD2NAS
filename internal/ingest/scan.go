@@ -60,13 +60,14 @@ func unsupportedExts(files []CardFile) []string {
 
 // ignoredExts are camera sidecars and metadata that hold no photo or video
 // (Sony XML/BIN/IND/BNP/INT/INP/DAT/SMI, AVCHD BDM/MPL/CPI, Canon CTG,
-// GoPro THM/LRV, DJI LRF, text files). Every other regular file the rules
-// don't import is unsupported and blocks "safe to format" (Decision 10), so
-// an unknown format is never lost by formatting. Lowercase, no dot.
+// GoPro THM/LRV and the root Get_started_with_GoPro.url, DJI LRF, text
+// files). Every other regular file the rules don't import is unsupported and
+// blocks "safe to format" (Decision 10), so an unknown format is never lost
+// by formatting. Lowercase, no dot.
 var ignoredExts = map[string]bool{
 	"xml": true, "bin": true, "ctg": true, "thm": true, "lrv": true, "lrf": true,
 	"dat": true, "ind": true, "bdm": true, "mpl": true, "cpi": true, "smi": true,
-	"bnp": true, "int": true, "inp": true, "txt": true,
+	"bnp": true, "int": true, "inp": true, "txt": true, "url": true,
 }
 
 // junkDirNames are directories (matched case-insensitively) that never hold

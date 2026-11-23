@@ -61,6 +61,7 @@ func TestScanSkipsJunk(t *testing.T) {
 		"AVF_INFO/AVIN0001.INT",
 		"AVF_INFO/PRV00001.DAT",
 		"DCIM/100MSDCF/C0001.SMI",
+		"Get_started_with_GoPro.url",
 		"notes.txt",
 	}
 	junk := []string{

@@ -376,6 +376,7 @@ func TestRunSidecarsStillSafe(t *testing.T) {
 	for _, rel := range []string{
 		"PRIVATE/M4ROOT/MEDIAPRO.XML", "PRIVATE/M4ROOT/STATUS.BIN", "PRIVATE/M4ROOT/CLIP/C0001M01.XML",
 		"PRIVATE/SONY/SONYCARD.IND", "AVF_INFO/AVIN0001.BNP", "DCIM/100GOPRO/GL010001.LRV", "DCIM/100GOPRO/GX010001.THM",
+		"Get_started_with_GoPro.url",
 	} {
 		writeFile(t, card, rel, []byte("x"))
 	}
