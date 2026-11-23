@@ -3,8 +3,8 @@
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY go.mod ./
-# go.sum appears once there are dependencies (M1); copy it then and run go mod download here.
+COPY go.mod go.sum ./
+RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 ARG VERSION=dev
