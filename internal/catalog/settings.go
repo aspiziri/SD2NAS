@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -87,14 +88,12 @@ func (d *DB) Settings(ctx context.Context) (Settings, error) {
 	for rows.Next() {
 		var k, v string
 		if err := rows.Scan(&k, &v); err != nil {
-			rows.Close()
-			return s, fmt.Errorf("read settings: %w", err)
+			return s, errors.Join(fmt.Errorf("read settings: %w", err), rows.Close())
 		}
 		kv[k] = v
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
-		return s, fmt.Errorf("read settings: %w", err)
+		return s, errors.Join(fmt.Errorf("read settings: %w", err), rows.Close())
 	}
 	if err := rows.Close(); err != nil {
 		return s, fmt.Errorf("read settings: %w", err)
