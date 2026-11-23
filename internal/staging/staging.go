@@ -216,12 +216,17 @@ type Folder struct {
 	LastCapture   string     `json:"last_capture,omitempty"`
 	Samples       []Sample   `json:"samples"`
 	ClockWarnings int        `json:"clock_warnings"` // files with at least one clock warning
+	AgeDays       int        `json:"age_days"`       // whole days since created_at
+	Stale         bool       `json:"stale"`          // AgeDays >= staging_warn_days (and that setting isn't 0)
 	Warnings      []string   `json:"warnings"`
 }
 
 type Listing struct {
-	Folders   []Folder `json:"folders"`   // ordered by name
-	Untracked []string `json:"untracked"` // directories in Staging/ with no catalog row (M4 adopts them)
+	Version        uint64   `json:"version"`          // Status().Version read before the listing was built
+	StaleAfterDays int      `json:"stale_after_days"` // the setting; 0 = off
+	Stale          int      `json:"stale"`            // how many folders are stale
+	Folders        []Folder `json:"folders"`          // ordered by name
+	Untracked      []string `json:"untracked"`        // directories in Staging/ with no catalog row (M4 adopts them)
 }
 
 type File struct {
@@ -236,8 +241,9 @@ type File struct {
 }
 
 type FolderFiles struct {
-	Folder Folder `json:"folder"`
-	Files  []File `json:"files"`
+	Version uint64 `json:"version"`
+	Folder  Folder `json:"folder"`
+	Files   []File `json:"files"`
 }
 
 var nameRE = regexp.MustCompile(`^([0-9]{4}-[0-9]{2}-[0-9]{2})(?: - (.+))?$`)
@@ -264,9 +270,28 @@ func KindName(k media.Kind) string {
 	return string(k)
 }
 
+// ageRule flags folders that have sat in staging too long (§3, Decision 13).
+type ageRule struct {
+	now      time.Time
+	warnDays int // 0 = never
+}
+
+func (s *Service) ageRule(ctx context.Context) (ageRule, error) {
+	set, err := s.db.Settings(ctx)
+	if err != nil {
+		return ageRule{}, err
+	}
+	return ageRule{now: s.now(), warnDays: set.StagingWarnDays}, nil
+}
+
 // List returns every staging folder with its summary, plus the directories
 // on disk the catalog does not know.
 func (s *Service) List(ctx context.Context) (Listing, error) {
+	version := s.Status().Version
+	age, err := s.ageRule(ctx)
+	if err != nil {
+		return Listing{}, err
+	}
 	rows, err := s.db.StagingFolders(ctx)
 	if err != nil {
 		return Listing{}, err
@@ -294,11 +319,15 @@ func (s *Service) List(ctx context.Context) (Listing, error) {
 		byFolder[name] = append(byFolder[name], a)
 	}
 	warned := warnedFiles(ws)
-	out := Listing{Folders: []Folder{}, Untracked: []string{}}
+	out := Listing{Version: version, StaleAfterDays: age.warnDays, Folders: []Folder{}, Untracked: []string{}}
 	known := map[string]bool{}
 	for _, row := range rows {
 		known[row.Name] = true
-		out.Folders = append(out.Folders, summarize(row, sortFiles(byFolder[row.Name]), warned, onDisk[row.Name]))
+		f := summarize(row, sortFiles(byFolder[row.Name]), warned, onDisk[row.Name], age)
+		if f.Stale {
+			out.Stale++
+		}
+		out.Folders = append(out.Folders, f)
 	}
 	for name := range onDisk {
 		if !known[name] {
@@ -340,7 +369,7 @@ func sortFiles(assets []catalog.Asset) []catalog.Asset {
 	return out
 }
 
-func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[string][]string, onDisk bool) Folder {
+func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[string][]string, onDisk bool, age ageRule) Folder {
 	date, title := SplitName(row.Name)
 	f := Folder{
 		ID: row.ID, Name: row.Name, Date: date, Title: title,
@@ -385,6 +414,11 @@ func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[str
 		f.Warnings = append(f.Warnings, "1 file has a suspicious capture time")
 	case n > 1:
 		f.Warnings = append(f.Warnings, fmt.Sprintf("%d files have a suspicious capture time", n))
+	}
+	f.AgeDays = max(0, int(age.now.Sub(row.CreatedAt)/(24*time.Hour)))
+	if age.warnDays > 0 && f.AgeDays >= age.warnDays {
+		f.Stale = true
+		f.Warnings = append(f.Warnings, fmt.Sprintf("In staging for %d days", f.AgeDays))
 	}
 	return f
 }
@@ -443,6 +477,11 @@ func (s *Service) Files(ctx context.Context, id int64, kind string) (FolderFiles
 	default:
 		return FolderFiles{}, fmt.Errorf("%w, not %q", ErrBadKind, kind)
 	}
+	version := s.Status().Version
+	age, err := s.ageRule(ctx)
+	if err != nil {
+		return FolderFiles{}, err
+	}
 	row, err := s.db.StagingFolderByID(ctx, id)
 	if err != nil {
 		return FolderFiles{}, err
@@ -467,7 +506,7 @@ func (s *Service) Files(ctx context.Context, id int64, kind string) (FolderFiles
 	}
 	sorted := sortFiles(assets)
 	warned := warnedFiles(ws)
-	out := FolderFiles{Folder: summarize(row, sorted, warned, onDisk), Files: []File{}}
+	out := FolderFiles{Version: version, Folder: summarize(row, sorted, warned, onDisk, age), Files: []File{}}
 	for _, a := range sorted {
 		if kind != "" && KindName(a.Kind) != kind {
 			continue

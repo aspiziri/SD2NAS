@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,7 +84,27 @@ func setup(t *testing.T) fixture {
 	if err := os.WriteFile(filepath.Join(photos, Dir, "readme.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return fixture{New(db, photos), db, photos, f1, f2}
+	svc := NewService(Config{DB: db, PhotosRoot: photos, Now: func() time.Time { return now }})
+	t.Cleanup(svc.Close)
+	return fixture{svc, db, photos, f1, f2}
+}
+
+// clockAt is a second service over fx's catalog and folders, reading the
+// clock at when.
+func clockAt(t *testing.T, fx fixture, when time.Time) *Service {
+	t.Helper()
+	svc := NewService(Config{DB: fx.db, PhotosRoot: fx.photos, Now: func() time.Time { return when }})
+	t.Cleanup(svc.Close)
+	return svc
+}
+
+func hasAgeWarning(f Folder) bool {
+	for _, w := range f.Warnings {
+		if strings.HasPrefix(w, "In staging") {
+			return true
+		}
+	}
+	return false
 }
 
 func TestListGroupsByFolder(t *testing.T) {
@@ -242,5 +263,82 @@ func TestKindName(t *testing.T) {
 		if got := KindName(k); got != want {
 			t.Errorf("KindName(%q) = %q, want %q", k, got, want)
 		}
+	}
+}
+
+func TestListAgeWarnings(t *testing.T) {
+	fx := setup(t)
+	ctx := t.Context()
+	old := clockAt(t, fx, now.Add(40*24*time.Hour))
+	l, err := old.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f1 := l.Folders[0]
+	if f1.AgeDays != 40 || !f1.Stale {
+		t.Errorf("f1 age = %d stale = %v, want 40 and true", f1.AgeDays, f1.Stale)
+	}
+	if n := len(f1.Warnings); n == 0 || f1.Warnings[n-1] != "In staging for 40 days" {
+		t.Errorf("warnings = %v, want the last to be the age warning", f1.Warnings)
+	}
+	if l.StaleAfterDays != 30 || l.Stale != 2 {
+		t.Errorf("stale_after_days = %d stale = %d, want 30 and 2", l.StaleAfterDays, l.Stale)
+	}
+
+	young := clockAt(t, fx, now.Add(29*24*time.Hour+23*time.Hour))
+	l, err = young.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f1 := l.Folders[0]; f1.AgeDays != 29 || f1.Stale || hasAgeWarning(f1) {
+		t.Errorf("29 days: %+v", f1)
+	}
+	if l.Stale != 0 {
+		t.Errorf("stale = %d at 29 days, want 0", l.Stale)
+	}
+
+	if err := fx.db.SetSetting(ctx, catalog.KeyStagingWarnDays, "0"); err != nil {
+		t.Fatal(err)
+	}
+	off := clockAt(t, fx, now.Add(40*24*time.Hour))
+	l, err = off.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f1 := l.Folders[0]; f1.AgeDays != 40 || f1.Stale || hasAgeWarning(f1) {
+		t.Errorf("warn off: %+v", f1)
+	}
+	if l.StaleAfterDays != 0 || l.Stale != 0 {
+		t.Errorf("warn off: stale_after_days = %d stale = %d", l.StaleAfterDays, l.Stale)
+	}
+
+	before := clockAt(t, fx, now.Add(-72*time.Hour))
+	l, err = before.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f1 := l.Folders[0]; f1.AgeDays != 0 {
+		t.Errorf("clock before created_at: age = %d, want 0", f1.AgeDays)
+	}
+}
+
+func TestListAndFilesCarryVersion(t *testing.T) {
+	fx := setup(t)
+	ctx := t.Context()
+	fx.svc.Touch()
+	fx.svc.Touch()
+	l, err := fx.svc.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Version != 2 {
+		t.Errorf("listing version = %d, want 2", l.Version)
+	}
+	ff, err := fx.svc.Files(ctx, fx.f1.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ff.Version != 2 {
+		t.Errorf("files version = %d, want 2", ff.Version)
 	}
 }
