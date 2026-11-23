@@ -34,7 +34,7 @@
   svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
   .foot { margin-top: auto; font-size: 12px; color: var(--muted); padding: 10px; line-height: 1.6; }
   @media (max-width: 760px) {
-    .nav { position: fixed; top: auto; left: 0; right: 0; bottom: 0; height: auto; z-index: 10; flex-direction: row; justify-content: space-around; gap: 0; padding: 6px 8px calc(6px + env(safe-area-inset-bottom)); border-right: 0; border-top: 1px solid var(--line); }
+    .nav { position: fixed; top: auto; left: 0; right: 0; bottom: 0; height: auto; z-index: 10; flex-direction: row; justify-content: space-around; gap: 0; padding: 6px calc(8px + env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom)) calc(8px + env(safe-area-inset-left)); border-right: 0; border-top: 1px solid var(--line); }
     .brand, .foot { display: none; }
     .tab { flex: 1; max-width: 160px; flex-direction: column; justify-content: center; gap: 2px; padding: 6px 4px; min-height: 52px; font-size: 11px; position: relative; }
     .label { flex: none; }
