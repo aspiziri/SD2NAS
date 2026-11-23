@@ -1,0 +1,23 @@
+# Runs the real image on a desktop against local test folders.
+#   docker compose -f deploy/docker-compose.dev.yml up --build
+# then open http://localhost:8080. Folders are created under ./tmp at the repo root.
+services:
+  sd2nas:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        VERSION: dev-compose
+    image: sd2nas:dev
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: America/Los_Angeles
+      UMASK: "000"
+    # Docker Desktop bind mounts are writable regardless of uid, so this
+    # matches the Unraid user without any chown on the desktop.
+    user: "99:100"
+    volumes:
+      - ../tmp/cards:/cards:ro
+      - ../tmp/photos:/photos
+      - ../tmp/config:/config

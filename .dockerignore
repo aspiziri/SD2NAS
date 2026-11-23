@@ -1,0 +1,7 @@
+.git
+.github
+docs
+tmp
+web/node_modules
+web/dist
+*.exe
