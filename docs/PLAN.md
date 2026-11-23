@@ -348,6 +348,14 @@ never across user think time.
 | Cull files / discard folder | delete files | `state = culled`, `rel_path = NULL` |
 | Promote | `os.Rename(Staging/X, Archive/<pattern>)`, instant within the share. If the target folder already exists, merge into it file by file with the collision loop. If a rename ever returns `EXDEV`, fall back to copy, verify hash, delete. | `state = archived`, new paths, drop the `staging_folders` row |
 
+**M3 (read-only) lists from the catalog.** Until M4's startup reconcile, a
+staging folder's files are the `staged` assets under `Staging/<name>/` in the
+catalog, not a directory scan (thumbnails and clock warnings need the content
+hash, which only the catalog has). `Staging/` is read only to report
+directories with no catalog row ("untracked") and rows whose directory is
+gone ("Not found on disk"). Files added or removed over SMB therefore don't
+show in the UI until M4's reconcile picks them up.
+
 **Folder naming follows the existing archive:** `YYYY-MM-DD - Title`, e.g.
 `2007-11-10 - SMU Homecoming`. New staging folders start as just `YYYY-MM-DD`.
 The UI's rename asks only for the title, keeps the date prefix, and inserts the
@@ -417,7 +425,7 @@ mockup. Everything else is reversible by doing the opposite operation.
 
 JSON throughout. Server-sent events at `/api/events` push ingest progress,
 staging changes, promote jobs and indexer progress, which replaces
-CameraImport's polling.
+CameraImport's polling. Event types: `ingest.current` and `ingest.finished` (M3); `staging.changed`, `promote.progress` and `indexer.progress` are reserved for M4 and M5.
 
 ```
 POST   /api/ingest                       {path,label,uuid}  ?wait=1 blocks until done
@@ -590,7 +598,8 @@ runs SD2NAS as `PUID:PGID` (default `99:100`) using `su-exec`. It never chowns
 
 **GitHub Actions**
 - `ci.yml`: `go vet`, `go test ./...`, `npm ci && npm run build` on every push
-  and PR.
+  and PR. The Go job installs exiftool and ffmpeg so the thumbnail tests run
+  for real.
 - `release.yml`: on push to `main` publish `ghcr.io/aspiziri/sd2nas:edge`; on a
   `v*` tag publish `:X.Y.Z` and `:latest`. linux/amd64 only. The package is
   public because the repo is. ghcr image names must be lowercase.
@@ -612,7 +621,7 @@ runs SD2NAS as `PUID:PGID` (default `99:100`) using `su-exec`. It never chowns
 
 **Local development**
 - `go run ./cmd/sd2nas --cards ./testdata/cards --photos ./tmp/photos --config ./tmp/config`
-- `npm run dev` in `web/` with a Vite proxy to the Go server
+- `npm run dev` in `web/` proxies `/api` and `/healthz` to the Go server on `:8080`; `npm run build` then `go build` embeds the UI (without a build the binary serves a "web UI not built" page)
 - `deploy/docker-compose.dev.yml` runs the real image on the desktop against
   test folders before deploying
 
@@ -630,7 +639,7 @@ runs SD2NAS as `PUID:PGID` (default `99:100`) using `su-exec`. It never chowns
 | RAW previews | `exiftool` in the image |
 | Video thumbnails | `ffmpeg` in the image |
 | Frontend | Svelte 5 + Vite, single-page app with no SvelteKit. The UI is written from scratch, so there's no reason to start on the older version. |
-| Dependencies | Approved: `modernc.org/sqlite`. Carried over: `goexif`, `go-mp4`, `imaging`. Frontend: `svelte`, `vite`. |
+| Dependencies | Approved: `modernc.org/sqlite`. Carried over: `goexif`, `go-mp4`, `imaging` (with `golang.org/x/image` pinned to v0.36.0 for its TIFF fixes, kept indirect so `go 1.24.0` stays). Frontend: `svelte`, `vite`, and `@sveltejs/vite-plugin-svelte` (approved by the owner for M3). |
 
 No open questions remain. The M0 hardware checks have passed (§11).
 
@@ -690,17 +699,46 @@ tick the item. If `capture` is more than a quarter of `copy`, reading EXIF from
 the staged copy instead of the card is the follow-up.
 
 ### M3: Web UI, read-only
-- [ ] Svelte app embedded; request guard on all changing endpoints
-- [ ] Ingest page with live SSE progress and history
-- [ ] Staging list and folder view with thumbnails, **including RAW and video**
+- [x] Svelte app embedded; request guard on all changing endpoints
+- [x] Ingest page with live SSE progress and history
+- [x] Staging list and folder view with thumbnails, **including RAW and video**
   (exiftool, ffmpeg), since culling RAWs on a phone needs them
-- [ ] Phone layout: bottom tab bar, one-column cards, full-screen preview
-- [ ] PWA manifest and icon (Add to Home Screen)
+- [x] Phone layout: bottom tab bar, one-column cards, full-screen preview
+- [x] PWA manifest and icon (Add to Home Screen)
+- [ ] Check on the phone over Tailscale: Add to Home Screen, iOS safe-area insets in the home-screen app, swipe and back in the preview, a folder with thousands of files
+- [ ] Check RAW thumbnails from real Sony, GoPro and Canon cards (orientation)
+
+Implementation plan: `docs/plans/m3-web-ui.md`. The UI is embedded from
+`web/dist` by package `web`. A committed `web/dist/.placeholder` keeps
+`go build` and `go test` working without npm, and `npm run build` keeps
+it. `/api/events` sends `ingest.current` (the `GET /api/ingest/current`
+body) and `ingest.finished`, plus a snapshot on every connect and a
+keepalive every 25 s. Staging folders are the `staging_folders` rows; their
+files are the `staged` assets under `Staging/<name>/`. Directories in
+`Staging/` without a row are reported as untracked until M4's reconcile
+adopts them. Thumbnails (400 px) and previews (1600 px) are cached under
+`/config/thumbs/<sha[:2]>/<sha>-<size>.jpg` and warmed after each import.
+There is no service worker. A full PWA install needs HTTPS (for example
+`tailscale serve`); over plain `http://tower:8080`, phones add a home-screen
+shortcut.
+
+The UI is responsive: it has to work well on both desktop and phone, so it
+is not a phone-only UI. Images over 120 megapixels are refused from the
+header before decoding (`thumbs.ErrTooLarge`, answered 422 with `no-store`).
+A missing `exiftool` or `ffmpeg` answers 404 and adds a `/healthz` warning
+(health stays ok). The `.ARW` in `testdata/cards` has no embedded preview
+(404 "no embedded preview"), so the thumbs tests synthesize an ARW that does.
+An undecodable video currently answers 500 and logs an ERROR on every
+request, because failures aren't cached; map it to a no-preview answer later.
+Smoke test of the image: `docker stop` with an `/api/events` stream open
+exits in about 0.5 s. `@sveltejs/vite-plugin-svelte` 7.3.1 was approved as a
+dev dependency alongside `svelte` 5.59.1 and `vite` 8.3.8.
 
 ### M4: Staging operations
 - [ ] Rename, merge, move files, cull, discard, promote (background job), all with tests on temp dirs
 - [ ] Folder locks; 409 on conflict with a running ingest
 - [ ] Startup reconcile for changes made over SMB
+- [ ] Adopt staging directories that have no catalog row (shown as "untracked" since M3) in the startup reconcile
 - [ ] Staging age warnings
 - [ ] Touch-friendly selection (long-press to start selecting, swipe-select in grids)
 
@@ -717,9 +755,13 @@ the staged copy instead of the card is the follow-up.
 - [ ] End-to-end test on the NAS with a real card, twice (second run imports 0)
 - [ ] Recover from a panic in the ingest worker (fail the job, keep serving); `catalog.tx` must roll back in a defer first so a panic can't leak the single connection
 - [ ] Take an exclusive lock on `/config` at startup so a second instance can't fail the live job or delete its partials
+- [ ] The fallback poller must register its jobs with the API's ingest feed (`watch`), as `POST /api/ingest` does, so short imports still send `ingest.finished`
 
 ### M7: Polish
 - [ ] Extra staging views (timeline, list)
 - [ ] "Shift times" tool for wrong camera clocks
 - [ ] Optional token auth
+- [ ] Byte-level copy progress for long videos (progress currently updates once per file)
+- [ ] Keep one `exiftool -stay_open` process for RAW thumbnails instead of one process per file
+- [ ] HTTPS (e.g. `tailscale serve`) so the PWA installs fully
 - [ ] `v0.1.0` tag → `:latest`
