@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"slices"
 	"sync"
@@ -57,9 +58,23 @@ func (f *ingestFeed) watch(j *ingest.Job) {
 	f.watched[j.ID()] = j
 }
 
+// snapshot is what a new client receives. If it differs from the last body
+// tick published, that client now holds a state the other clients may not
+// have, so forget the last body and let the next tick publish again; the
+// client's last ingest.current then converges to the true state.
 func (f *ingestFeed) snapshot() (string, any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	running, queued := f.m.Current()
-	return EventIngestCurrent, currentOf(running, queued), nil
+	body := currentOf(running, queued)
+	b, err := json.Marshal(body)
+	if err != nil {
+		return "", nil, fmt.Errorf("encode ingest.current snapshot: %w", err)
+	}
+	if !bytes.Equal(b, f.last) {
+		f.last = nil
+	}
+	return EventIngestCurrent, json.RawMessage(b), nil
 }
 
 // tick publishes ingest.current if it changed, then ingest.finished (and

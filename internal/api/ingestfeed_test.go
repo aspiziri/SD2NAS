@@ -275,3 +275,44 @@ func TestServerCloseStopsFeed(t *testing.T) {
 		t.Fatal("Server.Close did not return")
 	}
 }
+
+// A client that connects while a short job is running gets a running
+// snapshot. If the job ends before the next tick, that tick must still
+// publish the idle state, even though it equals what the feed last published.
+func TestFeedSnapshotForcesRepublish(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	open := func() { once.Do(func() { close(release) }) }
+	defer open()
+	s, card := newFeedServer(t, func(string) (uint64, error) { <-release; return 1e12, nil })
+	s.feed.tick() // the feed has published idle
+	rec := post(t, s, "", cardBody(card))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+	}
+	var posted viewForTest
+	decodeInto(t, rec, &posted)
+	typ, data, err := s.feed.snapshot() // the client connects mid-job
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := json.Marshal(data); typ != EventIngestCurrent || string(b) == `{"running":null,"queued":[]}` {
+		t.Fatalf("snapshot %s %s should show the job in flight", typ, b)
+	}
+	open()
+	pollUntil(t, "the ingest to be done", func() bool {
+		var v viewForTest
+		decodeInto(t, get(t, s, "/api/ingests/"+strconv.FormatInt(posted.ID, 10)), &v)
+		return v.Status == "done"
+	})
+	ch, unsub := s.hub.subscribe()
+	defer unsub()
+	s.feed.tick()
+	frames := takeFrames(ch)
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want ingest.current and ingest.finished: %q", len(frames), frames)
+	}
+	if typ, data := parseFrame(t, frames[0]); typ != EventIngestCurrent || string(data) != `{"running":null,"queued":[]}` {
+		t.Errorf("frame 0 = %s %s", typ, data)
+	}
+}
