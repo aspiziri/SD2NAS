@@ -216,7 +216,7 @@ CREATE TABLE aliases (
 
 CREATE TABLE ingests (
   id           INTEGER PRIMARY KEY,
-  card_label   TEXT, card_serial TEXT, card_size INTEGER,
+  card_label   TEXT, card_uuid TEXT, card_size INTEGER,  -- card_uuid: filesystem UUID (the reader's SERIAL is shared by every card)
   started_at   TEXT NOT NULL, finished_at TEXT,
   status       TEXT NOT NULL,           -- running | done | failed | refused | cancelled
   seen INTEGER, new INTEGER, in_archive INTEGER, in_staging INTEGER,
@@ -276,7 +276,7 @@ skipped on future ingests. The ingest summary offers "Re-import anyway".
 
 ## 7. Ingest pipeline (`internal/ingest`)
 
-1. **Trigger.** `POST /api/ingest {path, label, serial}` from the Unassigned
+1. **Trigger.** `POST /api/ingest {path, label, uuid}` from the Unassigned
    Devices script, with an optional in-container poller as a fallback (§11). One
    ingest runs at a time; others queue. The same card path already running
    returns the running job.
@@ -410,7 +410,7 @@ staging changes, promote jobs and indexer progress, which replaces
 CameraImport's polling.
 
 ```
-POST   /api/ingest                       {path,label,serial}  ?wait=1 blocks until done
+POST   /api/ingest                       {path,label,uuid}  ?wait=1 blocks until done
 GET    /api/ingest/current
 POST   /api/ingest/{id}/reimport-culled
 GET    /api/ingests                      history
@@ -455,7 +455,9 @@ Tailscale for remote access.
 ## 11. Card trigger and unmount
 
 `deploy/unassigned-devices.sh` is attached to the card reader in Unassigned
-Devices with auto-mount on:
+Devices with **Automount: on**, **Read Only: on**, **Share: off** and **Run
+Device Script File in the background: Yes** (the script blocks until the import
+finishes, which can take a long time).
 
 ```bash
 #!/bin/bash
@@ -464,13 +466,16 @@ PORT=8080
 TOKEN=""   # set if SD2NAS_TOKEN is configured on the container
 case "$ACTION" in
   ADD)
+    # SERIAL is the reader's serial, identical for every card, so identify the
+    # card by its filesystem UUID instead (changes when the card is formatted)
+    UUID=$(blkid -s UUID -o value "$DEVICE")
     # format=text returns two lines: level (normal|warning) and message,
     # so the script doesn't depend on jq being installed on the host
     if RESULT=$(curl -fsS --max-time 7200 -X POST \
         "http://localhost:$PORT/api/ingest?wait=1&format=text" \
         -H "Content-Type: application/json" -H "X-SD2NAS: 1" \
         ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
-        -d "{\"path\":\"/cards/$(basename "$MOUNTPOINT")\",\"label\":\"$LABEL\",\"serial\":\"$SERIAL\"}"); then
+        -d "{\"path\":\"/cards/$(basename "$MOUNTPOINT")\",\"label\":\"$LABEL\",\"uuid\":\"$UUID\"}"); then
       LEVEL=$(echo "$RESULT" | sed -n 1p)
       MSG=$(echo "$RESULT" | sed -n 2p)
       /usr/local/sbin/rc.unassigned umount "$DEVICE"
@@ -493,9 +498,21 @@ can't unmount host drives without privileged mode.
 for new mount points, for setups that don't want a host script. It can't
 unmount or notify through Unraid.
 
-**Test the hardware before writing code** (milestone 0): check whether your
-card reader triggers Unassigned Devices on *card insert* while the reader stays
-plugged in, or only when the reader itself is plugged in.
+**Hardware test results** (M0, SanDisk PRO-READER dual SD/microSD):
+- The reader stays plugged in permanently. Inserting a card triggers `ADD`, and
+  unmounts are detected.
+- Each slot is its own device (`…_000000000056-0:0` for SD, `…-0:1` for
+  microSD), and Unassigned Devices keeps settings per slot. Configure both slots
+  once; after that, any card in a slot gets that slot's settings.
+- `sdX` letters change between boots and re-plugs, so the script always uses
+  `$DEVICE` from the event, never a hard-coded name.
+- Unlabelled cards mount at `/mnt/disks/SanDisk_PRO-READER`. The script derives
+  the path from `$MOUNTPOINT`, so labelled cards work too.
+- `rc.unassigned umount` works from the shell.
+- A container with `/mnt/disks:/cards:rw,slave` sees cards mounted after it
+  starts and sees them disappear on unmount.
+- `notify` shows in the Unraid UI. Phone delivery needs a notification agent
+  with **Agents** ticked for each level in Settings → Notification Settings.
 
 ---
 
@@ -598,7 +615,7 @@ image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
 | Frontend | Svelte 5 + Vite, single-page app with no SvelteKit. The UI is written from scratch, so there's no reason to start on the older version. |
 | Dependencies | Approved: `modernc.org/sqlite`. Carried over: `goexif`, `go-mp4`, `imaging`. Frontend: `svelte`, `vite`. |
 
-No open questions remain; the next unknowns are hardware checks in M0.
+No open questions remain. The M0 hardware checks have passed (§11).
 
 ---
 
@@ -608,8 +625,9 @@ Each milestone ends with tests passing and a commit. The checklist under each
 is what "done" means.
 
 ### M0: Skeleton and hardware check
-- [ ] Card reader tested with Unassigned Devices: insert-triggered or reader-plug only
-- [ ] Confirm the variables Unassigned Devices passes to device scripts (`LABEL`, `SERIAL`, `MOUNTPOINT`) on your Unraid version
+- [x] Card reader tested with Unassigned Devices: insert-triggered with the reader left plugged in (results in §11)
+- [x] Unassigned Devices passes `ACTION`, `DEVICE`, `LABEL`, `SERIAL`, `MOUNTPOINT`; `SERIAL` belongs to the reader, so cards are identified by filesystem UUID
+- [ ] Phone notifications: configure an Unraid notification agent
 - [ ] Go module, `cmd/sd2nas` serving "hello" and `/healthz`
 - [ ] Dockerfile builds; image runs locally
 - [ ] CI and release workflows publish `ghcr.io/aspiziri/sd2nas:edge`
