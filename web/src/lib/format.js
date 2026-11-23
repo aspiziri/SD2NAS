@@ -5,10 +5,12 @@ const pad = (n) => String(n).padStart(2, '0');
 
 // formatBytes(1234567) === '1.2 MB' (decimal units, like the ingest messages).
 export function formatBytes(n) {
-  if (!Number.isFinite(n) || n < 1000) return `${Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0} B`;
-  let v = n;
-  let i = -1;
-  while (v >= 1000 && i < UNITS.length - 1) {
+  if (!Number.isFinite(n) || n < 0) return '0 B';
+  // Pick the unit after rounding, so 999.6 is "1.0 KB" and 999999 is "1.0 MB".
+  if (Math.round(n) < 1000) return `${Math.round(n)} B`;
+  let v = n / 1000;
+  let i = 0;
+  while (Math.round(v * 10) / 10 >= 1000 && i < UNITS.length - 1) {
     v /= 1000;
     i++;
   }

@@ -10,6 +10,15 @@ test('formatBytes', () => {
   assert.equal(f.formatBytes(1234567), '1.2 MB');
   assert.equal(f.formatBytes(5e10), '50.0 GB');
   assert.equal(f.formatBytes(undefined), '0 B');
+  assert.equal(f.formatBytes(999.4), '999 B');
+  assert.equal(f.formatBytes(999.6), '1.0 KB');
+  assert.equal(f.formatBytes(999_949), '999.9 KB');
+  assert.equal(f.formatBytes(999_950), '1.0 MB');
+  assert.equal(f.formatBytes(999_950_000), '1.0 GB');
+  assert.equal(f.formatBytes(-5), '0 B');
+  assert.equal(f.formatBytes(NaN), '0 B');
+  assert.equal(f.formatBytes(Infinity), '0 B');
+  assert.equal(f.formatBytes(5e15), '5000.0 TB');
 });
 
 test('formatWhen and formatCapture', () => {
