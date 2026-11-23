@@ -41,7 +41,7 @@ func TestJPEGStructure(t *testing.T) {
 		t.Errorf("APP1 length = %d, want %d", n, len(tiff)+8)
 	}
 	if string(b[6:12]) != "Exif\x00\x00" || !bytes.Equal(b[12:12+len(tiff)], tiff) {
-		t.Error("APP1 payload is not Exif\x00\x00 +TIFF(LittleEndian, spec)")
+		t.Error("APP1 payload is not Exif\\0\\0 + TIFF(LittleEndian, spec)")
 	}
 	img, err := jpeg.Decode(bytes.NewReader(b))
 	if err != nil {
