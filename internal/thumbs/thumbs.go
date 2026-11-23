@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,10 @@ var (
 	// ErrTooLarge means the image declares more than maxPixels pixels; it is
 	// refused before decoding so that it cannot exhaust memory.
 	ErrTooLarge = errors.New("thumbs: image has too many pixels to decode")
+	// ErrUndecodable means the file's bytes (or a tool's output for it) are
+	// corrupt, truncated or in an unsupported form. It is a property of the
+	// file, not a fault of the server.
+	ErrUndecodable = errors.New("thumbs: the file could not be decoded")
 )
 
 // maxPixels caps the pixels of any image decoded in Go (120 megapixels).
@@ -219,7 +224,7 @@ func (c *Cache) Get(ctx context.Context, src Source, size int) (string, error) {
 
 func (c *Cache) run(ctx context.Context, cl *call, src Source, size int, dst string) {
 	defer c.wg.Done()
-	err := c.generate(ctx, src, size, dst)
+	err := c.generateRecovered(ctx, src, size, dst)
 	cl.cancel()
 	c.mu.Lock()
 	if c.calls[dst] == cl {
@@ -228,6 +233,20 @@ func (c *Cache) run(ctx context.Context, cl *call, src Source, size int, dst str
 	c.mu.Unlock()
 	cl.err = err
 	close(cl.done)
+}
+
+// generateRecovered runs generate and turns a panic into an error, so that a
+// malformed file cannot take the process down. Decoding runs on this
+// goroutine; the parallel resize goroutines inside imaging are not covered.
+// generate's deferred release of the worker slot runs while unwinding.
+func (c *Cache) generateRecovered(ctx context.Context, src Source, size int, dst string) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("%s: render panicked: %v", src.Path, p)
+			c.cfg.Log.Error("thumbnail render panicked", "path", src.Path, "panic", p, "stack", string(debug.Stack()))
+		}
+	}()
+	return c.generate(ctx, src, size, dst)
 }
 
 func (c *Cache) generate(ctx context.Context, src Source, size int, dst string) error {
@@ -308,9 +327,22 @@ func decodeImage(path string) (image.Image, error) {
 	}
 	defer f.Close()
 	if err := checkPixels(f); err != nil {
-		return nil, err
+		return nil, undecodable(err)
 	}
-	return imaging.Decode(f, imaging.AutoOrientation(true))
+	img, err := imaging.Decode(f, imaging.AutoOrientation(true))
+	if err != nil {
+		return nil, undecodable(err)
+	}
+	return img, nil
+}
+
+// undecodable marks a decoder error as ErrUndecodable. ErrTooLarge keeps
+// its own meaning.
+func undecodable(err error) error {
+	if errors.Is(err, ErrTooLarge) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrUndecodable, err)
 }
 
 // checkPixels reads r's image header, returns ErrTooLarge when it declares

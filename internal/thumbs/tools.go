@@ -59,6 +59,11 @@ func (c *Cache) runTool(ctx context.Context, name string, args ...string) ([]byt
 		return nil, fmt.Errorf("%s: %w", tool, ctxErr)
 	}
 	if err != nil {
+		// A tool that ran and exited non-zero rejected the file. A missing
+		// binary or a failure to start is not the file's fault.
+		if errors.As(err, new(*exec.ExitError)) {
+			err = fmt.Errorf("%w: %w", ErrUndecodable, err)
+		}
 		if msg != "" {
 			return nil, fmt.Errorf("%s: %w: %s", tool, err, msg)
 		}
@@ -78,9 +83,13 @@ func (c *Cache) runTool(ctx context.Context, name string, args ...string) ([]byt
 func decodeUntrusted(data []byte) (image.Image, error) {
 	r := bytes.NewReader(data)
 	if err := checkPixels(r); err != nil {
-		return nil, err
+		return nil, undecodable(err)
 	}
-	return imaging.Decode(r)
+	img, err := imaging.Decode(r)
+	if err != nil {
+		return nil, undecodable(err)
+	}
+	return img, nil
 }
 
 // rawPreview returns the RAW file's embedded preview (falling back to
@@ -93,10 +102,10 @@ func (c *Cache) rawPreview(ctx context.Context, path string) (image.Image, error
 		}
 		var res []map[string]any
 		if err := json.Unmarshal(out, &res); err != nil {
-			return nil, fmt.Errorf("exiftool output: %w", err)
+			return nil, fmt.Errorf("%w: exiftool output: %w", ErrUndecodable, err)
 		}
 		if len(res) != 1 {
-			return nil, fmt.Errorf("exiftool output: %d results, want 1", len(res))
+			return nil, fmt.Errorf("%w: exiftool output: %d results, want 1", ErrUndecodable, len(res))
 		}
 		enc, _ := res[0][tag].(string) // absent when the file has no such image
 		if enc == "" {
@@ -104,11 +113,11 @@ func (c *Cache) rawPreview(ctx context.Context, path string) (image.Image, error
 		}
 		b64, ok := strings.CutPrefix(enc, "base64:")
 		if !ok {
-			return nil, fmt.Errorf("exiftool output: %s is not base64 binary", tag)
+			return nil, fmt.Errorf("%w: exiftool output: %s is not base64 binary", ErrUndecodable, tag)
 		}
 		data, err := base64.StdEncoding.DecodeString(b64)
 		if err != nil {
-			return nil, fmt.Errorf("exiftool output: %s: %w", tag, err)
+			return nil, fmt.Errorf("%w: exiftool output: %s: %w", ErrUndecodable, tag, err)
 		}
 		img, err := decodeUntrusted(data) // no auto-orientation: the RAW's tag rules
 		if err != nil {

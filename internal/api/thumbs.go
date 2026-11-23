@@ -73,7 +73,7 @@ func thumbFailure(err error) (code int, msg string, logIt bool) {
 		// exiftool or ffmpeg isn't installed: /healthz already warns, so
 		// don't log an error for every RAW or video tile.
 		return http.StatusNotFound, "no thumbnail: " + err.Error(), false
-	case errors.Is(err, thumbs.ErrTooLarge):
+	case errors.Is(err, thumbs.ErrTooLarge), errors.Is(err, thumbs.ErrUndecodable):
 		// A property of the file, not a fault of the server.
 		return http.StatusUnprocessableEntity, err.Error(), false
 	case errors.Is(err, thumbs.ErrClosed), errors.Is(err, context.Canceled):
@@ -98,6 +98,9 @@ func (h *thumbHandlers) serve(size int) http.HandlerFunc {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		case err != nil:
+			if r.Context().Err() != nil {
+				return // the client went away; there is nobody to answer
+			}
 			h.log.Error("thumbnail source", "sha", sha, "err", err)
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -112,6 +115,8 @@ func (h *thumbHandlers) serve(size int) http.HandlerFunc {
 				h.log.Error("thumbnail failed", "sha", sha, "size", size, "path", src.Path, "err", err)
 			} else if errors.Is(err, thumbs.ErrTooLarge) {
 				h.log.Warn("thumbnail refused", "sha", sha, "path", src.Path, "err", err)
+			} else if errors.Is(err, thumbs.ErrUndecodable) {
+				h.log.Warn("cannot decode for a thumbnail", "sha", sha, "path", src.Path, "err", err)
 			}
 			writeError(w, code, msg)
 			return

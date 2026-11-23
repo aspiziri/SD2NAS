@@ -12,6 +12,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,6 +129,49 @@ func writeJPEGSource(t *testing.T, w, h int, orientation uint16) string {
 		t.Fatal(err)
 	}
 	return writeSource(t, t.TempDir(), "a.jpg", data)
+}
+
+func TestGetCorruptImage(t *testing.T) {
+	good, err := encodeJPEG(redBlueImage(200, 100), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string][]byte{
+		"truncated": good[:len(good)/2],
+		"garbage":   bytes.Repeat([]byte("not an image "), 50),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := newCache(t, Config{})
+			src := Source{shaN(30), writeSource(t, t.TempDir(), "a.jpg", data), media.KindImage}
+			_, err := c.Get(context.Background(), src, ThumbSize)
+			if !errors.Is(err, ErrUndecodable) || errors.Is(err, ErrTooLarge) {
+				t.Fatalf("err = %v, want ErrUndecodable and not ErrTooLarge", err)
+			}
+		})
+	}
+}
+
+func TestGetRenderPanic(t *testing.T) {
+	c := newCache(t, Config{Workers: 1, Log: slog.New(slog.DiscardHandler)})
+	src := Source{shaN(31), writeJPEGSource(t, 200, 100, 0), media.KindImage}
+	c.render = func(context.Context, Source) (image.Image, error) { panic("boom") }
+	for i := 0; i < 2; i++ { // the second try shows the slot and the call entry were released
+		_, err := c.Get(context.Background(), src, ThumbSize)
+		if err == nil || !strings.Contains(err.Error(), "panicked") {
+			t.Fatalf("try %d: err = %v, want one containing panicked", i, err)
+		}
+	}
+	c.mu.Lock()
+	n := len(c.calls)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d calls still registered", n)
+	}
+	c.render = c.renderSource
+	if _, err := c.Get(context.Background(), src, ThumbSize); err != nil {
+		t.Fatalf("after the panics: %v", err)
+	}
 }
 
 func dims(t *testing.T, path string) (int, int) {

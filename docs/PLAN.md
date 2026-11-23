@@ -728,8 +728,9 @@ header before decoding (`thumbs.ErrTooLarge`, answered 422 with `no-store`).
 A missing `exiftool` or `ffmpeg` answers 404 and adds a `/healthz` warning
 (health stays ok). The `.ARW` in `testdata/cards` has no embedded preview
 (404 "no embedded preview"), so the thumbs tests synthesize an ARW that does.
-An undecodable video currently answers 500 and logs an ERROR on every
-request, because failures aren't cached; map it to a no-preview answer later.
+A file that can't be decoded (corrupt JPEG, truncated video, tool exit
+failure) answers 422 and logs a warning; failures aren't cached, so each view
+retries.
 Smoke test of the image: `docker stop` with an `/api/events` stream open
 exits in about 0.5 s. `@sveltejs/vite-plugin-svelte` 7.3.1 was approved as a
 dev dependency alongside `svelte` 5.59.1 and `vite` 8.3.8.
@@ -761,6 +762,7 @@ dev dependency alongside `svelte` 5.59.1 and `vite` 8.3.8.
 - [ ] Extra staging views (timeline, list)
 - [ ] "Shift times" tool for wrong camera clocks
 - [ ] Optional token auth
+- [ ] Cache thumbnail render failures per file so a corrupt file isn't re-rendered on every view
 - [ ] Byte-level copy progress for long videos (progress currently updates once per file)
 - [ ] Keep one `exiftool -stay_open` process for RAW thumbnails instead of one process per file
 - [ ] HTTPS (e.g. `tailscale serve`) so the PWA installs fully

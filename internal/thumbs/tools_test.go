@@ -258,6 +258,9 @@ func TestToolFailureSurfacesStderr(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "boom: bad file") {
 		t.Fatalf("err = %v, want one containing the tool's stderr", err)
 	}
+	if !errors.Is(err, ErrUndecodable) {
+		t.Errorf("err = %v, want ErrUndecodable", err)
+	}
 }
 
 func TestToolGarbage(t *testing.T) {
@@ -265,6 +268,9 @@ func TestToolGarbage(t *testing.T) {
 	_, err := c.Get(context.Background(), fakeSource(t, 6, media.KindRaw), ThumbSize)
 	if err == nil || !strings.Contains(err.Error(), "exiftool output") {
 		t.Fatalf("err = %v, want one containing exiftool output", err)
+	}
+	if !errors.Is(err, ErrUndecodable) {
+		t.Errorf("err = %v, want ErrUndecodable", err)
 	}
 }
 
@@ -275,6 +281,9 @@ func TestToolTimeoutKills(t *testing.T) {
 	_, err := c.Get(context.Background(), src, ThumbSize)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	if errors.Is(err, ErrUndecodable) {
+		t.Errorf("a timeout is not ErrUndecodable: %v", err)
 	}
 	if d := time.Since(start); d > 10*time.Second {
 		t.Fatalf("Get took %v", d)
@@ -289,6 +298,9 @@ func TestToolOutputCapped(t *testing.T) {
 	_, err := c.Get(context.Background(), fakeSource(t, 8, media.KindVideo), ThumbSize)
 	if err == nil || !strings.Contains(err.Error(), "larger than") || !errors.Is(err, errTooLarge) {
 		t.Fatalf("err = %v, want errTooLarge", err)
+	}
+	if errors.Is(err, ErrUndecodable) {
+		t.Errorf("runaway output is not ErrUndecodable: %v", err)
 	}
 	if n := len(recordedArgs(t, argsFile)); n != 1 {
 		t.Fatalf("%d calls, want 1 (runaway output is not retried at 0 s)", n)
@@ -327,6 +339,9 @@ func TestVideoFailureReportsBoth(t *testing.T) {
 	if n := strings.Count(err.Error(), "boom: bad file"); n != 2 {
 		t.Errorf("error mentions the failure %d times, want 2 (both attempts): %v", n, err)
 	}
+	if !errors.Is(err, ErrUndecodable) {
+		t.Errorf("err = %v, want ErrUndecodable", err)
+	}
 	wantArgs(t, argsFile, videoArgs("1", src.Path), videoArgs("0", src.Path))
 }
 
@@ -335,6 +350,9 @@ func TestVideoBadFrame(t *testing.T) {
 	_, err := c.Get(context.Background(), fakeSource(t, 11, media.KindVideo), ThumbSize)
 	if err == nil || !strings.Contains(err.Error(), "decode video frame") {
 		t.Fatalf("err = %v, want one containing decode video frame", err)
+	}
+	if !errors.Is(err, ErrUndecodable) {
+		t.Errorf("err = %v, want ErrUndecodable", err)
 	}
 }
 
@@ -375,6 +393,10 @@ func TestMissingTools(t *testing.T) {
 	want := []string{"sd2nas-no-such-tool not found: RAW thumbnails are unavailable"}
 	if got := c.MissingTools(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("MissingTools() = %q, want %q", got, want)
+	}
+	_, err := c.Get(context.Background(), fakeSource(t, 13, media.KindRaw), ThumbSize)
+	if !errors.Is(err, exec.ErrNotFound) || errors.Is(err, ErrUndecodable) {
+		t.Fatalf("err = %v, want exec.ErrNotFound and not ErrUndecodable", err)
 	}
 }
 

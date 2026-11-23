@@ -198,6 +198,7 @@ func TestThumbFailure(t *testing.T) {
 		{"no image", thumbs.ErrNoImage, 404, false},
 		{"missing tool", fmt.Errorf("x.ARW: %w", &exec.Error{Name: "exiftool", Err: exec.ErrNotFound}), 404, false},
 		{"too large", fmt.Errorf("%w: 20000x10000", thumbs.ErrTooLarge), 422, false},
+		{"undecodable", fmt.Errorf("x: %w", thumbs.ErrUndecodable), 422, false},
 		{"closed", thumbs.ErrClosed, 503, false},
 		{"canceled", context.Canceled, 503, false},
 		{"deadline", context.DeadlineExceeded, 500, true},
@@ -209,6 +210,22 @@ func TestThumbFailure(t *testing.T) {
 			t.Errorf("%s: got %d %q log=%v, want %d log=%v", c.name, code, msg, logIt, c.code, c.logs)
 		}
 	}
+}
+
+func TestThumbUndecodable(t *testing.T) {
+	f := newFullServer(t)
+	rel := "Staging/2025-05-30/bad.JPG"
+	abs := filepath.Join(f.photos, filepath.FromSlash(rel))
+	writeJPEG(t, abs, 800, 600)
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, data[:200], 0o666); err != nil {
+		t.Fatal(err)
+	}
+	sha := insertAsset(t, f, catalog.StateStaged, rel)
+	wantThumbError(t, get(t, f.s, "/api/thumbs/"+sha), http.StatusUnprocessableEntity, "could not be decoded")
 }
 
 func TestThumbWarmAfterIngest(t *testing.T) {
