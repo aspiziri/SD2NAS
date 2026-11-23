@@ -346,7 +346,7 @@ function renderStaging() {
     </div>`;
   }).join('') : `<div class="waiting" style="grid-column:1/-1"><div class="icon">✨</div><h2>Staging is empty</h2><p class="muted">Everything has been promoted to the archive.</p></div>`;
 
-  return `<h1>Staging</h1><p class="sub">${state.folders.length} folders · ${fmtN(totalFiles)} files · ${totalGB.toFixed(1)} GB on <span class="mono">/mnt/cache/photo-staging</span></p>
+  return `<h1>Staging</h1><p class="sub">${state.folders.length} folders · ${fmtN(totalFiles)} files · ${totalGB.toFixed(1)} GB on <span class="mono">/mnt/user/photos/Staging</span></p>
     <div class="toolbar row">
       <span class="muted">${sel ? `${sel} selected` : 'Select folders to act on them'}</span>
       ${sel ? `<button class="btn link" onclick="state.selected.clear();render()">Clear</button>` : `<button class="btn link" onclick="state.folders.forEach(f=>state.selected.add(f.id));render()">Select all</button>`}
@@ -496,13 +496,13 @@ function promoteDialog() {
     <p class="muted small" style="margin:4px 0 0">Tokens: <span class="mono">{year}</span> <span class="mono">{month}</span> <span class="mono">{name}</span></p>
     <div class="preview mono" id="promotePreview"></div>
     ${undated.length ? `<div class="note warn">${undated.length} folder${undated.length > 1 ? 's have' : ' has'} only a date for a name. Rename first if you want a description in the archive.</div>` : ''}
-    <div class="note">${n} files (${sizeGB(fs.flatMap(f => f.files)).toFixed(1)} GB) move from cache to the array and are added to the archive index.</div>
+    <div class="note">${n} files (${sizeGB(fs.flatMap(f => f.files)).toFixed(1)} GB) move instantly into the archive (same share, so it is just a rename) and are added to the archive index.</div>
     <div class="row end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="doPromote()">Promote</button></div>`);
   updatePromotePreview();
 }
 function updatePromotePreview() {
   const pat = document.getElementById('patIn').value;
-  document.getElementById('promotePreview').innerHTML = selFolders().map(f => `/mnt/user/Photos/Archive/${esc(promotePath(f, pat))}/`).join('<br>');
+  document.getElementById('promotePreview').innerHTML = selFolders().map(f => `/mnt/user/photos/Archive/${esc(promotePath(f, pat))}/`).join('<br>');
 }
 function doPromote() {
   const pat = document.getElementById('patIn').value; state.promotePattern = pat;
@@ -528,7 +528,7 @@ function renderArchive() {
       </table>
       <div class="row" style="margin-top:12px"><button class="btn primary" onclick="state.archive.changed=0;toast('New hashes saved (old ones kept as aliases)');render()">Accept new hashes</button>
       <span class="muted small">The old hash is kept as an alias, so the original file from a card still counts as a duplicate.</span></div></div>` : '';
-  return `<h1>Archive index</h1><p class="sub">Hash catalog of <span class="mono">/mnt/user/Photos/Archive</span>, used to skip files you already have.</p>
+  return `<h1>Archive index</h1><p class="sub">Hash catalog of <span class="mono">/mnt/user/photos/Archive</span>, used to skip files you already have.</p>
     <div class="card"><div class="stats">
       <div class="stat"><b>${fmtN(a.files)}</b>files indexed</div>
       <div class="stat"><b>${a.tb.toFixed(2)} TB</b>archive size</div>
@@ -556,8 +556,8 @@ function renderSettings() {
   return `<h1>Settings</h1><p class="sub">Mockup only; nothing here saves.</p>
     <div class="card"><h2>Paths</h2><div class="form2">
       <div><label class="f">Card mount root (watched)</label><input type="text" value="/mnt/disks"></div>
-      <div><label class="f">Staging</label><input type="text" value="/mnt/cache/photo-staging"></div>
-      <div><label class="f">Archive</label><input type="text" value="/mnt/user/Photos/Archive"></div>
+      <div><label class="f">Staging</label><input type="text" value="/mnt/user/photos/Staging"></div>
+      <div><label class="f">Archive</label><input type="text" value="/mnt/user/photos/Archive"></div>
       <div><label class="f">Promote pattern</label><input type="text" value="${esc(state.promotePattern)}"></div>
     </div></div>
     <div class="card"><h2>Import rules (same as the desktop app)</h2><div class="form2">

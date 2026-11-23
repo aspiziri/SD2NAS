@@ -22,8 +22,8 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
 - Name and sort files exactly like CameraImport: `YYYY-MM-DD HH.mm.ss.ext`, videos
   with resolution, frame rate and duration, and `Capture/` and `Videos/`
   subfolders.
-- Keep every newly ingested file in two places, the SSD staging copy and a
-  safety copy on the array, until it's promoted (§3).
+- Stage on the parity-protected array, in the same share as the archive, so
+  promoting is an instant folder move (§3).
 - Manage staging from a browser, phone first: browse, merge, rename, move files,
   cull, discard, promote.
 - Keep a hash index of the existing archive, fill it once in the background, and
@@ -55,8 +55,7 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
    │  POST /api/ingest?wait=1  ───────────────►  ingest job
    │                                              ├─ scan /cards/SONY_A7IV
    │                                              ├─ fingerprint → catalog lookup
-   │                                              ├─ copy new → /staging/…   (SSD)
-   │                                              ├─ safety copy → /archive/.sd2nas/incoming (array)
+   │                                              ├─ copy new → /photos/Staging/…
    │                                              └─ record in SQLite (/config)
    │  ◄─────────────────── summary ─────────────
    ├─ rc.unassigned umount
@@ -71,58 +70,55 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
 | Container path | Host path (example) | Mode | Purpose |
 |---|---|---|---|
 | `/cards` | `/mnt/disks` | RW/Slave, used read-only | Cards mounted by Unassigned Devices. Slave propagation is required so cards mounted after the container starts are visible. |
-| `/staging` | `/mnt/cache/PhotoStaging` | RW | Staging on the 1 TB cache SSD. A share set to cache only, so the mover never touches it. |
-| `/archive` | `/mnt/user/Photos` (your existing archive share) | RW | The archive, on the array. SD2NAS's own files live in a hidden `.sd2nas/` folder at its root. |
-| `/config` | `/mnt/cache/appdata/sd2nas` | RW | SQLite database, thumbnail cache, settings. Use the cache path directly, not `/mnt/user`, to avoid SQLite locking problems on Unraid's share filesystem. |
+| `/photos` | `/mnt/user/photos` | RW | The `photos` share (array only, no cache). Contains `Archive/` (existing), `Staging/` (created by SD2NAS) and a hidden `.sd2nas/` folder for catalog backups. |
+| `/config` | `/mnt/cache/appdata/sd2nas` | RW | SQLite database, thumbnail and preview cache, settings, on the cache SSD for fast browsing. Use the cache path directly, not `/mnt/user`, to avoid SQLite locking problems on Unraid's share filesystem. |
 
 The container runs as `99:100` (nobody:users) with `UMASK=000` so files stay
 editable over SMB, and must have `TZ` set (§13).
 
 ---
 
-## 3. Storage and the safety copy
+## 3. Storage
 
-**Why not just let Unraid's mover handle it:** the mover *moves* files from
-cache to the array; it doesn't keep a copy on both. And moving a file between
-shares through `/mnt/user` is a known Unraid trap: the file keeps living on the
-cache disk under the new share. So staging (SSD) and the archive (array) are
-separate shares, and SD2NAS always does real copies between them.
+```
+/mnt/user/photos/          the photos share: array only, dual parity, no cache
+  Archive/                 existing archive (flat list of session folders)
+  Staging/                 created by SD2NAS
+  .sd2nas/backups/         nightly catalog backups
+```
 
-**The safety copy:**
-- During ingest, each new file is written to `/staging` (fast to browse and make
-  thumbnails from) **and** to `/archive/.sd2nas/incoming/<hash[:2]>/<hash>.<ext>`
-  on the array.
-- The safety copy is named by hash and never reorganized, so merges, renames and
-  moves in staging only touch the SSD copy.
-- **Promote** moves each file's safety copy to its final archive path. That's a
-  rename within the same share on the array, so it's fast. Then it deletes the
-  SSD copy. If a safety copy is missing, promote copies from staging and
-  verifies the hash instead.
-- **Cull/discard** deletes both copies.
-- Unraid hides dot-folders over SMB by default, so `.sd2nas/` won't clutter the
-  archive list (verify in M0).
+**Why the array and not the cache SSD:**
+- The cache is a single SSD with no redundancy; the array has dual parity. Files
+  are protected from the moment they land in staging, with no second copy to
+  manage.
+- Staging and the archive are folders in **the same share**, so promote is a
+  plain rename: instant, however large the folder. (Moving between a cache
+  share and an array share would need real copies; moving across shares through
+  `/mnt/user` is a known Unraid trap that leaves files on the original disk.)
+- Browsing speed doesn't depend on where the photos live: thumbnails and
+  previews are cached in `/config` on the SSD.
+- Ingest runs unattended, so array write speed (~60–100 MB/s with dual parity)
+  doesn't matter much. A typical card with a few GB of new files takes a minute
+  or two; a 128 GB card of new 4K video about 25 minutes.
+- The disks never spin down on this NAS, so ingest doesn't wake anything.
 
-**"Safe to format"** is only sent when every file on the card is either already
-in the archive or has both its staging copy and its safety copy. Failed files or
-a missing safety copy turn it into a warning instead.
-
-**Cost:** array writes with parity run at roughly 100 MB/s, so the safety copy
-is the slowest step. A typical card with a few GB of new files takes a couple of
-minutes; a 128 GB card of new 4K video takes about 20 minutes. It can be turned
-off in settings if the cache pool is mirrored.
+**"Safe to format"** is sent when every file on the card is either already
+known (archived, staged or culled) or was copied into staging and verified.
+Failed files turn it into a warning instead.
 
 **Capacity guards:**
 - Before copying, ingest adds up the size of the new files and refuses to start
-  if staging would drop below a reserve (default 50 GB). The card stays mounted
-  and a notification explains why.
-- Staging shows a warning banner, plus a daily notification, when free space
-  drops below 150 GB or a folder has been in staging longer than 30 days. Both
-  thresholds are settings.
+  if the share would drop below a reserve (default 50 GB). The card stays
+  mounted and a notification explains why.
+- Staging shows a warning banner, plus a daily notification, when a folder has
+  been in staging longer than 30 days. The threshold is a setting.
 
 **Catalog backup:** the database is the only record of what you culled, and
 that can't be rebuilt from the archive. Nightly, after the rescan, SD2NAS writes
-`VACUUM INTO /archive/.sd2nas/backups/catalog-YYYY-MM-DD.db` and keeps the last
-14. This is on top of the Appdata Backup plugin.
+`VACUUM INTO /photos/.sd2nas/backups/catalog-YYYY-MM-DD.db` and keeps the last
+14. It sits outside `Archive/`, so neither the indexer nor Capture One sees it.
+Unraid hides dot-folders over SMB by default (verify in M0). This is on top of
+the Appdata Backup plugin.
 
 ---
 
@@ -132,7 +128,7 @@ that can't be rebuilt from the archive. Nightly, after the rescan, SD2NAS writes
 cmd/sd2nas/            main: flags/env, wiring, HTTP server, background workers
 internal/media/        naming, EXIF date, video metadata, copy-with-hash
 internal/catalog/      SQLite schema, migrations, queries, nightly backup
-internal/ingest/       card ingest job (scan → fingerprint → copy → safety copy → record)
+internal/ingest/       card ingest job (scan → fingerprint → copy → record)
 internal/staging/      staging folders: list, merge, rename, move, cull, promote; folder locks
 internal/indexer/      archive backfill + nightly rescan
 internal/thumbs/       thumbnail generation + cache (exiftool, ffmpeg)
@@ -194,8 +190,7 @@ CREATE TABLE assets (
   capture_time  TEXT,                   -- local time, as named
   tz_offset     TEXT,                   -- from EXIF OffsetTimeOriginal, if any
   state         TEXT NOT NULL,          -- staged | archived | culled | missing
-  rel_path      TEXT,                   -- relative to /staging or /archive; NULL when culled
-  safety_path   TEXT,                   -- safety copy under .sd2nas/incoming while staged
+  rel_path      TEXT,                   -- relative to /photos; NULL when culled
   mtime         INTEGER,                -- for cheap rescans
   first_ingest  INTEGER REFERENCES ingests(id),  -- NULL if found by indexer
   updated_at    TEXT NOT NULL
@@ -242,7 +237,7 @@ CREATE TABLE ingest_files (
 
 CREATE TABLE staging_folders (
   id      INTEGER PRIMARY KEY,
-  name    TEXT NOT NULL UNIQUE,         -- directory name under /staging
+  name    TEXT NOT NULL UNIQUE,         -- directory name under Staging/
   dates   TEXT NOT NULL,                -- JSON array of YYYY-MM-DD it covers
   created_at TEXT NOT NULL
 );
@@ -257,7 +252,7 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 | Situation | What happens | Cost |
 |---|---|---|
-| Fingerprint not in catalog | **New.** Copy to staging while computing the full SHA-256, write the safety copy, then insert the asset and its fingerprint. | The copy's own reads |
+| Fingerprint not in catalog | **New.** Copy to staging while computing the full SHA-256, then insert the asset and its fingerprint. | The copy's own reads |
 | Fingerprint matches an asset | **Known.** Record the outcome from the asset's state (archived, staged, culled → "seen before"). Don't copy. | 128 KB |
 | Full hash of a new copy matches an existing asset (fingerprint collision or an alias) | Delete the copy, record it as known. | Rare |
 
@@ -288,7 +283,7 @@ skipped on future ingests. The ingest summary offers "Re-import anyway".
    (low-res proxies and thumbnails).
 3. **Fingerprint and classify** each file against the catalog. Run 2–4 workers.
 4. **Space check.** Sum the sizes of the new files; refuse the ingest
-   (`status = refused`) if staging would drop below the reserve (§3).
+   (`status = refused`) if the share would drop below the reserve (§3).
 5. **Copy new files**, one at a time to keep card reads sequential:
    - capture time: EXIF for images and RAW; `mvhd` creation time for video;
      modified time as a last resort
@@ -303,8 +298,6 @@ skipped on future ingests. The ingest summary offers "Re-import anyway".
      collision loop (identical file → skip, else add `-1`, `-2`)
    - `CopyHashed` to `.partial`, fsync, rename; holding that staging folder's
      lock (§8)
-   - safety copy to `/archive/.sd2nas/incoming/` (a second worker, so the next
-     card read overlaps the array write)
    - insert the asset and fingerprint, update `staging_folders`
 6. **Clock check** on the new files (§12) and attach any warnings to the summary.
 7. **Finish.** Write ingest totals and `safe_to_format`, publish an SSE event,
@@ -317,8 +310,8 @@ skipped on future ingests. The ingest summary offers "Re-import anyway".
 - Card pulled mid-ingest → job `failed`, finished files stay recorded. Partial
   files are removed. Re-inserting the card picks up where it left off, because
   done files now match.
-- On startup: delete stray `*.partial` files, mark `running` ingests as
-  `failed`, and redo safety copies that are missing for staged assets.
+- On startup: delete stray `*.partial` files and mark `running` ingests as
+  `failed`.
 
 ---
 
@@ -334,17 +327,14 @@ that a card ingest is currently filling, the API returns `409 Conflict` and the
 UI says "this folder is being imported into". Locks are held for one operation,
 never across user think time.
 
-| Operation | Staging (SSD) | Archive (array) | Catalog |
-|---|---|---|---|
-| List folders | read `/staging` | none | join counts and sizes from `assets` |
-| Rename | rename the directory | none | update `staging_folders.name`, `assets.rel_path` prefix |
-| Merge N → 1 | move files into the target folder (collision loop), remove empty sources | none | union `dates`, update paths |
-| Move files | same as merge, per file; "New folder…" creates one | none | update paths and dates |
-| Cull files / discard folder | delete files | delete safety copies | `state = culled`, `rel_path = NULL` |
-| Promote | delete SSD copies after the archive side succeeds | rename safety copies into `/archive/<pattern>/…`; if the target folder exists, merge with the collision loop; if a safety copy is missing, copy from staging and verify the hash | `state = archived`, new paths, drop the `staging_folders` row |
-
-Promote runs as a background job with progress, so a big folder doesn't tie up
-the phone.
+| Operation | Filesystem | Catalog |
+|---|---|---|
+| List folders | read `Staging/` | join counts and sizes from `assets` |
+| Rename | rename the directory | update `staging_folders.name`, `assets.rel_path` prefix |
+| Merge N → 1 | move files into the target folder (collision loop), remove empty sources | union `dates`, update paths |
+| Move files | same as merge, per file; "New folder…" creates one | update paths and dates |
+| Cull files / discard folder | delete files | `state = culled`, `rel_path = NULL` |
+| Promote | `os.Rename(Staging/X, Archive/<pattern>)`, instant within the share. If the target folder already exists, merge into it file by file with the collision loop. If a rename ever returns `EXDEV`, fall back to copy, verify hash, delete. | `state = archived`, new paths, drop the `staging_folders` row |
 
 **Folder naming follows the existing archive:** `YYYY-MM-DD - Title`, e.g.
 `2007-11-10 - SMU Homecoming`. New staging folders start as just `YYYY-MM-DD`.
@@ -549,8 +539,9 @@ unaffected.
   filename within the same second.
 - **Day cutoff** applies to the folder only, never the filename, so files still
   sort by real time inside a folder.
-- **Staging → archive is always a real copy** (or a rename of the array-side
-  safety copy), never a rename across shares (§3).
+- **Staging and the archive must stay in the same share** for promote to be a
+  rename. If they're ever configured apart, promote falls back to copy, verify,
+  delete (`EXDEV`), never a rename across shares (§3).
 
 ---
 
@@ -571,9 +562,9 @@ image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
   public because the repo is. ghcr image names must be lowercase.
 
 **Unraid setup**
-- Create a `PhotoStaging` share with primary storage on the cache pool and no
-  secondary storage, so the mover leaves it alone.
-- Template `deploy/unraid/sd2nas.xml`: repository, web UI link, port, the four
+- No new share needed: SD2NAS creates `Staging/` and `.sd2nas/` inside the
+  existing `photos` share.
+- Template `deploy/unraid/sd2nas.xml`: repository, web UI link, port, the three
   paths (with `/cards` as RW/Slave), `TZ`, `UMASK=000`, optional
   `SD2NAS_TOKEN`, and `--user 99:100` in Extra Parameters. The image isn't
   linuxserver-based, so it doesn't use their `PUID`/`PGID` convention; the
@@ -583,7 +574,7 @@ image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
   the Docker tab like any CA app.
 
 **Local development**
-- `go run ./cmd/sd2nas --cards ./testdata/cards --staging ./tmp/staging --archive ./tmp/archive --config ./tmp/config`
+- `go run ./cmd/sd2nas --cards ./testdata/cards --photos ./tmp/photos --config ./tmp/config`
 - `npm run dev` in `web/` with a Vite proxy to the Go server
 - `deploy/docker-compose.dev.yml` runs the real image on the desktop against
   test folders before deploying
@@ -595,7 +586,8 @@ image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
 | Topic | Decision |
 |---|---|
 | Archive layout | One flat list of `YYYY-MM-DD - Title` folders, about 150k photos. Each is a Capture One session with CameraImport's layout inside. Promote pattern defaults to `{name}`. |
-| Staging location | 1 TB cache SSD (~600 GB free), separate cache-only share, plus a safety copy on the array until promoted |
+| Storage | Everything on the array in the `photos` share (dual parity, no cache): `/mnt/user/photos/Archive` and `/mnt/user/photos/Staging`. Only the database and thumbnail cache live on the cache SSD. No safety copy. |
+| Capture One | Sessions are created by hand after promoting; SD2NAS ignores them for now |
 | Day cutoff | Setting `day_starts_at`, default 04:00 |
 | Clock errors | Automatic warnings for certain cases and GPS mismatches in v1; manual shift tool in M7 |
 | RAW previews | `exiftool` in the image |
@@ -603,15 +595,7 @@ image size is about 120 MB. Exposes 8080, runs as `99:100`, with a
 | Frontend | Svelte 5 + Vite, single-page app with no SvelteKit. The UI is written from scratch, so there's no reason to start on the older version. |
 | Dependencies | Approved: `modernc.org/sqlite`. Carried over: `goexif`, `go-mp4`, `imaging`. Frontend: `svelte`, `vite`. |
 
-### Still open
-1. **Capture One step.** After promoting, how do you create the session today?
-   If Capture One expects the folder to be empty or named a certain way, promote
-   may need to adapt. And what goes in `Other/`?
-2. **Cache pool redundancy.** Is the cache a single SSD or a mirrored pool?
-   With a single SSD the safety copy should stay on; with a mirror it could be
-   optional.
-3. **Archive share path.** The exact share and path of the archive on the NAS
-   (the plan assumes `/mnt/user/Photos`).
+No open questions remain; the next unknowns are hardware checks in M0.
 
 ---
 
@@ -624,7 +608,6 @@ is what "done" means.
 - [ ] Card reader tested with Unassigned Devices: insert-triggered or reader-plug only
 - [ ] Confirm the variables Unassigned Devices passes to device scripts (`LABEL`, `SERIAL`, `MOUNTPOINT`) on your Unraid version
 - [ ] Confirm Unraid's SMB hides dot-folders (`.sd2nas/`)
-- [ ] `PhotoStaging` share created on the cache pool
 - [ ] Go module, `cmd/sd2nas` serving "hello" and `/healthz`
 - [ ] Dockerfile builds; image runs locally
 - [ ] CI and release workflows publish `ghcr.io/aspiziri/sd2nas:edge`
@@ -638,7 +621,7 @@ is what "done" means.
 ### M2: Catalog and ingest (headless)
 - [ ] Schema and migrations; catalog tests on a temp database
 - [ ] Ingest job against a folder of fixtures: new, known, seen before, failed
-- [ ] Safety copy, space check and `safe_to_format` logic
+- [ ] Space check and `safe_to_format` logic
 - [ ] Clock checks (future date, reset default, GPS mismatch)
 - [ ] `POST /api/ingest?wait=1` returns the summary
 - [ ] Re-running on the same folder imports 0 files
@@ -654,8 +637,8 @@ is what "done" means.
 ### M4: Staging operations
 - [ ] Rename, merge, move files, cull, discard, promote (background job), all with tests on temp dirs
 - [ ] Folder locks; 409 on conflict with a running ingest
-- [ ] Startup reconcile for changes made over SMB; redo missing safety copies
-- [ ] Free-space and age warnings
+- [ ] Startup reconcile for changes made over SMB
+- [ ] Staging age warnings
 - [ ] Touch-friendly selection (long-press to start selecting, swipe-select in grids)
 
 ### M5: Archive indexer
