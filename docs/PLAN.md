@@ -637,8 +637,8 @@ is what "done" means.
 - [x] Phone notifications: Unraid notification agent configured, with Agents ticked for Notices as well (successful imports are sent as `normal`)
 - [x] Go module, `cmd/sd2nas` serving "hello" and `/healthz`
 - [x] Dockerfile builds; image runs locally
-- [ ] CI and release workflows publish `ghcr.io/aspiziri/sd2nas:edge`
-- [ ] Image installed on Unraid from the template and reachable at `http://tower:8080`
+- [x] CI and release workflows publish `ghcr.io/aspiziri/sd2nas:edge`
+- [x] Image installed on Unraid from the template and reachable at `http://tower:8080`; `/healthz` ok with uid 99, gid 100, `TZ` passed in by Unraid, photos and config writable
 
 ### M1: Media core
 - [ ] `internal/media` ported with CameraImport's tests passing
