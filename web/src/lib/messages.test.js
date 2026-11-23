@@ -1,0 +1,82 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { plural, joinList, describeError, rescanSummary, promoteSummary, promoteStates } from './messages.js';
+import { ApiError } from './api.js';
+
+const scan = (o) => ({ adopted_folders: 0, added_files: 0, moved_files: 0, restored_files: 0, culled_files: 0, removed_folders: 0,
+  duplicates: 0, busy_folders: 0, errors: [], skipped: '', ...o });
+
+test('plural and joinList', () => {
+  assert.equal(plural(1, 'file', 'files'), '1 file');
+  assert.equal(plural(1204, 'file', 'files'), '1,204 files');
+  assert.equal(joinList(['a']), 'a');
+  assert.equal(joinList(['a', 'b']), 'a and b');
+  assert.equal(joinList(['a', 'b', 'c']), 'a, b and c');
+});
+
+test('describeError keeps server sentences and explains the rest', () => {
+  assert.equal(describeError(new ApiError(409, '2025-05-30 is being imported into. Try again when the import finishes.', { code: 'folder_busy' })),
+    '2025-05-30 is being imported into. Try again when the import finishes.');
+  assert.match(describeError(new ApiError(503, 'catalog: boom')), /^SD2NAS can't do that right now: catalog: boom/);
+  assert.match(describeError(new ApiError(0, 'SD2NAS is not reachable: x')), /^SD2NAS is not reachable/);
+  assert.equal(describeError(new Error('boom')), 'boom');
+});
+
+test('describeError passes every busy holder and the other 4xx sentences through', () => {
+  for (const [status, msg, data] of [
+    [409, 'X is busy with another change. Try again in a moment.', { code: 'folder_busy', holder: 'operation', folder_id: 3 }],
+    [409, 'X is being rescanned. Try again in a moment.', { code: 'folder_busy', holder: 'rescan' }],
+    [409, 'X is waiting to be promoted.', { code: 'folder_busy', holder: 'promote', folder_id: 3 }],
+    [409, 'X is being promoted.', { code: 'folder_busy', holder: 'promote', folder_id: 3 }],
+    [409, 'A folder with that name already exists in Staging. Pick another title.', { code: 'name_taken' }],
+    [409, 'Those files changed. Reload and try again.', { code: 'changed' }],
+    [409, 'An import is running.', { code: 'ingest_running' }],
+    [409, 'Already forgotten.', { code: 'already_forgotten' }],
+    [400, 'The title contains "/", which can\'t be used in a folder name.', null],
+    [404, 'That folder no longer exists.', null],
+  ]) {
+    assert.equal(describeError(new ApiError(status, msg, data)), msg);
+  }
+});
+
+test('describeError falls back to a sentence when the body has none', () => {
+  assert.match(describeError(new ApiError(409, '', { code: 'name_taken' })), /already exists in Staging/);
+  assert.match(describeError(new ApiError(409, '', { code: 'folder_busy', holder: 'promote' })), /busy/);
+  assert.match(describeError(new ApiError(404, '')), /no longer exists/);
+  assert.match(describeError(new ApiError(503, '')), /^SD2NAS can't do that right now: /);
+  assert.equal(describeError(null), '');
+});
+
+test('rescanSummary', () => {
+  assert.equal(rescanSummary(scan({})), 'Staging already matched the disk.');
+  assert.equal(rescanSummary(scan({ adopted_folders: 1, added_files: 3, culled_files: 1 })),
+    'Rescan found 1 new folder, 3 new files and 1 file gone.');
+  assert.match(rescanSummary(scan({ busy_folders: 2 })), /2 folders were busy and skipped/);
+  assert.match(rescanSummary(scan({ errors: ['x changed while it was read'] })), /1 problem: x changed while it was read/);
+  assert.equal(rescanSummary(scan({ skipped: 'Staging/ is missing' })), 'Rescan skipped: Staging/ is missing');
+});
+
+test('promoteSummary', () => {
+  const folders = [{ state: 'done' }, { state: 'moving' }];
+  assert.equal(promoteSummary({ state: 'running', folders, files_done: 10, files_total: 40 }), 'Promoting folder 2 of 2 · 10 of 40 files');
+  assert.equal(promoteSummary({ state: 'done', folders: [{ state: 'done' }, { state: 'done' }], files_done: 40, files_total: 40 }),
+    'Promoted 2 folders (40 files) to the archive.');
+  assert.equal(promoteSummary({ state: 'failed', folders: [{ state: 'done' }, { state: 'failed' }], files_done: 20, files_total: 40 }),
+    '1 of 2 folders could not be promoted.');
+  assert.equal(promoteSummary({ state: 'cancelled', folders: [{ state: 'waiting' }], files_done: 0, files_total: 5 }), 'Promote cancelled.');
+  assert.equal(promoteSummary({ state: 'queued', folders: [{ state: 'waiting' }], files_done: 0, files_total: 5 }), '1 folder is waiting to be promoted.');
+});
+
+test('promoteStates marks the folders of the running job and the queue', () => {
+  assert.equal(promoteStates(null).size, 0);
+  const queue = {
+    running: { id: 1, folders: [{ id: 10, state: 'done' }, { id: 11, state: 'moving' }, { id: 12, state: 'waiting' }] },
+    queued: [{ id: 2, folders: [{ id: 20, state: 'waiting' }] }],
+    last: null,
+  };
+  const m = promoteStates(queue);
+  assert.equal(m.has(10), false); // done: it has left staging
+  assert.deepEqual(m.get(11), { job: 1, state: 'moving', cancellable: false });
+  assert.deepEqual(m.get(12), { job: 1, state: 'waiting', cancellable: false });
+  assert.deepEqual(m.get(20), { job: 2, state: 'waiting', cancellable: true });
+});
