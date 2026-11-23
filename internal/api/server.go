@@ -10,6 +10,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/aspiziri/SD2NAS/internal/catalog"
 )
 
 // PathInfo describes one of the mounted directories.
@@ -45,6 +47,11 @@ type Server struct {
 	bg        sync.WaitGroup // background goroutines (ingest feed, thumbnail warm-up)
 	closers   []func()       // run by Close once bg has stopped (e.g. the thumbnail cache)
 	closeOnce sync.Once
+
+	feedInterval time.Duration // DefaultFeedInterval; set before MountIngest
+	feed         *ingestFeed   // set by MountIngest
+	hookMu       sync.Mutex
+	finished     []func(catalog.Ingest)
 }
 
 // New builds the server and probes writable mounts once. Probing on every
@@ -65,6 +72,7 @@ func New(version string, mounts []Mount) *Server {
 	s.log = slog.Default()
 	s.hub = NewHub()
 	s.keepalive = DefaultKeepalive
+	s.feedInterval = DefaultFeedInterval
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /api/events", s.handleEvents)
@@ -91,6 +99,20 @@ func (s *Server) Close() {
 			c()
 		}
 	})
+}
+
+// addFinishedHook registers fn to run, on the feed goroutine, for every
+// ingest that finishes. fn must not block.
+func (s *Server) addFinishedHook(fn func(catalog.Ingest)) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.finished = append(s.finished, fn)
+}
+
+func (s *Server) finishedHooks() []func(catalog.Ingest) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	return append([](func(catalog.Ingest))(nil), s.finished...)
 }
 
 // AddProblem adds a permanent /healthz problem (for example, the catalog

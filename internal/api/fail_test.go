@@ -191,6 +191,7 @@ func newBrokenIngestServer(t *testing.T, closeManager bool) (s *Server, card str
 	}
 	s = New("test", nil)
 	s.MountIngest(m, db, time.Minute)
+	t.Cleanup(s.Close)
 	return s, card
 }
 
