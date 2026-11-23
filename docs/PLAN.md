@@ -641,9 +641,14 @@ is what "done" means.
 - [x] Image installed on Unraid from the template and reachable at `http://tower:8080`; `/healthz` ok with uid 99, gid 100, `TZ` passed in by Unraid, photos and config writable
 
 ### M1: Media core
-- [ ] `internal/media` ported with CameraImport's applicable tests ported and passing
-- [ ] `CopyHashed`, `QuickFingerprint`, `mvhd` capture time, day cutoff
-- [ ] Fixtures synthesized by `internal/media/mediatest` and committed under `testdata/cards/...`
+- [x] `internal/media` ported with CameraImport's applicable tests ported and passing
+- [x] `CopyHashed`, `QuickFingerprint`, `mvhd` capture time, day cutoff
+- [x] Fixtures synthesized by `internal/media/mediatest` and committed under `testdata/cards/...`
+
+Implementation plan: `docs/plans/m1-media-core.md`. CR3 files get no EXIF
+capture time yet (goexif can't read ISO-BMFF); they fall back to the file's
+modified time with `ErrExifUnsupported`. Reading CR3's `CMT1`/`CMT2` boxes is
+left for later.
 
 ### M2: Catalog and ingest (headless)
 - [ ] Schema and migrations; catalog tests on a temp database
@@ -652,6 +657,11 @@ is what "done" means.
 - [ ] Clock checks (future date, reset default, GPS mismatch)
 - [ ] `POST /api/ingest?wait=1` returns the summary
 - [ ] Re-running on the same folder imports 0 files
+- [ ] Before copying, clean up stale `*.partial` files left by a crash or a pulled card (`CopyHashed` refuses to overwrite them)
+- [ ] After `CopyHashed`, fsync the destination folder on Linux before counting the file toward "safe to format"
+- [ ] `CopyHashed` closes the source explicitly before the final rename, so any error means no destination file was created
+- [ ] Tell a missing destination folder from a missing card file (both wrap `fs.ErrNotExist`; check `PathError.Path`) and a taken name from a stale partial (both wrap `fs.ErrExist`)
+- [ ] Measure RAW ingest on the NAS: EXIF reading and the copy each read the whole file from the card
 
 ### M3: Web UI, read-only
 - [ ] Svelte app embedded; request guard on all changing endpoints
