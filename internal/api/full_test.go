@@ -70,6 +70,7 @@ func newFullServer(t *testing.T) fullServer {
 			}
 		}})
 	s.MountStaging(svc) // s.Close closes svc
+	s.MountForget(m, db, svc)
 	s.MountThumbs(db, cache, photos)
 	t.Cleanup(s.Close)
 	return fullServer{s: s, card: card, photos: photos, config: config, db: db, cache: cache, locks: locks, svc: svc, mgr: m}

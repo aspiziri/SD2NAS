@@ -112,6 +112,8 @@ func run(log *slog.Logger) error {
 		mgr.Start()
 		srv.MountIngest(mgr, db, api.DefaultMaxWait)
 		srv.MountStaging(svc) // srv.Close closes svc
+		srv.MountForget(mgr, db, svc)
+		svc.StartRescan() // §8: fix drift from SMB edits made while SD2NAS was down
 		if cacheErr != nil {
 			log.Error("thumbnail cache unavailable", "err", cacheErr)
 			srv.AddProblem("thumbnails: " + cacheErr.Error())

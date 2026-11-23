@@ -37,12 +37,22 @@ func (s *Server) MountStaging(svc *staging.Service) {
 	s.mux.HandleFunc("POST /api/staging/merge", h.merge)
 	s.mux.HandleFunc("POST /api/staging/move", h.move)
 	s.mux.HandleFunc("POST /api/staging/cull", h.cull)
+	s.mux.HandleFunc("POST /api/staging/promote", h.promote)
+	s.mux.HandleFunc("GET /api/staging/promote", h.promoteStatus)
+	s.mux.HandleFunc("DELETE /api/staging/promote/{jobId}", h.cancelPromote) // no clash: DELETE /api/staging/{id} has one segment fewer
+	s.mux.HandleFunc("POST /api/staging/rescan", h.rescan)
 	// The snapshot runs outside the hub's lock, and the OnChange callback
 	// only publishes, so neither inverts the service's lock order.
 	s.hub.AddSnapshot(func() (string, any, error) { return EventStagingChanged, svc.Status(), nil })
 	svc.OnChange(func(st staging.Status) {
 		if err := s.hub.Publish(EventStagingChanged, st); err != nil {
 			s.log.Error("publish staging.changed", "err", err)
+		}
+	})
+	s.hub.AddSnapshot(func() (string, any, error) { return EventPromoteProgress, svc.Promotes(), nil })
+	svc.OnPromote(func(q staging.PromoteQueue) {
+		if err := s.hub.Publish(EventPromoteProgress, q); err != nil {
+			s.log.Error("publish promote.progress", "err", err)
 		}
 	})
 	s.addFinishedHook(func(catalog.Ingest) { svc.Touch() }) // new files may have landed
@@ -257,6 +267,45 @@ func (h *stagingHandlers) cull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (h *stagingHandlers) promote(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs     []int64 `json:"ids"`
+		Pattern string  `json:"pattern"`
+	}
+	if err := decodeBody(w, r, &body, smallBody); err != nil {
+		writeError(w, http.StatusBadRequest, "The request body is not valid JSON.")
+		return
+	}
+	job, err := h.svc.Promote(opContext(r), body.IDs, body.Pattern)
+	if err != nil {
+		writeOpError(w, h.log, "folder", "promote staging folders", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
+}
+
+func (h *stagingHandlers) promoteStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.svc.Promotes())
+}
+
+func (h *stagingHandlers) cancelPromote(w http.ResponseWriter, r *http.Request) {
+	id, err := positiveInt(r.PathValue("jobId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "The promote id must be a positive whole number.")
+		return
+	}
+	job, err := h.svc.CancelPromote(id)
+	if err != nil {
+		writeOpError(w, h.log, "promote", "cancel promote", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job": job})
+}
+
+func (h *stagingHandlers) rescan(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusAccepted, map[string]bool{"started": h.svc.StartRescan()})
 }
 
 func (h *stagingHandlers) list(w http.ResponseWriter, r *http.Request) {
