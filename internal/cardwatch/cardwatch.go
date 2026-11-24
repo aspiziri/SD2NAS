@@ -141,6 +141,20 @@ func (w *Watcher) tick(now time.Time) {
 			delete(w.handled, name) // gone: next time it is a new card
 		}
 	}
+	// A handled folder that stays but stops being a mount point (Unassigned
+	// Devices can leave the folder behind after an unmount) is re-armed, so
+	// the next card mounted there is new. An error keeps it handled.
+	for name := range w.handled {
+		dir := filepath.Join(w.cfg.Root, name)
+		mounted, err := w.isMount(dir, w.cfg.Root)
+		if err != nil {
+			w.log.Warn("card poller: cannot tell whether a handled card is still mounted", "path", dir, "err", err)
+			continue
+		}
+		if !mounted {
+			delete(w.handled, name)
+		}
+	}
 	for name := range w.since {
 		if !present[name] {
 			delete(w.since, name)

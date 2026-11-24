@@ -41,7 +41,9 @@ type harness struct {
 	w      *Watcher
 	logs   *syncBuf
 	mounts map[string]bool
-	mgr    *ingest.Manager
+	// mountErr makes isMount fail for a folder name.
+	mountErr map[string]error
+	mgr      *ingest.Manager
 
 	mu      sync.Mutex
 	reqs    []ingest.Request
@@ -70,7 +72,7 @@ func newHarness(t *testing.T) *harness {
 	runner := ingest.NewRunner(ingest.Config{Catalog: db, PhotosRoot: photos, FreeSpace: plenty, Log: slog.New(slog.DiscardHandler)})
 	// Never started: jobs are recorded and queued, not run.
 	mgr := ingest.NewManager(runner, root)
-	h := &harness{t: t, root: root, logs: &syncBuf{}, mounts: map[string]bool{}, mgr: mgr}
+	h := &harness{t: t, root: root, logs: &syncBuf{}, mounts: map[string]bool{}, mountErr: map[string]error{}, mgr: mgr}
 	h.w = New(Config{
 		Root: root,
 		Submit: func(ctx context.Context, req ingest.Request) (*ingest.Job, error) {
@@ -85,7 +87,12 @@ func newHarness(t *testing.T) *harness {
 		},
 		Log: slog.New(slog.NewTextHandler(h.logs, nil)),
 	})
-	h.w.isMount = func(dir, _ string) (bool, error) { return h.mounts[filepath.Base(dir)], nil }
+	h.w.isMount = func(dir, _ string) (bool, error) {
+		if err := h.mountErr[filepath.Base(dir)]; err != nil {
+			return false, err
+		}
+		return h.mounts[filepath.Base(dir)], nil
+	}
 	t.Cleanup(h.w.Close)
 	return h
 }
@@ -184,6 +191,46 @@ func TestPollerReinsertedCardImportedAgain(t *testing.T) {
 	h.w.tick(t2.Add(5 * time.Second))
 	h.w.tick(t2.Add(15 * time.Second))
 	h.wantSubmits(2, "reinserted")
+}
+
+func TestPollerFolderStaysButUnmountedIsRearmed(t *testing.T) {
+	h := newHarness(t)
+	h.w.tick(t0)
+	h.card("CARD", "DCIM")
+	h.w.tick(t0.Add(5 * time.Second))
+	h.w.tick(t0.Add(15 * time.Second))
+	h.wantSubmits(1, "first")
+	// Unmounted, but the folder is left in place.
+	h.mounts["CARD"] = false
+	h.w.tick(t0.Add(30 * time.Second))
+	h.w.tick(t0.Add(40 * time.Second))
+	h.wantSubmits(1, "while unmounted")
+	// Mounted again at the same name.
+	h.mounts["CARD"] = true
+	h.w.tick(t0.Add(50 * time.Second))
+	h.wantSubmits(1, "settling")
+	h.w.tick(t0.Add(60 * time.Second))
+	h.wantSubmits(2, "second mount")
+	h.w.tick(t0.Add(80 * time.Second))
+	h.wantSubmits(2, "once only")
+}
+
+func TestPollerMountErrorDoesNotRearm(t *testing.T) {
+	h := newHarness(t)
+	h.w.tick(t0)
+	h.card("CARD", "DCIM")
+	h.w.tick(t0.Add(5 * time.Second))
+	h.w.tick(t0.Add(15 * time.Second))
+	h.wantSubmits(1, "first")
+	h.mountErr["CARD"] = errors.New("stat failed")
+	for i := range 5 {
+		h.w.tick(t0.Add(time.Duration(30+10*i) * time.Second))
+	}
+	delete(h.mountErr, "CARD")
+	for i := range 5 {
+		h.w.tick(t0.Add(time.Duration(100+10*i) * time.Second))
+	}
+	h.wantSubmits(1, "after errors")
 }
 
 func TestPollerIgnoresNonCards(t *testing.T) {
