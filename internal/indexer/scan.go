@@ -89,6 +89,18 @@ func (sc *scan) inScope(rel string) bool {
 	return true
 }
 
+// replaced reports whether e's path is known to hold other content this pass,
+// so a file there is no sign that e is back: the path was read with other
+// content, or another row is confirmed there (two rows can share a path after
+// a pass stopped between a move onto it and its check).
+func (sc *scan) replaced(e catalog.ArchiveEntry) bool {
+	if sc.readOther[e.RelPath] {
+		return true
+	}
+	p, ok := sc.byPath[e.RelPath]
+	return ok && p.SHA256 != e.SHA256 && sc.seen[p.SHA256]
+}
+
 // hasCopy reports whether a copy of content sha was seen at another path this pass.
 func (sc *scan) hasCopy(sha string) bool {
 	_, ok := sc.seenCopies[sha]
@@ -208,7 +220,7 @@ func (sc *scan) check() error {
 		if h := s.beforeMissing; h != nil {
 			h(e.RelPath)
 		}
-		if !sc.readOther[e.RelPath] { // a path read with other content this pass is known to be replaced
+		if !sc.replaced(e) {
 			_, err := os.Lstat(sc.abs(e.RelPath))
 			if err == nil {
 				continue // it is back: the next pass reads it
@@ -453,16 +465,9 @@ func (sc *scan) resolve(f file) error {
 	if err != nil {
 		return err
 	}
+	// Not an asset; it may still be an alias (an earlier version of an asset
+	// changed in place): RecordArchiveChange and IndexAsset both drop that alias.
 	a, known := found[f.sha]
-	var earlier catalog.Asset // set when f.sha is only an alias: the asset it is an earlier version of
-	if !known {
-		if earlier, err = sc.aliasTarget(f.sha); err != nil {
-			return err
-		}
-	}
-	// RecordArchiveChange needs a hash the catalog doesn't know; a revert to
-	// an earlier version of the edited asset is one it can take.
-	unknown := !known && (earlier.SHA256 == "" || f.editedFrom != nil && earlier.SHA256 == f.editedFrom.SHA256)
 	switch {
 	case known && a.State == catalog.StateArchived && a.RelPath == f.rel:
 		// already recorded here (a promote finished during the pass): never a copy of itself
@@ -473,7 +478,7 @@ func (sc *scan) resolve(f file) error {
 		if err == nil {
 			sc.r.Unchanged++
 		}
-	case unknown && f.editedFrom != nil && !sc.hasCopy(f.editedFrom.SHA256):
+	case !known && f.editedFrom != nil && !sc.hasCopy(f.editedFrom.SHA256):
 		// the file at this path now holds new content
 		err = db.RecordArchiveChange(sc.dbctx, *f.editedFrom, f.sha, f.fp, f.size, f.mtime, now)
 		if err == nil {
@@ -481,15 +486,6 @@ func (sc *scan) resolve(f file) error {
 			sc.seen[f.editedFrom.SHA256] = true // the old row no longer exists
 			sc.seen[f.sha] = true
 		}
-	case !known && earlier.SHA256 != "":
-		// Indexing it would make an alias key an asset hash, which a later
-		// change in place of this file could not record.
-		at := earlier.RelPath
-		if at == "" {
-			at = "a file no longer in the archive"
-		}
-		sc.r.errorf("%s holds an earlier version of %s, which was changed in place; it is not indexed", f.rel, at)
-		return nil
 	case !known:
 		// New content; an edited path whose old content survives as a copy
 		// lands here too, and the old content moves to that copy in check.
@@ -541,20 +537,4 @@ func (sc *scan) resolve(f file) error {
 		err = db.AddFingerprint(sc.dbctx, f.fp, a.SHA256) // insert-or-ignore: later moves of this file take the shortcut
 	}
 	return err
-}
-
-// aliasTarget returns the asset that content sha is an earlier version of,
-// or a zero Asset when sha is no alias (AssetsByHash found no asset for it).
-func (sc *scan) aliasTarget(sha string) (catalog.Asset, error) {
-	a, err := sc.s.db.AssetBySHA(sc.dbctx, sha)
-	if errors.Is(err, catalog.ErrNotFound) {
-		return catalog.Asset{}, nil
-	}
-	if err != nil {
-		return catalog.Asset{}, err
-	}
-	if a.SHA256 == sha { // became an asset since AssetsByHash; IndexAsset then reports the conflict
-		return catalog.Asset{}, nil
-	}
-	return a, nil
 }

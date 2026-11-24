@@ -807,9 +807,31 @@ func TestCopiedThenEditedInPlace(t *testing.T) {
 	}
 }
 
+// The cost of reading new paths first: when the edited content is also
+// duplicated to a new path in the same pass, the new path gets the edit, the
+// edited path becomes its copy, and the old content is missing (no change entry).
+func TestEditDuplicatedInSamePass(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "original", t0)
+	rescan(t, s)
+	put(t, photos, "Archive/T/a.JPG", "edited!!", t0.Add(time.Hour))
+	put(t, photos, "Archive/T/c.JPG", "edited!!", t0.Add(time.Hour))
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Added: 1, Copies: 1, Missing: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "edited!!", catalog.StateArchived, "Archive/T/c.JPG")
+	wantAsset(t, db, "original", catalog.StateMissing, "Archive/T/a.JPG")
+	if c := copyRows(t, db); len(c) != 1 || c[0].RelPath != "Archive/T/a.JPG" || c[0].SHA256 != sum("edited!!") {
+		t.Errorf("copy rows = %+v", c)
+	}
+	if ch := changeEntries(t, db); len(ch) != 0 {
+		t.Errorf("changes = %+v", ch)
+	}
+}
+
 // Content the catalog knows only as an alias (an earlier version of an
-// asset changed in place) is never made an asset of its own.
-func TestEarlierVersionLeftOut(t *testing.T) {
+// asset changed in place) found at a path of its own becomes an asset again.
+func TestEarlierVersionIndexedAgain(t *testing.T) {
 	s, db, photos := setup(t)
 	put(t, photos, "Archive/T/a.JPG", "original", t0)
 	rescan(t, s)
@@ -817,14 +839,89 @@ func TestEarlierVersionLeftOut(t *testing.T) {
 	rescan(t, s)
 	put(t, photos, "Archive/T/c.JPG", "original", t0)
 	r := rescan(t, s)
-	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1})
-	want := []string{"Archive/T/c.JPG holds an earlier version of Archive/T/a.JPG, which was changed in place; it is not indexed"}
-	if !reflect.DeepEqual(r.Errors, want) {
-		t.Errorf("errors = %q; want %q", r.Errors, want)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Added: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "original", catalog.StateArchived, "Archive/T/c.JPG")
+	wantAsset(t, db, "edited!!", catalog.StateArchived, "Archive/T/a.JPG")
+	if a, err := db.AssetBySHA(t.Context(), sum("original")); err != nil || a.SHA256 != sum("original") {
+		t.Errorf("AssetBySHA(original) = %+v, %v; want the original itself", a, err)
 	}
-	noAsset(t, db, "original")
-	if a, err := db.AssetBySHA(t.Context(), sum("original")); err != nil || a.SHA256 != sum("edited!!") {
-		t.Errorf("AssetBySHA(original) = %+v, %v", a, err)
+	n, fp := countHashes(s), countFingerprints(s)
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 2})
+	if n.Load() != 0 || fp.Load() != 0 {
+		t.Errorf("reads after: %d hashes, %d fingerprints; want none", n.Load(), fp.Load())
+	}
+}
+
+// A revert while a copy of the edit exists: the path gets the original back
+// as an asset, and the edit moves to its copy.
+func TestRevertWithCopyOfEdit(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "version-a", t0)
+	rescan(t, s)
+	put(t, photos, "Archive/T/a.JPG", "version-b!", t0.Add(time.Hour))
+	rescan(t, s)
+	put(t, photos, "Archive/T/d.JPG", "version-b!", t0.Add(time.Hour))
+	if r := rescan(t, s); r.Copies != 1 {
+		t.Fatalf("copy of the edit: %+v", r)
+	}
+	put(t, photos, "Archive/T/a.JPG", "version-a", t0.Add(2*time.Hour))
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Added: 1, Moved: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "version-a", catalog.StateArchived, "Archive/T/a.JPG")
+	wantAsset(t, db, "version-b!", catalog.StateArchived, "Archive/T/d.JPG")
+	if c := copyRows(t, db); len(c) != 0 {
+		t.Errorf("copy rows = %+v", c)
+	}
+	n, fp := countHashes(s), countFingerprints(s)
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 2})
+	if n.Load() != 0 || fp.Load() != 0 {
+		t.Errorf("reads after: %d hashes, %d fingerprints; want none", n.Load(), fp.Load())
+	}
+}
+
+// A file moved over another archived file, with the pass stopped before its
+// checking phase, leaves two archived rows at one path; the next complete
+// pass marks the overwritten content missing whichever row it keeps.
+func TestMoveOverFileStoppedBeforeCheck(t *testing.T) {
+	for _, tc := range []struct{ from, to, gone string }{
+		{"b.JPG", "a.JPG", "aaaa"},
+		{"a.JPG", "b.JPG", "bbbbbbbb"},
+	} {
+		t.Run(tc.from+" over "+tc.to, func(t *testing.T) {
+			s, db, photos := setup(t)
+			put(t, photos, "Archive/T/a.JPG", "aaaa", t0)
+			put(t, photos, "Archive/T/b.JPG", "bbbbbbbb", t0)
+			put(t, photos, "Archive/T/z.JPG", "zzzz", t0)
+			rescan(t, s)
+			rename(t, photos, "Archive/T/"+tc.from, "Archive/T/"+tc.to)
+			put(t, photos, "Archive/T/z.JPG", "zzzz-changed", t0.Add(time.Hour)) // a later changed path to stop on
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			s.beforeRead = func(_ context.Context, rel string) {
+				if rel == "Archive/T/z.JPG" {
+					cancel()
+				}
+			}
+			r, err := s.Rescan(ctx, TriggerManual, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !r.Stopped || r.Moved != 1 {
+				t.Fatalf("stopped pass = %+v; want Stopped after the move", r)
+			}
+			s.beforeRead = nil
+			r = rescan(t, s)
+			if r.Missing != 1 || len(r.Errors) != 0 {
+				t.Errorf("next pass = %+v; want the overwritten content missing", r)
+			}
+			wantAsset(t, db, tc.gone, catalog.StateMissing, "Archive/T/"+tc.to)
+			r = rescan(t, s)
+			wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 2})
+		})
 	}
 }
 
@@ -842,14 +939,12 @@ func TestMoveShortcutNeedsSameMtime(t *testing.T) {
 	put(t, photos, "Archive/T/c.JPG", "version-a", t0)
 	n := countHashes(s)
 	r := rescan(t, s)
-	wantCounts(t, r, ScanResult{Listed: 1, Missing: 1})
+	wantCounts(t, r, ScanResult{Listed: 1, Added: 1, Missing: 1})
 	if n.Load() != 1 {
 		t.Errorf("hash calls = %d; want 1", n.Load())
 	}
-	want := []string{"Archive/T/c.JPG holds an earlier version of Archive/T/a.JPG, which was changed in place; it is not indexed"}
-	if !reflect.DeepEqual(r.Errors, want) {
-		t.Errorf("errors = %q; want %q", r.Errors, want)
-	}
+	noErrors(t, r)
+	wantAsset(t, db, "version-a", catalog.StateArchived, "Archive/T/c.JPG")
 	wantAsset(t, db, "version-b", catalog.StateMissing, "Archive/T/a.JPG")
 }
 

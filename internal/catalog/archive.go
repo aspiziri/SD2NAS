@@ -203,6 +203,9 @@ func (d *DB) ArchiveCopies(ctx context.Context) ([]ArchiveCopy, error) {
 }
 
 // IndexAsset is InsertAsset plus checked_at = checkedAt, in one transaction.
+// Content that was an alias (an earlier version of an asset changed in place)
+// is an asset of its own from now on: its alias row goes. Fingerprints stay,
+// so the edited asset still matches the old content's fingerprint.
 func (d *DB) IndexAsset(ctx context.Context, a Asset, quickFP string, checkedAt time.Time) error {
 	sha, err := hexToBlob(a.SHA256)
 	if err != nil {
@@ -213,6 +216,9 @@ func (d *DB) IndexAsset(ctx context.Context, a Asset, quickFP string, checkedAt 
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, "UPDATE assets SET checked_at = ? WHERE sha256 = ?", formatTime(checkedAt), sha); err != nil {
+			return fmt.Errorf("index asset %s: %w", a.SHA256, err)
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM aliases WHERE old_sha256 = ?", sha); err != nil {
 			return fmt.Errorf("index asset %s: %w", a.SHA256, err)
 		}
 		if quickFP == "" {

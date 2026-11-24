@@ -159,6 +159,44 @@ func TestIndexAssetSetsCheckedAt(t *testing.T) {
 	}
 }
 
+// An earlier version of an edited asset found as a file of its own becomes an
+// asset again: its alias goes, the edited asset and its fingerprints stay.
+func TestIndexAssetOfAliasKey(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	b := archivedAt(t, d, 2, "Archive/s/a.JPG", 0)
+	a := hexN(1)
+	if err := d.AddAlias(ctx, a, b, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AddFingerprint(ctx, hexN(101), b); err != nil { // A's fingerprint, re-pointed by the change
+		t.Fatal(err)
+	}
+	if err := d.IndexAsset(ctx, Asset{SHA256: a, Size: 1, Kind: media.KindImage, State: StateArchived,
+		RelPath: "Archive/s/c.JPG", Mtime: 1000, UpdatedAt: t1}, hexN(101), t1); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := d.AssetBySHA(ctx, a); err != nil || got.SHA256 != a || got.RelPath != "Archive/s/c.JPG" {
+		t.Errorf("AssetBySHA(A) = %+v, %v; want A itself", got, err)
+	}
+	var n int
+	if err := d.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM aliases").Scan(&n); err != nil || n != 0 {
+		t.Errorf("aliases left = %d, %v", n, err)
+	}
+	if got, err := d.AssetBySHA(ctx, b); err != nil || got.RelPath != "Archive/s/a.JPG" || got.State != StateArchived {
+		t.Errorf("B = %+v, %v", got, err)
+	}
+	got, err := d.AssetsByFingerprint(ctx, hexN(101))
+	if err != nil || len(got) != 2 || got[0].SHA256 != a || got[1].SHA256 != b {
+		t.Errorf("fingerprint finds %+v, %v; want A and B", got, err)
+	}
+	// A later change in place of A's file no longer trips over the old alias.
+	e := ArchiveEntry{SHA256: a, RelPath: "Archive/s/c.JPG", Size: 1, Mtime: 1000, State: StateArchived, UpdatedAt: t1}
+	if err := d.RecordArchiveChange(ctx, e, hexN(3), "", 3, 3000, t2); err != nil {
+		t.Errorf("change of the re-indexed file: %v", err)
+	}
+}
+
 func TestSetArchivePath(t *testing.T) {
 	d := openTest(t)
 	ctx := t.Context()
