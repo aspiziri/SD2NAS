@@ -102,12 +102,15 @@ func TestFullReindexResumes(t *testing.T) {
 	for _, n := range names {
 		put(t, photos, "Archive/T/"+n+".JPG", "content "+n, t0)
 	}
+	clock := newStepClock(s, time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
 	rescan(t, s)
+	clock.add(time.Second)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var reads int
 	s.beforeRead = func(_ context.Context, _ string) {
+		clock.add(time.Millisecond) // each read is recorded after the re-index started
 		reads++
 		if reads == 5 {
 			cancel() // after the fourth read
@@ -185,4 +188,24 @@ func TestFullReindexGoneFile(t *testing.T) {
 	wantCounts(t, r, ScanResult{Listed: 1, Unchanged: 1, Missing: 1})
 	noErrors(t, r)
 	wantAsset(t, db, "bravo", catalog.StateMissing, "Archive/T/b.JPG")
+}
+
+// checked_at and the re-index cut-off are both cut to the millisecond, so a
+// file the last pass read in the millisecond the re-index starts is read
+// again, not taken as verified by the re-index.
+func TestFullReindexRereadsFileCheckedAtItsStart(t *testing.T) {
+	s, _, photos := setup(t)
+	for _, n := range []string{"a", "b", "c"} {
+		put(t, photos, "Archive/T/"+n+".JPG", "content "+n, t0)
+	}
+	clock := newStepClock(s, time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	rescan(t, s)
+	clock.add(999 * time.Microsecond) // the re-index starts in the same millisecond
+	n := countHashes(s)
+	r := fullRescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 3, Unchanged: 3})
+	noErrors(t, r)
+	if n.Load() != 3 {
+		t.Errorf("full reads = %d; want 3", n.Load())
+	}
 }

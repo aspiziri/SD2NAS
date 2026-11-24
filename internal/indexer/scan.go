@@ -43,7 +43,7 @@ func (s *Service) runPass(ctx context.Context, trigger string, full bool) (ScanR
 	started := s.beginPass(trigger, full)
 	dbctx := context.WithoutCancel(ctx)
 	// An unfinished re-index is continued whatever the trigger; checked_at has
-	// millisecond precision, so the cut-off does too.
+	// millisecond precision, so the cut-off does too (see mustReread).
 	rereadBefore, err := s.db.PendingReread(dbctx)
 	var id int64
 	if err == nil {
@@ -129,9 +129,12 @@ func (sc *scan) abs(rel string) string {
 }
 
 // mustReread reports whether a file last read at checkedAt is due for a
-// re-read whatever its size and time say (a re-index).
+// re-read whatever its size and time say (a re-index). A file read in the
+// re-index's starting millisecond is read again: both times are cut to the
+// millisecond, so it may have been read just before the re-index started.
+// Only a resumed re-index pays for that, with an extra read.
 func (sc *scan) mustReread(checkedAt time.Time) bool {
-	return !sc.rereadBefore.IsZero() && checkedAt.Before(sc.rereadBefore)
+	return !sc.rereadBefore.IsZero() && !checkedAt.After(sc.rereadBefore)
 }
 
 // reindex reports a re-index pass: a file never read before must be read
