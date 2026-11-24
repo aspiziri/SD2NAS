@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -56,6 +57,21 @@ func (f *ingestFeed) watch(j *ingest.Job) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.watched[j.ID()] = j
+}
+
+// SubmitIngest queues an import as POST /api/ingest does, and registers it
+// with the ingest feed, so a short import still sends ingest.finished. It
+// fails when MountIngest hasn't run.
+func (s *Server) SubmitIngest(ctx context.Context, req ingest.Request) (*ingest.Job, error) {
+	if s.feed == nil {
+		return nil, errors.New("api: ingest is not mounted")
+	}
+	j, err := s.feed.m.Submit(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	s.feed.watch(j)
+	return j, nil
 }
 
 // snapshot is what a new client receives. If it differs from the last body

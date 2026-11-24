@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,8 +15,8 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/ingest"
 )
 
-// DefaultMaxWait is the ?wait=1 ceiling; it matches the card script's
-// curl --max-time 7200.
+// DefaultMaxWait is the ?wait=1 ceiling. The card script's curl --max-time 7260
+// waits 60 s longer, so this reply reaches it first.
 const DefaultMaxWait = 2 * time.Hour
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -64,6 +65,7 @@ type ingestHandlers struct {
 	db      *catalog.DB
 	maxWait time.Duration
 	feed    *ingestFeed
+	submit  func(context.Context, ingest.Request) (*ingest.Job, error)
 }
 
 // MountIngest registers the ingest endpoints. Call it before serving.
@@ -71,7 +73,7 @@ func (s *Server) MountIngest(m *ingest.Manager, db *catalog.DB, maxWait time.Dur
 	f := &ingestFeed{m: m, hub: s.hub, log: s.log, hooks: s.finishedHooks, watched: map[int64]*ingest.Job{}}
 	s.feed = f
 	s.hub.AddSnapshot(f.snapshot)
-	h := &ingestHandlers{m: m, db: db, maxWait: maxWait, feed: f}
+	h := &ingestHandlers{m: m, db: db, maxWait: maxWait, feed: f, submit: s.SubmitIngest}
 	s.mux.HandleFunc("POST /api/ingest", h.post)
 	s.mux.HandleFunc("GET /api/ingest/current", h.current)
 	s.mux.HandleFunc("GET /api/ingests", h.list)
@@ -140,7 +142,7 @@ func (h *ingestHandlers) post(w http.ResponseWriter, r *http.Request) {
 		writeFail(w, r, http.StatusBadRequest, "path is required")
 		return
 	}
-	job, err := h.m.Submit(r.Context(), ingest.Request{Path: body.Path, Label: body.Label, UUID: body.UUID})
+	job, err := h.submit(r.Context(), ingest.Request{Path: body.Path, Label: body.Label, UUID: body.UUID})
 	switch {
 	case errors.Is(err, ingest.ErrBadCardPath):
 		writeFail(w, r, http.StatusBadRequest, err.Error())
@@ -152,7 +154,6 @@ func (h *ingestHandlers) post(w http.ResponseWriter, r *http.Request) {
 		writeFail(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.feed.watch(job)
 	if !wait {
 		h.respond(w, http.StatusAccepted, job, text)
 		return
