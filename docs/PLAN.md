@@ -637,8 +637,8 @@ runs SD2NAS as `PUID:PGID` (default `99:100`) using `su-exec`. It never chowns
   the Card poller variable (`SD2NAS_POLL_CARDS`, default `false`), and no token
   variable until M7. The install steps are in `README.md`.
 - Startup takes `/config/sd2nas.lock`; a second instance exits with code 3.
-- Install by adding the repo's `deploy/unraid` URL under Docker → Template
-  repositories, or by pasting the values into Add Container. Updates show up in
+- Install by adding the repo URL (`https://github.com/aspiziri/SD2NAS`) under
+  Docker → Template repositories, or by pasting the values into Add Container. Updates show up in
   the Docker tab like any CA app.
 
 **Local development**
