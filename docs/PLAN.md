@@ -495,7 +495,10 @@ Tailscale for remote access.
 `deploy/unassigned-devices.sh` is attached to the card reader in Unassigned
 Devices with **Automount: on**, **Read Only: on**, **Share: off** and **Run
 Device Script File in the background: Yes** (the script blocks until the import
-finishes, which can take a long time).
+finishes, which can take a long time). Unassigned Devices names each slot's
+script file after the device and doesn't let you change its path, so each
+slot's script is a two-line wrapper,
+`exec bash /boot/config/plugins/unassigned.devices/sd2nas.sh` (README).
 
 The script is `deploy/unassigned-devices.sh` (README: install, `sd2nas.cfg`).
 Unassigned Devices passes `ACTION`, `DEVICE`, `LABEL`, `SERIAL` and
@@ -875,7 +878,7 @@ Implementation plan: `docs/plans/m6-unraid-integration.md`.
 **On the NAS (the owner's).** These can't be done from the repository:
 1. Update the container. Edit it → Advanced View → Extra Parameters `--restart=unless-stopped`; set Card poller `false`. Check whether Docker → Template repositories with `https://github.com/aspiziri/SD2NAS` finds the template; if not, remove that method from the README.
 2. Install the script and `sd2nas.cfg` (`SD2NAS_URL=http://localhost:4040`) as the README says.
-3. Set both reader slots in Unassigned Devices: Automount on, Read Only on, Share off, script `/boot/config/plugins/unassigned.devices/sd2nas.sh`, run in the background. Check that the option names match the README.
+3. Set both reader slots in Unassigned Devices: Automount on, Read Only on, Share off, Enable Device Script and run in the background on, and the slot's Device Script content replaced with the README's two-line wrapper (`exec bash /boot/config/plugins/unassigned.devices/sd2nas.sh`). Unassigned Devices fixes each slot's script path (e.g. `SanDisk_PRO-READER.sh`), so the path can't point at `sd2nas.sh` directly. Check that the option names match the README.
 4. Notification Settings: Agents ticked for Notices, Warnings and Alerts.
 5. User Scripts: `SD2NAS notices`, Hourly, `ACTION=NOTIFY bash /boot/config/plugins/unassigned.devices/sd2nas.sh`. Run it once by hand; `grep sd2nas /var/log/syslog` shows no `could not fetch notices` line.
 6. Insert a real card → a Notice `<card>: N new, … Card safe to format.`, and the card is unmounted in Unassigned Devices. Reinsert it → `0 new, N already known. … Card safe to format.` Tick the end-to-end item with the date and counts.

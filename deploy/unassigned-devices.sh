@@ -1,9 +1,13 @@
 #!/bin/bash
 # SD2NAS card script for Unassigned Devices (docs/PLAN.md §11, README.md).
 #
-# Attach it to every slot of the card reader with Automount on, Read Only on,
-# Share off and "Run Device Script File in the background" on. Unassigned
-# Devices sets ACTION, DEVICE, LABEL, SERIAL and MOUNTPOINT. ACTION=NOTIFY
+# Install it as /boot/config/plugins/unassigned.devices/sd2nas.sh. Each slot of
+# the card reader runs it from its own device script, a two-line wrapper:
+#   #!/bin/bash
+#   exec bash /boot/config/plugins/unassigned.devices/sd2nas.sh
+# with Automount on, Read Only on, Share off and "Run Device Script File in the
+# background" on. Unassigned Devices sets ACTION, DEVICE, LABEL, SERIAL and
+# MOUNTPOINT. ACTION=NOTIFY
 # (User Scripts, hourly) only delivers the notices SD2NAS has queued.
 #
 # Settings go in sd2nas.cfg (SD2NAS_CONF), so updating this script keeps them:
