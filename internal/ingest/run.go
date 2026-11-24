@@ -324,8 +324,10 @@ func knownOutcome(s catalog.AssetState) (catalog.Outcome, error) {
 		return catalog.OutcomeInArchive, nil
 	case catalog.StateStaged:
 		return catalog.OutcomeInStaging, nil
-	case catalog.StateCulled, catalog.StateMissing:
+	case catalog.StateCulled:
 		return catalog.OutcomeSeenBefore, nil
+	case catalog.StateMissing:
+		return catalog.OutcomeMissing, nil
 	}
 	return "", fmt.Errorf("catalog asset has unknown state %q", s)
 }
@@ -711,7 +713,7 @@ func (j *ingestRun) finish(status catalog.IngestStatus, errText string) (catalog
 		}
 	}
 	c := j.counts
-	safe := status == catalog.StatusDone && c.Failed == 0 && c.Unsupported == 0 && c.Seen > 0 // Decision 9
+	safe := status == catalog.StatusDone && c.Failed == 0 && c.Missing == 0 && c.Unsupported == 0 && c.Seen > 0 // Decision 9
 	err := j.cat().FinishIngest(j.dbctx, catalog.Ingest{
 		ID: j.id, Status: status, FinishedAt: j.r.now(), Counts: c, UnsupportedExts: j.exts, ClockWarnings: len(j.warnings),
 		CardSize: j.cardSize, SafeToFormat: safe, Error: errText,
@@ -719,7 +721,7 @@ func (j *ingestRun) finish(status catalog.IngestStatus, errText string) (catalog
 	if err != nil {
 		return catalog.Ingest{}, fmt.Errorf("finish ingest %d: %w", j.id, err)
 	}
-	j.log.Info("ingest finished", "status", status, "seen", c.Seen, "new", c.New, "failed", c.Failed,
+	j.log.Info("ingest finished", "status", status, "seen", c.Seen, "new", c.New, "failed", c.Failed, "missing", c.Missing,
 		"scan", j.scanDur, "classify", j.classifyDur, "capture", j.captureDur, "copy", j.copyDur, "copy_bytes", j.copyBytes)
 	j.p.update(func(s *ProgressSnapshot) { s.Phase = PhaseDone })
 	return j.cat().Ingest(j.dbctx, j.id)

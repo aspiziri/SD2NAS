@@ -58,6 +58,15 @@ func TestDescribe(t *testing.T) {
 		{"unsupported only", func(in *catalog.Ingest) {
 			in.Status, in.Counts, in.UnsupportedExts = catalog.StatusDone, counts{Unsupported: 2}, []string{".crm"}
 		}, LevelWarning, p + "0 new, 0 already known, 2 files not imported (.crm). Do not format the card."},
+		{"missing", func(in *catalog.Ingest) {
+			in.Status, in.Counts = catalog.StatusDone, counts{Seen: 42, InArchive: 40, Missing: 2}
+		}, LevelWarning, p + "0 new, 40 already known, 2 files' archive copies are missing. Do not format the card."},
+		{"one missing", func(in *catalog.Ingest) {
+			in.Status, in.Counts = catalog.StatusDone, counts{Seen: 2, New: 1, Missing: 1}
+		}, LevelWarning, p + "1 new, 0 already known, 1 file's archive copy is missing. Do not format the card."},
+		{"failed then missing then unsupported", func(in *catalog.Ingest) {
+			in.Status, in.Counts, in.UnsupportedExts = catalog.StatusDone, counts{Seen: 4, New: 1, InArchive: 1, Failed: 1, Missing: 2, Unsupported: 1}, []string{".mkv"}
+		}, LevelWarning, p + "1 new, 1 already known, 1 failed, 2 files' archive copies are missing, 1 file not imported (.mkv). Do not format the card."},
 		{"refused", func(in *catalog.Ingest) {
 			in.Status = catalog.StatusRefused
 			in.Error = "staging would drop below the 50.0 GB free-space reserve (2 new files need 0.1 GB, 40.0 GB free)"
