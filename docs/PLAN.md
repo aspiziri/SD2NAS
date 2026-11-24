@@ -337,9 +337,12 @@ removed by hand over SMB.
 **Folder locks:** every operation, including ingest writing into a folder, takes
 a lock on each staging folder it touches. If you try to merge or rename a folder
 that a card ingest is currently filling, the API returns `409 Conflict` and the
-UI says "this folder is being imported into". Locks are held for one operation,
-never across user think time. The one exception is a queued promote, which
-holds its folders' locks from the moment it is queued. Locks also cover the
+UI says "this folder is being imported into". An import holds the lock of each
+folder it writes into until the import ends (an operation that wants one of
+those folders is refused, and an import that wants a folder an operation holds
+waits for it). Operations hold their locks only for themselves, never across
+user think time. The one other exception is a queued promote, which holds its
+folders' locks from the moment it is queued. Locks also cover the
 directory names an operation creates.
 
 | Operation | Filesystem | Catalog |
