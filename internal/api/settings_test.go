@@ -39,6 +39,16 @@ func TestSettingsAPI(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("put: %d %s", rec.Code, rec.Body)
 	}
+	if get := send(t, f.s, http.MethodGet, "/api/settings", ""); rec.Body.String() != get.Body.String() {
+		t.Errorf("PUT body %s differs from GET body %s", rec.Body, get.Body)
+	}
+	var put struct {
+		Settings map[string]string `json:"settings"`
+	}
+	decodeInto(t, rec, &put)
+	if put.Settings["archive_rescan_at"] != "04:45" || len(put.Settings) != 7 {
+		t.Errorf("PUT body %s", rec.Body)
+	}
 	if got := getSettings(t, f)["archive_rescan_at"]; got != "04:45" {
 		t.Errorf("archive_rescan_at %q", got)
 	}

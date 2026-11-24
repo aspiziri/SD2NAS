@@ -195,12 +195,20 @@ func TestArchiveChangedAndAccept(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("changed: %d %s", rec.Code, rec.Body)
 	}
-	var cl indexer.ChangeList
+	var cl map[string]any
 	decodeInto(t, rec, &cl)
-	if len(cl.Changes) != 1 || cl.LatestID < 1 || cl.Total != 1 {
-		t.Fatalf("changes %+v", cl)
+	changes, _ := cl["changes"].([]any)
+	latest, _ := cl["latest_id"].(float64)
+	if _, ok := cl["version"].(float64); !ok || len(changes) != 1 || latest < 1 || cl["total"] != float64(1) {
+		t.Fatalf("changed body %s", rec.Body)
 	}
-	rec = send(t, f.s, http.MethodPost, "/api/archive/changed/accept", fmt.Sprintf(`{"upTo":%d}`, cl.LatestID))
+	ch, _ := changes[0].(map[string]any)
+	for _, k := range []string{"id", "rel_path", "old_sha256", "sha256", "old_size", "size", "indexed_at", "changed_at"} {
+		if _, ok := ch[k]; !ok {
+			t.Errorf("change has no %q field: %v", k, ch)
+		}
+	}
+	rec = send(t, f.s, http.MethodPost, "/api/archive/changed/accept", fmt.Sprintf(`{"upTo":%d}`, int64(latest)))
 	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != `{"accepted":1}` {
 		t.Fatalf("accept: %d %s", rec.Code, rec.Body)
 	}
@@ -268,10 +276,18 @@ func TestIndexerProgressEvent(t *testing.T) {
 		t.Fatalf("pause: %d %s", rec.Code, rec.Body)
 	}
 	waitFor("a paused frame", `"paused_by":"user"`)
+	before := len(frames())
 	if rec := send(t, f.s, http.MethodPost, "/api/archive/resume", ""); rec.Code != http.StatusOK {
 		t.Fatalf("resume: %d %s", rec.Code, rec.Body)
 	}
-	waitFor("a busy frame after resume", `"paused_by":"busy"`)
+	pollUntil(t, "a busy frame after resume", func() bool {
+		for _, fr := range frames()[before:] {
+			if strings.Contains(fr, "event: "+EventIndexerProgress) && strings.Contains(fr, `"paused_by":"busy"`) {
+				return true
+			}
+		}
+		return false
+	})
 	f.busy.Store(false)
 	waitIdle(t, f)
 	waitFor("a finished frame", `"running":null`)
@@ -316,6 +332,7 @@ func TestIndexerSnapshotDuringPublishes(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
+		close(stop) // let the pause/resume goroutine end
 		t.Fatal("connecting subscribers deadlocked against indexer publishes")
 	}
 	close(stop)

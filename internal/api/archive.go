@@ -10,9 +10,6 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/indexer"
 )
 
-// EventIndexerProgress carries the indexer.Status (also sent on connect).
-const EventIndexerProgress = "indexer.progress"
-
 type archiveHandlers struct {
 	idx *indexer.Service
 	log *slog.Logger

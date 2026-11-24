@@ -10,13 +10,14 @@ import (
 	"time"
 )
 
-// Event types sent on /api/events. A later milestone adds indexer.progress;
+// Event types sent on /api/events;
 // EventSource clients ignore the types they don't listen for.
 const (
 	EventIngestCurrent   = "ingest.current"
 	EventIngestFinished  = "ingest.finished"
 	EventStagingChanged  = "staging.changed"
 	EventPromoteProgress = "promote.progress"
+	EventIndexerProgress = "indexer.progress"
 )
 
 // DefaultKeepalive is how often an idle stream gets a comment line, so

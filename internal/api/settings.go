@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -27,12 +28,12 @@ func (s *Server) MountSettings(db *catalog.DB, idx *indexer.Service, photosRoot 
 }
 
 func (h *settingsHandlers) get(w http.ResponseWriter, r *http.Request) {
-	h.write(w, r)
+	h.write(w, r.Context())
 }
 
 // write answers with every setting's effective value.
-func (h *settingsHandlers) write(w http.ResponseWriter, r *http.Request) {
-	set, err := h.db.Settings(r.Context())
+func (h *settingsHandlers) write(w http.ResponseWriter, ctx context.Context) {
+	set, err := h.db.Settings(ctx)
 	if err != nil {
 		h.log.Error("read settings", "err", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -82,5 +83,5 @@ func (h *settingsHandlers) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.idx.SettingsChanged()
-	h.write(w, r)
+	h.write(w, context.WithoutCancel(r.Context()))
 }
