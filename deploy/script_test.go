@@ -481,7 +481,10 @@ func TestScriptConfigFileAndToken(t *testing.T) {
 	if err := os.WriteFile(conf, []byte("SD2NAS_URL="+f.srv.URL+"\nSD2NAS_TOKEN=abc\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runScript(t, f, map[string]string{"SD2NAS_CONF": conf, "SD2NAS_URL": ""})
+	calls := runScript(t, f, map[string]string{"SD2NAS_CONF": conf, "SD2NAS_URL": ""})
+	if slices.ContainsFunc(named(calls, "logger"), func(c call) bool { return c.has("has an error") }) {
+		t.Errorf("a valid cfg was logged as having an error: %q", calls)
+	}
 	reqs := f.requests()
 	if len(reqs) != 2 {
 		t.Fatalf("requests = %d, want 2", len(reqs))
@@ -490,6 +493,25 @@ func TestScriptConfigFileAndToken(t *testing.T) {
 		if got := r.header.Get("Authorization"); got != "Bearer abc" {
 			t.Errorf("%s Authorization = %q, want Bearer abc", r.path, got)
 		}
+	}
+}
+
+// A cfg with the README's <port> placeholder left in is a bash syntax error:
+// the script logs it and carries on with the URL it has.
+func TestScriptBrokenConfig(t *testing.T) {
+	f := newFake(t)
+	f.ingest = reply(200, "normal\nok\n")
+	cfg := filepath.Join(t.TempDir(), "sd2nas.cfg")
+	if err := os.WriteFile(cfg, []byte("SD2NAS_URL=http://localhost:<port>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	calls := runScript(t, f, map[string]string{"SD2NAS_CONF": cfg})
+	want := cfg + " has an error, so settings from that line on were ignored; using SD2NAS_URL=" + f.srv.URL
+	if !slices.ContainsFunc(named(calls, "logger"), func(c call) bool { return c.has(want) }) {
+		t.Errorf("no logger call %q: %q", want, calls)
+	}
+	if len(f.requests()) != 2 {
+		t.Errorf("requests = %d, want 2 (the import goes on with the URL it has)", len(f.requests()))
 	}
 }
 

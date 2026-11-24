@@ -31,11 +31,13 @@ The script runs when Unassigned Devices mounts a card. It imports the card, unmo
    curl -fsSL https://raw.githubusercontent.com/aspiziri/SD2NAS/main/deploy/unassigned-devices.sh -o /boot/config/plugins/unassigned.devices/sd2nas.sh
    ```
 
-3. Tell it where SD2NAS listens (the container's host port):
+3. Tell it where SD2NAS listens. Change `4040` to the container's host port, the left-hand number in Docker's port mapping (`4040->8080` means 4040):
 
    ```
-   echo 'SD2NAS_URL=http://localhost:<port>' > /boot/config/plugins/unassigned.devices/sd2nas.cfg
+   echo 'SD2NAS_URL=http://localhost:4040' > /boot/config/plugins/unassigned.devices/sd2nas.cfg
    ```
+
+   Check it: `. /boot/config/plugins/unassigned.devices/sd2nas.cfg; curl -sS "$SD2NAS_URL/healthz"` prints SD2NAS's health text.
 
 4. Insert a card into **each slot** of the reader once. In Main → Unassigned Devices, open that slot's settings and set:
    - **Automount** on;

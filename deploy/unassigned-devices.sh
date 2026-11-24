@@ -17,9 +17,11 @@
 # never decides it.
 
 SD2NAS_CONF="${SD2NAS_CONF:-/boot/config/plugins/unassigned.devices/sd2nas.cfg}"
+conf_rc=0
 if [ -r "$SD2NAS_CONF" ]; then
 	# shellcheck source=/dev/null
 	. "$SD2NAS_CONF"
+	conf_rc=$? # bash stops at a bad line (such as a literal <port>) and returns 2
 fi
 # A cfg saved with Windows line endings leaves a CR on every value.
 SD2NAS_URL="${SD2NAS_URL%$'\r'}"
@@ -36,6 +38,10 @@ PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin:/usr/bin:/bin"
 log() {
 	logger -t sd2nas -- "$1" 2>/dev/null || printf 'sd2nas: %s\n' "$1" >&2
 }
+
+if [ "$conf_rc" -ne 0 ]; then
+	log "$SD2NAS_CONF has an error, so settings from that line on were ignored; using SD2NAS_URL=$SD2NAS_URL"
+fi
 
 # notify LEVEL TEXT: an Unraid notification, plus a syslog line.
 notify() {
