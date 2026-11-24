@@ -3,6 +3,7 @@ package indexer
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -23,22 +24,69 @@ const (
 	msgArchiveGone    = "Archive/ went missing during the scan, so it was stopped (is the photos share still mounted?)"
 )
 
-// runPass runs one pass with s.pass held. It returns an error only for
-// catalog failures; a cancelled ctx sets Stopped.
+// beginPass makes sure Running is set (StartRescan did already) and returns
+// the pass's start time.
+func (s *Service) beginPass(trigger string, full bool) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status.Running == nil {
+		s.status.Running = &Progress{Trigger: trigger, Full: full, StartedAt: s.now()}
+		s.reportLocked(true)
+	}
+	return s.status.Running.StartedAt
+}
+
+// runPass runs one pass with s.pass held, records it in archive_scans and
+// updates the status. It returns an error only for catalog failures; a
+// cancelled ctx sets Stopped.
 func (s *Service) runPass(ctx context.Context, trigger string, full bool) (ScanResult, error) {
-	// full (a re-index) has no effect until the pass can re-read files.
-	_ = full
-	r := ScanResult{Trigger: trigger, StartedAt: s.now(), Errors: []string{}}
-	err := s.scanArchive(ctx, &r)
+	started := s.beginPass(trigger, full)
+	dbctx := context.WithoutCancel(ctx)
+	id, err := s.db.StartArchiveScan(dbctx, trigger, time.Time{}, started) // a re-index takes effect in Task 10
+	if err != nil {
+		s.mu.Lock()
+		s.status.Running = nil
+		s.reportLocked(true)
+		s.mu.Unlock()
+		return ScanResult{}, err
+	}
+	s.progress(true, func(p *Progress) { p.Phase = PhaseListing })
+
+	r := ScanResult{Trigger: trigger, Full: full, StartedAt: started, Errors: []string{}}
+	err = s.scanArchive(ctx, &r)
 	r.FinishedAt = s.now()
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil && errors.Is(err, cerr) {
 			r.Stopped = true
-			return r, nil
+			err = nil
+		} else {
+			r.finalError(err.Error())
+			s.log.Error("archive scan failed", "err", err)
 		}
-		return r, err
 	}
-	return r, nil
+	complete := err == nil && !r.Stopped && r.Skipped == ""
+	if b, merr := json.Marshal(r); merr != nil {
+		err = errors.Join(err, fmt.Errorf("encode scan result: %w", merr))
+	} else if ferr := s.db.FinishArchiveScan(dbctx, id, r.FinishedAt, complete, string(b)); ferr != nil {
+		err = errors.Join(err, ferr)
+	}
+	if cerr := s.refreshCounts(dbctx); cerr != nil {
+		err = errors.Join(err, cerr)
+	}
+	s.mu.Lock()
+	last := r
+	last.log = nil
+	s.status.Last = &last
+	s.status.Running = nil
+	s.status.Version++
+	s.reportLocked(true)
+	s.mu.Unlock()
+	s.log.Info("archive scan", "trigger", trigger, "full", full, "stopped", r.Stopped, "skipped", r.Skipped,
+		"listed", r.Listed, "unchanged", r.Unchanged, "added", r.Added, "moved", r.Moved, "changed", r.Changed,
+		"reappeared", r.Reappeared, "recovered", r.Recovered, "missing", r.Missing, "copies", r.Copies,
+		"in_staging", r.InStaging, "busy_folders", r.BusyFolders,
+		"problems", len(r.Errors)+r.ErrorsOmitted)
+	return r, err
 }
 
 // scanArchive reads the settings once, builds the scan and runs it.
@@ -160,6 +208,18 @@ func (sc *scan) run() error {
 		return nil
 	}
 
+	toHash, bytes := len(sc.fresh)+len(sc.changed), int64(0)
+	for _, f := range sc.fresh {
+		bytes += f.size
+	}
+	for _, f := range sc.changed {
+		bytes += f.size
+	}
+	s.progress(true, func(p *Progress) {
+		p.Phase, p.Folder, p.Current = PhaseHashing, "", ""
+		p.Listed, p.ToHash, p.BytesToHash = r.Listed, toHash, bytes
+	})
+
 	// New paths first: a copy of an edited file's old content, made in the
 	// same pass, is then seen before the edited path is resolved, so the old
 	// content moves to the copy instead of becoming an alias of the edit.
@@ -173,6 +233,7 @@ func (sc *scan) run() error {
 			return err
 		}
 	}
+	sc.s.progress(true, func(p *Progress) { p.Phase, p.Folder, p.Current = PhaseChecking, "", "" })
 	return sc.check()
 }
 
@@ -264,6 +325,8 @@ func (sc *scan) check() error {
 // found takes one indexed file from the listing.
 func (sc *scan) found(f file) {
 	sc.r.Listed++
+	listed := sc.r.Listed
+	sc.s.progress(false, func(p *Progress) { p.Listed = listed })
 	if a, ok := sc.byPath[f.rel]; ok {
 		sc.seen[a.SHA256] = true
 		if a.Size == f.size && a.Mtime == f.mtime && !sc.mustReread(a.CheckedAt) {
@@ -289,7 +352,7 @@ func (sc *scan) found(f file) {
 // handle reads and records one file; changed is true for a path the catalog
 // holds with other size or time. Only cancellation and catalog failures are
 // returned.
-func (sc *scan) handle(f file, changed bool) error {
+func (sc *scan) handle(f file, changed bool) (err error) {
 	if err := sc.wait(); err != nil {
 		return err
 	}
@@ -297,6 +360,13 @@ func (sc *scan) handle(f file, changed bool) error {
 		sc.r.BusyFolders++
 		return nil
 	}
+	folder, _, _ := strings.Cut(strings.TrimPrefix(f.rel, ArchiveDir+"/"), "/")
+	sc.s.progress(false, func(p *Progress) { p.Folder, p.Current = ArchiveDir+"/"+folder, f.rel })
+	defer func() {
+		if err == nil {
+			sc.s.progress(false, func(p *Progress) { p.Hashed++; p.BytesHashed += f.size })
+		}
+	}()
 	if err := sc.before(f.rel); err != nil {
 		return err
 	}

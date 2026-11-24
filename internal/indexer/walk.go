@@ -162,6 +162,9 @@ func (sc *scan) walk(dir, rel string, depth int) error {
 			sc.r.BusyFolders++
 			return nil
 		}
+		if depth == 1 {
+			sc.s.progress(false, func(p *Progress) { p.Folder = rel })
+		}
 	}
 	entries, err := sc.s.readDir(dir)
 	if err != nil {

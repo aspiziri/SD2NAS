@@ -4,6 +4,7 @@ package indexer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -92,6 +93,37 @@ func (r *ScanResult) finalError(msg string) {
 	r.Errors = append(r.Errors, msg)
 }
 
+// Status is the indexer.progress event data (Decision 19). Task 11 adds
+// LastBackup, BackingUp and NextScan; Task 10 adds PendingFull.
+type Status struct {
+	Version uint64      `json:"version"` // bumps after each pass, backup, accept and settings change
+	Running *Progress   `json:"running"` // nil when no pass runs
+	Last    *ScanResult `json:"last"`    // the last finished pass; nil before the first
+	Changed int         `json:"changed"` // "changed since indexed" entries
+	Missing int         `json:"missing"` // missing assets
+}
+
+// Progress is a running pass.
+type Progress struct {
+	Trigger     string    `json:"trigger"`
+	Full        bool      `json:"full"`  // a re-index
+	Phase       string    `json:"phase"` // "" until the pass starts listing, then listing | hashing | checking
+	StartedAt   time.Time `json:"started_at"`
+	Listed      int       `json:"listed"`
+	ToHash      int       `json:"to_hash"` // files to read (changed + new); 0 while listing
+	Hashed      int       `json:"hashed"`
+	BytesToHash int64     `json:"bytes_to_hash"`
+	BytesHashed int64     `json:"bytes_hashed"`
+	Folder      string    `json:"folder"`    // the session folder being listed or read
+	Current     string    `json:"current"`   // the file being read; "" while listing or checking
+	PausedBy    string    `json:"paused_by"` // "" | "user" | "busy" (Task 10)
+}
+
+// publishEvery is the shortest gap between unforced progress frames (<= 4/s).
+const publishEvery = 250 * time.Millisecond
+
+const msgInterrupted = "SD2NAS stopped before this scan finished"
+
 // Service is the archive indexer.
 type Service struct {
 	db         *catalog.DB
@@ -116,8 +148,13 @@ type Service struct {
 
 	pass sync.Mutex // held by the running pass
 
-	mu     sync.Mutex // guards closed
-	closed bool
+	// mu guards closed and the status. notify runs under it and only
+	// publishes: never call a Service method from it.
+	mu      sync.Mutex
+	closed  bool
+	status  Status
+	notify  func(Status)
+	lastPub time.Time // real clock
 }
 
 // New builds the service. It starts nothing yet.
@@ -141,8 +178,135 @@ func New(cfg Config) (*Service, error) {
 		s.log = slog.Default()
 	}
 	s.hash = hashFile
+	if err := s.loadState(context.Background()); err != nil {
+		return nil, err
+	}
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	return s, nil
+}
+
+// loadState closes passes left unfinished by a stop or crash (the history
+// prune relies on every row being finished), then loads the last pass and
+// the counts.
+func (s *Service) loadState(ctx context.Context) error {
+	open, err := s.db.UnfinishedArchiveScans(ctx)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	for _, o := range open {
+		r := ScanResult{Trigger: o.Kind, Full: o.Reread, StartedAt: o.StartedAt, FinishedAt: now,
+			Stopped: true, Errors: []string{msgInterrupted}}
+		b, err := json.Marshal(r)
+		if err != nil {
+			return fmt.Errorf("indexer: encode interrupted scan %d: %w", o.ID, err)
+		}
+		if err := s.db.FinishArchiveScan(ctx, o.ID, now, false, string(b)); err != nil {
+			return err
+		}
+	}
+	last, err := s.db.LastArchiveScan(ctx)
+	switch {
+	case errors.Is(err, catalog.ErrNotFound):
+	case err != nil:
+		return err
+	default:
+		var r ScanResult
+		if err := json.Unmarshal([]byte(last.Result), &r); err != nil {
+			s.log.Error("last archive scan is unreadable", "scan", last.ID, "err", err)
+		} else {
+			if r.Errors == nil {
+				r.Errors = []string{}
+			}
+			s.status.Last = &r
+		}
+	}
+	return s.refreshCounts(ctx)
+}
+
+// refreshCounts reloads Changed and Missing. Call it without s.mu.
+func (s *Service) refreshCounts(ctx context.Context) error {
+	c, err := s.db.ArchiveCounts(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.status.Changed, s.status.Missing = c.Changed, c.Missing
+	s.mu.Unlock()
+	return nil
+}
+
+// Status returns the current status.
+func (s *Service) Status() Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.statusLocked()
+}
+
+func (s *Service) statusLocked() Status {
+	st := s.status
+	if st.Running != nil {
+		p := *st.Running
+		st.Running = &p
+	}
+	if st.Last != nil {
+		l := *st.Last
+		st.Last = &l
+	}
+	return st
+}
+
+// OnChange sets the function that receives every published Status. Call it
+// before serving; fn runs under s.mu and must only publish.
+func (s *Service) OnChange(fn func(Status)) {
+	s.mu.Lock()
+	s.notify = fn
+	s.mu.Unlock()
+}
+
+// reportLocked publishes the status: always when force, otherwise at most
+// every publishEvery. s.mu is held.
+func (s *Service) reportLocked(force bool) {
+	if s.notify == nil {
+		return
+	}
+	if !force && time.Since(s.lastPub) < publishEvery {
+		return
+	}
+	s.lastPub = time.Now()
+	s.notify(s.statusLocked())
+}
+
+// progress applies fn to the running pass (nothing when none runs) and reports.
+func (s *Service) progress(force bool, fn func(*Progress)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status.Running == nil {
+		return
+	}
+	fn(s.status.Running)
+	s.reportLocked(force)
+}
+
+// StartRescan starts a manual pass in the background. It is false when a
+// pass is running or the service is closed (full takes effect in Task 10).
+func (s *Service) StartRescan(full bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || !s.pass.TryLock() {
+		return false
+	}
+	s.wg.Add(1)
+	s.status.Running = &Progress{Trigger: TriggerManual, Full: full, StartedAt: s.now()}
+	s.reportLocked(true)
+	go func() {
+		defer s.wg.Done()
+		defer s.pass.Unlock()
+		if _, err := s.runPass(s.bgCtx, TriggerManual, full); err != nil {
+			s.log.Error("archive scan failed", "err", err)
+		}
+	}()
+	return true
 }
 
 // ErrClosed is what Rescan returns once the service has been closed.
