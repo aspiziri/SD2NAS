@@ -73,6 +73,9 @@ func (s *Service) loop() {
 			continue
 		case <-s.after(next.Sub(s.now())):
 		}
+		if s.now().Before(next) { // the wall clock was set back during the wait: wait for next again
+			continue
+		}
 		s.nightly()
 	}
 }

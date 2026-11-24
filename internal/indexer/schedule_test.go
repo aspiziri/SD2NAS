@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 	_ "time/tzdata"
@@ -50,11 +49,37 @@ func TestNextRun(t *testing.T) {
 	}
 }
 
-// fakeTimer is the Service's after: it records each wait and lets a test fire it.
+// stepClock is the Service's now, moved only by the test or a fakeTimer.
+type stepClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newStepClock(s *Service, t time.Time) *stepClock {
+	c := &stepClock{t: t}
+	s.now = c.now
+	return c
+}
+
+func (c *stepClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *stepClock) add(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// fakeTimer is the Service's after: it records each wait and lets a test
+// fire it. With a clock, fire first moves the clock on by the wait.
 type fakeTimer struct {
 	mu    sync.Mutex
 	waits []time.Duration
 	chans []chan time.Time
+	clock *stepClock
 }
 
 func (f *fakeTimer) after(d time.Duration) <-chan time.Time {
@@ -81,6 +106,14 @@ func (f *fakeTimer) wait(i int) time.Duration {
 func (f *fakeTimer) fire(t *testing.T, i int) {
 	t.Helper()
 	waitFor(t, "the loop to arm its timer", func() bool { return f.count() > i })
+	if f.clock != nil {
+		f.clock.add(f.wait(i))
+	}
+	f.ring(i)
+}
+
+// ring fires timer i (armed already) without moving the clock.
+func (f *fakeTimer) ring(i int) {
 	f.mu.Lock()
 	ch := f.chans[i]
 	f.mu.Unlock()
@@ -90,7 +123,7 @@ func (f *fakeTimer) fire(t *testing.T, i int) {
 func TestNightlyBacksUpThenScans(t *testing.T) {
 	s, _, photos := setup(t)
 	put(t, photos, "Archive/T/a.JPG", "content a", t0)
-	ft := &fakeTimer{}
+	ft := &fakeTimer{clock: newStepClock(s, time.Date(2026, 6, 15, 12, 0, 0, 0, time.Local))}
 	s.after = ft.after
 	s.Start()
 	waitFor(t, "the first timer", func() bool { return ft.count() == 1 })
@@ -138,9 +171,7 @@ func TestPausedNightlyPassDoesNotBlockNextBackup(t *testing.T) {
 	s, _, photos := setup(t)
 	s.idleEvery = time.Hour
 	putFive(t, photos)
-	var tick atomic.Int64
-	base := time.Date(2026, 6, 15, 2, 0, 0, 0, time.Local)
-	s.now = func() time.Time { return base.Add(time.Duration(tick.Add(1)) * 30 * time.Minute) }
+	clock := newStepClock(s, time.Date(2026, 6, 15, 2, 0, 0, 0, time.Local))
 	var once sync.Once
 	s.beforeRead = func(_ context.Context, _ string) {
 		once.Do(func() {
@@ -149,7 +180,7 @@ func TestPausedNightlyPassDoesNotBlockNextBackup(t *testing.T) {
 			}
 		})
 	}
-	ft := &fakeTimer{}
+	ft := &fakeTimer{clock: clock}
 	s.after = ft.after
 	s.Start()
 	waitFor(t, "the first timer", func() bool { return ft.count() == 1 })
@@ -184,7 +215,7 @@ func TestNightlyBackupWhilePaused(t *testing.T) {
 	s, db, photos := setup(t)
 	s.idleEvery = time.Hour
 	putFive(t, photos)
-	ft := &fakeTimer{}
+	ft := &fakeTimer{clock: newStepClock(s, time.Date(2026, 6, 15, 12, 0, 0, 0, time.Local))}
 	s.after = ft.after
 	s.Start()
 	waitFor(t, "the first timer", func() bool { return ft.count() == 1 })
@@ -292,4 +323,34 @@ func TestCloseWhileRescanWaits(t *testing.T) {
 	if _, err := db.LastArchiveScan(t.Context()); !errors.Is(err, catalog.ErrNotFound) {
 		t.Errorf("LastArchiveScan = %v; want ErrNotFound (no scan recorded)", err)
 	}
+}
+
+// A timer that ends before the scan time by the wall clock (the clock was set
+// back during the wait) arms again instead of running the night's job (T11-m1).
+func TestClockSetBackWaitsAgain(t *testing.T) {
+	s, _, _ := setup(t)
+	clock := newStepClock(s, time.Date(2026, 6, 15, 12, 0, 0, 0, time.Local))
+	ft := &fakeTimer{clock: clock}
+	s.after = ft.after
+	s.Start()
+	waitFor(t, "the first timer", func() bool { return ft.count() == 1 })
+	next := s.Status().NextScan
+	clock.add(ft.wait(0) - time.Hour) // the timer ran its course; the clock reads an hour earlier
+	ft.ring(0)
+	waitFor(t, "the loop to arm again", func() bool { return ft.count() == 2 })
+	if st := s.Status(); st.LastBackup != nil || st.BackingUp || st.Running != nil {
+		t.Errorf("status = %+v; want nothing run before %v", st, next)
+	}
+	if d := ft.wait(1); d != time.Hour {
+		t.Errorf("second wait = %v; want 1h", d)
+	}
+	if got := s.Status().NextScan; !got.Equal(next) {
+		t.Errorf("NextScan = %v; want %v", got, next)
+	}
+	ft.fire(t, 1)
+	waitFor(t, "the backup and the nightly pass", func() bool {
+		st := s.Status()
+		return st.LastBackup != nil && st.Last != nil && st.Running == nil && !st.BackingUp
+	})
+	waitFor(t, "the loop to arm a third time", func() bool { return ft.count() == 3 })
 }
