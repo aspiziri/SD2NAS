@@ -129,6 +129,8 @@ type scan struct {
 	seenCopies map[string]catalog.ArchiveCopy  // by sha: a copy of archived content seen this pass
 	seen       map[string]bool                 // sha of archived rows accounted for this pass
 	readOther  map[string]bool                 // rel_paths of archived rows read this pass with other content
+	unread     map[int64]bool                  // sizes of listed files left unresolved though still there (held, unreadable, changing)
+	unreadAt   map[string]bool                 // their rel_paths
 	changed    []file
 }
 
@@ -146,7 +148,7 @@ func (s *Service) newScan(ctx context.Context, set catalog.Settings, r *ScanResu
 		dbctx:  context.WithoutCancel(ctx),
 		byPath: map[string]catalog.ArchiveEntry{}, bySHA: map[string]catalog.ArchiveEntry{},
 		copies: map[string]catalog.ArchiveCopy{}, keepCopy: map[string]bool{}, seenCopies: map[string]catalog.ArchiveCopy{},
-		seen: map[string]bool{}, readOther: map[string]bool{}}, nil
+		seen: map[string]bool{}, readOther: map[string]bool{}, unread: map[int64]bool{}, unreadAt: map[string]bool{}}, nil
 }
 
 // held reports whether a promote is writing into directory rel.

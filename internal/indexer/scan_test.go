@@ -1208,3 +1208,170 @@ func TestHalfPromotedFolder(t *testing.T) {
 		wantAsset(t, db, c, catalog.StateArchived, "Archive/T/"+name)
 	}
 }
+
+// ioErr reports a read failure that is not "not found".
+var ioErr = errors.New("input/output error")
+
+// failFingerprint makes s.fingerprint fail for paths below dir (a slash rel).
+func failFingerprint(s *Service, photos, dir string) (restore func()) {
+	inner := s.fingerprint
+	prefix := filepath.Join(photos, filepath.FromSlash(dir)) + string(filepath.Separator)
+	s.fingerprint = func(p string) (string, error) {
+		if len(p) > len(prefix) && p[:len(prefix)] == prefix {
+			return "", ioErr
+		}
+		return inner(p)
+	}
+	return func() { s.fingerprint = inner }
+}
+
+// A file moved to a path the pass cannot read is not marked missing at its
+// old path: the next pass finds the move. A truly gone file of another size
+// is still marked.
+func TestUnreadNewPathNotMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/S1/a.JPG", "alpha", t0)
+	put(t, photos, "Archive/S1/b.JPG", "bravo", t0)
+	put(t, photos, "Archive/S1/c.JPG", "charlie", t0)
+	rescan(t, s)
+	rename(t, photos, "Archive/S1/a.JPG", "Archive/S2/a.JPG")
+	remove(t, photos, "Archive/S1/c.JPG")
+	restore := failFingerprint(s, photos, "Archive/S2")
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Missing: 1})
+	if len(r.Errors) != 1 {
+		t.Errorf("errors = %q; want the read failure", r.Errors)
+	}
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/S1/a.JPG")
+	wantAsset(t, db, "charlie", catalog.StateMissing, "Archive/S1/c.JPG")
+
+	restore()
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Moved: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/S2/a.JPG")
+}
+
+// A file moved into a folder a promote holds once it was listed is not
+// marked missing at its old path.
+func TestHeldAfterListingNotMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	locks := newFakeLocks()
+	s.locks = locks
+	put(t, photos, "Archive/S1/a.JPG", "alpha", t0)
+	put(t, photos, "Archive/S1/b.JPG", "bravo", t0)
+	put(t, photos, "Archive/S1/c.JPG", "charlie", t0)
+	rescan(t, s)
+	rename(t, photos, "Archive/S1/a.JPG", "Archive/S2/a.JPG")
+	remove(t, photos, "Archive/S1/c.JPG")
+	realReadDir := s.readDir
+	s.readDir = func(p string) ([]os.DirEntry, error) {
+		e, err := realReadDir(p)
+		if filepath.Base(p) == "S2" {
+			locks.hold("Archive/S2")
+		}
+		return e, err
+	}
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Missing: 1, BusyFolders: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/S1/a.JPG")
+	wantAsset(t, db, "charlie", catalog.StateMissing, "Archive/S1/c.JPG")
+
+	s.readDir = realReadDir
+	locks.release("Archive/S2")
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Moved: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/S2/a.JPG")
+}
+
+// A copy whose folder a promote holds once it was listed keeps its row, and
+// its primary, gone meanwhile, is not marked missing (T8-m3).
+func TestHeldCopyKeepsRowAndPrimary(t *testing.T) {
+	s, db, photos := setup(t)
+	locks := newFakeLocks()
+	s.locks = locks
+	put(t, photos, "Archive/S1/a.JPG", "dup", t0)
+	put(t, photos, "Archive/S3/a.JPG", "dup", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/S1/a.JPG")
+	put(t, photos, "Archive/S3/a.JPG", "dup", t0.Add(time.Hour)) // touched: read again
+	realReadDir := s.readDir
+	s.readDir = func(p string) ([]os.DirEntry, error) {
+		e, err := realReadDir(p)
+		if filepath.Base(p) == "S3" {
+			locks.hold("Archive/S3")
+		}
+		return e, err
+	}
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, BusyFolders: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "dup", catalog.StateArchived, "Archive/S1/a.JPG")
+	if c := copyRows(t, db); len(c) != 1 || c[0].RelPath != "Archive/S3/a.JPG" {
+		t.Errorf("copy rows = %+v; want the held copy kept", c)
+	}
+
+	s.readDir = realReadDir
+	locks.release("Archive/S3")
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Moved: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "dup", catalog.StateArchived, "Archive/S3/a.JPG")
+	if c := copyRows(t, db); len(c) != 0 {
+		t.Errorf("copy rows after the move = %+v", c)
+	}
+}
+
+// Two rows at one path (a pass stopped between a move onto it and its check)
+// and a failed read there: the content at the path is not marked missing,
+// whichever row the pass keeps for the path (T8-m4). The next readable pass
+// settles it.
+func TestTwoRowsAtPathReadFails(t *testing.T) {
+	for _, tc := range []struct{ from, to, moved, gone string }{
+		{"b.JPG", "a.JPG", "bbbbbbbb", "aaaa"},
+		{"a.JPG", "b.JPG", "aaaa", "bbbbbbbb"},
+	} {
+		t.Run(tc.from+" over "+tc.to, func(t *testing.T) {
+			s, db, photos := setup(t)
+			put(t, photos, "Archive/T/a.JPG", "aaaa", t0)
+			put(t, photos, "Archive/T/b.JPG", "bbbbbbbb", t0)
+			put(t, photos, "Archive/T/z.JPG", "zzzz", t0)
+			rescan(t, s)
+			rename(t, photos, "Archive/T/"+tc.from, "Archive/T/"+tc.to)
+			put(t, photos, "Archive/T/z.JPG", "zzzz-changed", t0.Add(time.Hour)) // a later changed path to stop on
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			s.beforeRead = func(_ context.Context, rel string) {
+				if rel == "Archive/T/z.JPG" {
+					cancel()
+				}
+			}
+			r, err := s.Rescan(ctx, TriggerManual, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !r.Stopped || r.Moved != 1 {
+				t.Fatalf("stopped pass = %+v; want Stopped after the move", r)
+			}
+			s.beforeRead = nil
+
+			// Touched, so the path is read whichever row the pass keeps for it.
+			put(t, photos, "Archive/T/"+tc.to, tc.moved, t0.Add(2*time.Hour))
+			restore := failFingerprint(s, photos, "Archive/T")
+			r = rescan(t, s)
+			if len(r.Errors) == 0 {
+				t.Fatalf("result = %+v; want the read failure", r)
+			}
+			if a := asset(t, db, tc.moved); a.State != catalog.StateArchived {
+				t.Errorf("content at the unread path = %s; want archived (result %+v)", a.State, r)
+			}
+			restore()
+			r = rescan(t, s)
+			noErrors(t, r)
+			wantAsset(t, db, tc.moved, catalog.StateArchived, "Archive/T/"+tc.to)
+			wantAsset(t, db, tc.gone, catalog.StateMissing, "Archive/T/"+tc.to)
+		})
+	}
+}

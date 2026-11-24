@@ -168,6 +168,16 @@ func (sc *scan) replaced(e catalog.ArchiveEntry) bool {
 	return ok && p.SHA256 != e.SHA256 && sc.seen[p.SHA256]
 }
 
+// unresolved records a listed file the pass left unresolved though it is
+// still there (held, unreadable, changing while read, its catalog entry
+// moving on): an archived row not seen this pass may have moved to it, and a
+// move keeps the size, so check leaves rows of that size, and a copy row at
+// that path, for the next pass.
+func (sc *scan) unresolved(f *file) {
+	sc.unread[f.size] = true
+	sc.unreadAt[f.rel] = true
+}
+
 // hasCopy reports whether a copy of content sha was seen at another path this pass.
 func (sc *scan) hasCopy(sha string) bool {
 	_, ok := sc.seenCopies[sha]
@@ -291,8 +301,8 @@ func (sc *scan) check() error {
 			delete(sc.seenCopies, e.SHA256)
 			continue
 		}
-		if s.held(e.RelPath) {
-			continue
+		if sc.unread[e.Size] || s.held(e.RelPath) {
+			continue // it may be a file this pass could not read: the next pass looks again
 		}
 		if h := s.beforeMissing; h != nil {
 			h(e.RelPath)
@@ -328,7 +338,7 @@ func (sc *scan) check() error {
 
 	// keepCopy holds every copy seen this pass, including those just made primary.
 	for _, rel := range slices.Sorted(maps.Keys(sc.copies)) {
-		if sc.keepCopy[rel] || !sc.inScope(rel) {
+		if sc.keepCopy[rel] || sc.unreadAt[rel] || !sc.inScope(rel) {
 			continue
 		}
 		if err := db.DeleteArchiveCopy(sc.dbctx, rel); err != nil {
@@ -374,6 +384,7 @@ func (sc *scan) handle(f file, changed bool) (err error) {
 	}
 	if sc.s.held(f.rel) {
 		sc.r.BusyFolders++
+		sc.unresolved(&f)
 		return nil
 	}
 	folder, _, _ := strings.Cut(strings.TrimPrefix(f.rel, ArchiveDir+"/"), "/")
@@ -461,10 +472,12 @@ func (sc *scan) read(f *file, full bool) (ok bool, err error) {
 	}
 	if err != nil {
 		sc.r.errorf("%s: %v", f.rel, err)
+		sc.unresolved(f)
 		return false, nil
 	}
 	if !before.Mode().IsRegular() {
 		sc.r.errorf("%s: no longer a regular file", f.rel)
+		sc.unresolved(f)
 		return false, nil
 	}
 	if !full && !f.matches(before) {
@@ -472,7 +485,7 @@ func (sc *scan) read(f *file, full bool) (ok bool, err error) {
 		f.sha = ""
 	}
 	if f.fp, err = s.fingerprint(p); err != nil {
-		return sc.readFailed(f.rel, err)
+		return sc.readFailed(f, err)
 	}
 	if !full && f.sha == "" {
 		if f.sha, err = sc.movedContent(*f); err != nil {
@@ -482,7 +495,7 @@ func (sc *scan) read(f *file, full bool) (ok bool, err error) {
 	}
 	if full {
 		if f.sha, err = s.hash(sc.ctx, p); err != nil {
-			return sc.readFailed(f.rel, err)
+			return sc.readFailed(f, err)
 		}
 	}
 	if s.afterHash != nil {
@@ -494,10 +507,12 @@ func (sc *scan) read(f *file, full bool) (ok bool, err error) {
 	}
 	if err != nil {
 		sc.r.errorf("%s: %v", f.rel, err)
+		sc.unresolved(f)
 		return false, nil
 	}
 	if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
 		sc.r.errorf("%s changed while it was read (still being copied?); the next scan picks it up", f.rel)
+		sc.unresolved(f)
 		return false, nil
 	}
 	f.size, f.mtime = after.Size(), after.ModTime().UnixNano()
@@ -532,15 +547,16 @@ func (f file) matches(info os.FileInfo) bool {
 }
 
 // readFailed sorts a failed read: cancellation stops the pass, a vanished
-// file is skipped silently, anything else is listed.
-func (sc *scan) readFailed(rel string, err error) (bool, error) {
+// file is skipped silently, anything else is listed and left unresolved.
+func (sc *scan) readFailed(f *file, err error) (bool, error) {
 	if cerr := sc.ctx.Err(); cerr != nil {
 		return false, cerr
 	}
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
-	sc.r.errorf("%s: %v", rel, err)
+	sc.r.errorf("%s: %v", f.rel, err)
+	sc.unresolved(f)
 	return false, nil
 }
 
@@ -616,6 +632,7 @@ func (sc *scan) resolve(f file) error {
 		return nil
 	}
 	if sc.entryChanged(f.rel, err) {
+		sc.unresolved(&f)
 		return nil
 	}
 	if err != nil {
