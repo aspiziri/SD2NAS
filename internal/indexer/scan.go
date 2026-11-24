@@ -57,7 +57,9 @@ func (s *Service) runPass(ctx context.Context, trigger string, full bool) (ScanR
 	}
 	if err != nil {
 		s.mu.Lock()
+		s.userPaused = false // a Pause before the failure must not hold the next pass
 		s.status.Running = nil
+		s.status.Version++
 		s.reportLocked(true)
 		s.mu.Unlock()
 		return ScanResult{}, err

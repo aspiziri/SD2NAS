@@ -247,3 +247,24 @@ func TestCloseWhilePaused(t *testing.T) {
 	}
 	wantCounts(t, r, ScanResult{Listed: 5, Unchanged: 2, Added: 3})
 }
+
+// A Pause just before a pass fails to start does not leave the next pass
+// paused (T10-m1).
+func TestFailedStartClearsPause(t *testing.T) {
+	s, db, _ := setup(t)
+	s.beginPass(TriggerManual, false) // as StartRescan does, before the catalog writes
+	if _, err := s.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	v := s.Status().Version
+	if err := db.Close(); err != nil { // the start's catalog writes fail
+		t.Fatal(err)
+	}
+	if _, err := s.Rescan(t.Context(), TriggerManual, false); err == nil {
+		t.Fatal("Rescan on a closed catalog succeeded")
+	}
+	st := s.Status()
+	if s.isUserPaused() || st.Running != nil || st.Version <= v {
+		t.Errorf("after a failed start: userPaused %v, Running %+v, Version %d (was %d)", s.isUserPaused(), st.Running, st.Version, v)
+	}
+}
