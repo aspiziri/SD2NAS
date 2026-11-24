@@ -2,7 +2,9 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -75,6 +77,9 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	st.ArchivePath = filepath.Join(s.photosRoot, ArchiveDir)
 	_, statErr := os.Stat(st.ArchivePath)
 	st.ArchivePresent = statErr == nil
+	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+		s.log.Warn("archive folder unreadable", "path", st.ArchivePath, "err", statErr)
+	}
 	return st, nil
 }
 
@@ -111,13 +116,14 @@ func (s *Service) Accept(ctx context.Context, upTo int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	err = s.refreshCounts(ctx)
+	// The delete has committed: a failed count refresh is logged, not
+	// answered, and the next pass or accept counts again.
+	if err := s.refreshCounts(context.WithoutCancel(ctx)); err != nil {
+		s.log.Error("count archive changes after accept", "err", err)
+	}
 	s.mu.Lock()
 	s.status.Version++
 	s.reportLocked(true)
 	s.mu.Unlock()
-	if err != nil {
-		return n, fmt.Errorf("indexer: count changes after accept: %w", err)
-	}
 	return n, nil
 }

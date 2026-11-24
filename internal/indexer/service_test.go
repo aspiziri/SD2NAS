@@ -1,10 +1,13 @@
 package indexer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -297,5 +300,31 @@ func TestStatsAndAccept(t *testing.T) {
 	}
 	if _, err := s.Changes(t.Context()); err != nil {
 		t.Errorf("Changes after Close: %v", err)
+	}
+}
+
+// An Archive/ that can't be stat'ed for a reason other than "not there" is
+// logged, not passed off silently as a missing share.
+func TestStatsLogsUnreadableArchive(t *testing.T) {
+	s, _, _ := setup(t)
+	notDir := filepath.Join(t.TempDir(), "photos-file")
+	if err := os.WriteFile(notDir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(notDir, ArchiveDir)); err == nil || errors.Is(err, fs.ErrNotExist) {
+		t.Skipf("this OS reports a path through a file as %v", err)
+	}
+	var buf bytes.Buffer // Stats logs on the calling goroutine
+	s.log = slog.New(slog.NewTextHandler(&buf, nil))
+	s.photosRoot = notDir
+	st, err := s.Stats(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ArchivePresent {
+		t.Error("ArchivePresent = true")
+	}
+	if out := buf.String(); !bytes.Contains(buf.Bytes(), []byte("archive folder unreadable")) || !bytes.Contains(buf.Bytes(), []byte("err=")) {
+		t.Errorf("log = %q; want the stat error", out)
 	}
 }
