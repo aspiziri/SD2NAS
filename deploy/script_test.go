@@ -492,3 +492,24 @@ func TestScriptConfigFileAndToken(t *testing.T) {
 		}
 	}
 }
+
+func TestScriptCRLFConfig(t *testing.T) {
+	f := newFake(t)
+	f.ingest = reply(200, "normal\nok\n")
+	cfg := filepath.Join(t.TempDir(), "sd2nas.cfg")
+	if err := os.WriteFile(cfg, []byte("SD2NAS_URL="+f.srv.URL+"\r\nSD2NAS_TOKEN=secret\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// An empty SD2NAS_URL removes the variable, so only the cfg supplies it.
+	calls := runScript(t, f, map[string]string{"SD2NAS_CONF": cfg, "SD2NAS_URL": ""})
+	reqs := f.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d, want 2 (the cfg's CR must not break the URL)", len(reqs))
+	}
+	if got := reqs[0].header.Get("Authorization"); got != "Bearer secret" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer secret")
+	}
+	if len(named(calls, "rc.unassigned")) != 1 {
+		t.Errorf("calls = %q, want the card unmounted after the import", calls)
+	}
+}

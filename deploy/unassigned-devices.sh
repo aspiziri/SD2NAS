@@ -17,6 +17,11 @@ if [ -r "$SD2NAS_CONF" ]; then
 	# shellcheck source=/dev/null
 	. "$SD2NAS_CONF"
 fi
+# A cfg saved with Windows line endings leaves a CR on every value.
+SD2NAS_URL="${SD2NAS_URL%$'\r'}"
+SD2NAS_TOKEN="${SD2NAS_TOKEN%$'\r'}"
+SD2NAS_NOTIFY="${SD2NAS_NOTIFY%$'\r'}"
+SD2NAS_MAX_TIME="${SD2NAS_MAX_TIME%$'\r'}"
 SD2NAS_URL="${SD2NAS_URL:-http://localhost:8080}"
 SD2NAS_TOKEN="${SD2NAS_TOKEN:-}"
 SD2NAS_NOTIFY="${SD2NAS_NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}"
@@ -51,11 +56,14 @@ post() {
 	local tmp rc auth=()
 	CODE=000
 	BODY=""
-	tmp=$(mktemp) || return 1
+	if ! tmp=$(mktemp); then
+		log "could not create a temporary file for the request to SD2NAS"
+		return 1
+	fi
 	if [ -n "$SD2NAS_TOKEN" ]; then
 		auth=(-H "Authorization: Bearer $SD2NAS_TOKEN")
 	fi
-	CODE=$(curl -sS --connect-timeout 10 --max-time "$2" -o "$tmp" -w '%{http_code}' \
+	CODE=$(curl -q -sS --connect-timeout 10 --max-time "$2" -o "$tmp" -w '%{http_code}' \
 		-X POST -H "X-SD2NAS: 1" -H "Content-Type: application/json" "${auth[@]}" \
 		--data-binary "$3" "$SD2NAS_URL$1")
 	rc=$?
@@ -94,6 +102,9 @@ ingest() {
 	post "/api/ingest?wait=1&format=text" "$SD2NAS_MAX_TIME" \
 		"{\"path\":$(json_string "/cards/$card"),\"label\":$(json_string "$LABEL"),\"uuid\":$(json_string "$uuid")}"
 	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		log "import of $name failed: curl exit $rc"
+	fi
 	if [ "$rc" -eq 28 ]; then
 		notify alert "SD2NAS did not finish importing $name in time. Card left mounted. Check SD2NAS."
 	elif [ "$rc" -ne 0 ]; then
