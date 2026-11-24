@@ -280,7 +280,7 @@ func (d *DB) RecordArchiveChange(ctx context.Context, old ArchiveEntry, sha, qui
 			if err != nil {
 				return err
 			}
-			return &WrongStateError{Verb: "record archive change", SHA256: old.SHA256, State: AssetState(state)}
+			return &WrongStateError{Verb: "old content", SHA256: old.SHA256, State: AssetState(state)}
 		}
 		// 2. Fingerprints: the old content's values find the new asset.
 		if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO fingerprints (quick_fp, sha256) SELECT quick_fp, ? FROM fingerprints WHERE sha256 = ?", newB, oldB); err != nil {
@@ -381,37 +381,40 @@ func (d *DB) DeleteArchiveCopy(ctx context.Context, relPath string) error {
 // ArchiveChanges returns up to limit changes ordered by id, the total number
 // of changes, and the highest id among the returned ones (0 when none).
 func (d *DB) ArchiveChanges(ctx context.Context, limit int) (changes []ArchiveChange, total int, latestID int64, err error) {
-	if err := d.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM archive_changes").Scan(&total); err != nil {
-		return nil, 0, 0, fmt.Errorf("archive changes: %w", err)
-	}
-	rows, err := d.db.QueryContext(ctx, `SELECT id, rel_path, old_sha256, sha256, old_size, size, indexed_at, changed_at
-		FROM archive_changes ORDER BY id LIMIT ?`, limit)
+	err = d.tx(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM archive_changes").Scan(&total); err != nil {
+			return err
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT id, rel_path, old_sha256, sha256, old_size, size, indexed_at, changed_at
+			FROM archive_changes ORDER BY id LIMIT ?`, limit)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var (
+				c                ArchiveChange
+				oldSHA, sha      []byte
+				indexed, changed string
+			)
+			if err := rows.Scan(&c.ID, &c.RelPath, &oldSHA, &sha, &c.OldSize, &c.Size, &indexed, &changed); err != nil {
+				return errors.Join(err, rows.Close())
+			}
+			c.OldSHA256, c.SHA256 = blobToHex(oldSHA), blobToHex(sha)
+			if c.IndexedAt, err = parseTime(indexed); err != nil {
+				return errors.Join(fmt.Errorf("%s: parse indexed_at: %w", c.RelPath, err), rows.Close())
+			}
+			if c.ChangedAt, err = parseTime(changed); err != nil {
+				return errors.Join(fmt.Errorf("%s: parse changed_at: %w", c.RelPath, err), rows.Close())
+			}
+			changes = append(changes, c)
+			latestID = c.ID
+		}
+		if err := rows.Err(); err != nil {
+			return errors.Join(err, rows.Close())
+		}
+		return rows.Close()
+	})
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("archive changes: %w", err)
-	}
-	for rows.Next() {
-		var (
-			c                ArchiveChange
-			oldSHA, sha      []byte
-			indexed, changed string
-		)
-		if err := rows.Scan(&c.ID, &c.RelPath, &oldSHA, &sha, &c.OldSize, &c.Size, &indexed, &changed); err != nil {
-			return nil, 0, 0, errors.Join(fmt.Errorf("archive changes: %w", err), rows.Close())
-		}
-		c.OldSHA256, c.SHA256 = blobToHex(oldSHA), blobToHex(sha)
-		if c.IndexedAt, err = parseTime(indexed); err != nil {
-			return nil, 0, 0, errors.Join(fmt.Errorf("archive change %s: parse indexed_at: %w", c.RelPath, err), rows.Close())
-		}
-		if c.ChangedAt, err = parseTime(changed); err != nil {
-			return nil, 0, 0, errors.Join(fmt.Errorf("archive change %s: parse changed_at: %w", c.RelPath, err), rows.Close())
-		}
-		changes = append(changes, c)
-		latestID = c.ID
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, 0, errors.Join(fmt.Errorf("archive changes: %w", err), rows.Close())
-	}
-	if err := rows.Close(); err != nil {
 		return nil, 0, 0, fmt.Errorf("archive changes: %w", err)
 	}
 	return changes, total, latestID, nil
