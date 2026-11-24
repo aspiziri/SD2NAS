@@ -65,6 +65,10 @@ export function scanSummary(r) {
   return s;
 }
 
+// changedHeading heads the "changed since indexed" card.
+export const changedHeading = (n) =>
+  `${plural(n, 'archive file', 'archive files')} changed since ${n === 1 ? 'it was' : 'they were'} indexed`;
+
 // sizeChange: 'same size', '+12.3 KB' or '-12.3 KB'.
 export function sizeChange(oldSize, size) {
   if (oldSize === size) return 'same size';

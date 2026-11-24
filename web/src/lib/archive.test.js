@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { scanPercent, scanLine, progressDetail, scanSummary, sizeChange, lastScanLabel, backupLine } from './archive.js';
+import { scanPercent, scanLine, progressDetail, scanSummary, sizeChange, lastScanLabel, backupLine, changedHeading } from './archive.js';
 import { formatWhen } from './format.js';
 
 const prog = (o) => ({ trigger: 'manual', full: false, phase: 'hashing', listed: 0, to_hash: 0, hashed: 0,
@@ -113,4 +113,10 @@ test('backupLine', () => {
   assert.equal(backupLine({ at: '2026-11-21T03:00:00Z', bytes: 1234567, error: 'disk full' }), 'The last catalog backup failed: disk full');
   assert.equal(backupLine({ at: '2026-11-21T03:00:00Z', bytes: 1234567 }),
     `Last catalog backup ${formatWhen('2026-11-21T03:00:00Z')}, 1.2 MB.`);
+});
+
+test('changedHeading agrees with the count', () => {
+  assert.equal(changedHeading(1), '1 archive file changed since it was indexed');
+  assert.equal(changedHeading(2), '2 archive files changed since they were indexed');
+  assert.equal(changedHeading(1234), '1,234 archive files changed since they were indexed');
 });

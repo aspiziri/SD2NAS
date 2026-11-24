@@ -4,7 +4,7 @@
   import { live } from '../lib/live.svelte.js';
   import { formatBytes, formatCount, formatWhen } from '../lib/format.js';
   import { describeError, plural } from '../lib/messages.js';
-  import { scanPercent, scanLine, progressDetail, scanSummary, sizeChange, lastScanLabel, backupLine } from '../lib/archive.js';
+  import { scanPercent, scanLine, progressDetail, scanSummary, sizeChange, lastScanLabel, backupLine, changedHeading } from '../lib/archive.js';
   import { toast } from '../lib/toast.svelte.js';
   import Dialog from '../components/Dialog.svelte';
 
@@ -182,7 +182,7 @@
     <div class="info">
       {#if live.indexer.backing_up}<div class="muted small">Backing up the catalog…</div>{/if}
       <div class="muted small">
-        Next scan {formatWhen(status.next_scan)} · catalog backups in <span class="mono">{stats.backup_dir}</span>.
+        {#if status.next_scan}Next scan {formatWhen(status.next_scan)} · catalog{:else}Catalog{/if} backups in <span class="mono">{stats.backup_dir}</span>.
         <span class:bad={status.last_backup?.error}>{backupLine(status.last_backup)}</span>
       </div>
       <div class="muted small">Not indexed inside session folders: {stats.skip_rules.join(', ') || 'nothing extra'}, plus hidden and NAS metadata folders.</div>
@@ -220,7 +220,7 @@
 
   {#if stats.changed > 0 && changes}
     <div class="card">
-      <h2>⚠ {plural(stats.changed, 'archive file', 'archive files')} changed since they were indexed</h2>
+      <h2>⚠ {changedHeading(stats.changed)}</h2>
       <p class="muted small lead">Same path, different content. Usually an editor writing metadata into the file.</p>
       <table class="stack">
         <thead><tr><th>File</th><th>Last indexed</th><th>Size change</th></tr></thead>
