@@ -41,7 +41,7 @@ func TestSkipRules(t *testing.T) {
 	}
 	for _, f := range got {
 		k, _ := media.DefaultRules().KindOf(f.rel)
-		if f.kind != k || f.size == 0 || f.mtime != t0.Unix() {
+		if f.kind != k || f.size == 0 || f.mtime != t0.UnixNano() {
 			t.Errorf("%s: kind %q size %d mtime %d", f.rel, f.kind, f.size, f.mtime)
 		}
 	}

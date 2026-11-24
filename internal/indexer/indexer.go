@@ -140,14 +140,36 @@ func New(cfg Config) (*Service, error) {
 	if s.log == nil {
 		s.log = slog.Default()
 	}
-	s.hash = func(ctx context.Context, path string) (string, error) {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-		return media.HashFile(path)
-	}
+	s.hash = hashFile
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	return s, nil
+}
+
+// ErrClosed is what Rescan returns once the service has been closed.
+var ErrClosed = errors.New("indexer: shutting down")
+
+// Rescan runs one pass now and waits for it (tests); it waits for a pass
+// that is already running, stops when ctx or Close does, and is ErrClosed
+// after Close. err is non-nil only for catalog failures; cancellation sets
+// Stopped. full asks for a re-index; it has no effect until Task 10.
+func (s *Service) Rescan(ctx context.Context, trigger string, full bool) (ScanResult, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ScanResult{}, ErrClosed
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
+
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.bgCtx, cancel)
+	defer cancel()
+	defer stop()
+
+	s.pass.Lock()
+	defer s.pass.Unlock()
+	return s.runPass(ctx, trigger, full)
 }
 
 // Close stops a pass between files (and mid-file) and the nightly loop, and

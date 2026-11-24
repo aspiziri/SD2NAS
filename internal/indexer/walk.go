@@ -117,6 +117,16 @@ type scan struct {
 	skip    skipRules
 	skipped map[string]bool // rels the listing didn't read: held, unreadable
 	fresh   []file
+
+	dbctx      context.Context                 // context.WithoutCancel(ctx): what was read is recorded
+	byPath     map[string]catalog.ArchiveEntry // archived rows
+	bySHA      map[string]catalog.ArchiveEntry // the same rows by hash
+	copies     map[string]catalog.ArchiveCopy  // by rel_path
+	keepCopy   map[string]bool                 // copy rows confirmed or written this pass
+	seenCopies map[string]catalog.ArchiveCopy  // by sha: a copy of archived content seen this pass
+	seen       map[string]bool                 // sha of archived rows accounted for this pass
+	readOther  map[string]bool                 // rel_paths of archived rows read this pass with other content
+	changed    []file
 }
 
 // newScan builds the pass state; settings are read once, at the start of a pass.
@@ -129,14 +139,15 @@ func (s *Service) newScan(ctx context.Context, set catalog.Settings, r *ScanResu
 		r.Errors = []string{}
 	}
 	r.log = s.log
-	return &scan{s: s, ctx: ctx, r: r, skip: newSkipRules(s.rules, entries), skipped: map[string]bool{}}, nil
+	return &scan{s: s, ctx: ctx, r: r, skip: newSkipRules(s.rules, entries), skipped: map[string]bool{},
+		dbctx:  context.WithoutCancel(ctx),
+		byPath: map[string]catalog.ArchiveEntry{}, bySHA: map[string]catalog.ArchiveEntry{},
+		copies: map[string]catalog.ArchiveCopy{}, keepCopy: map[string]bool{}, seenCopies: map[string]catalog.ArchiveCopy{},
+		seen: map[string]bool{}, readOther: map[string]bool{}}, nil
 }
 
 // held reports whether a promote is writing into directory rel.
 func (s *Service) held(rel string) bool { return s.locks != nil && s.locks.NameHeld(rel) }
-
-// found takes one indexed file from the listing.
-func (sc *scan) found(f file) { sc.fresh = append(sc.fresh, f) }
 
 // walk lists dir (rel is its slash path, depth its depth below Archive/,
 // 0 = Archive/ itself), handing each indexed file to found. Symlinks are
@@ -186,7 +197,7 @@ func (sc *scan) walk(dir, rel string, depth int) error {
 				sc.skipped[child] = true
 				continue
 			}
-			sc.found(file{rel: child, size: info.Size(), mtime: info.ModTime().Unix(), kind: kind})
+			sc.found(file{rel: child, size: info.Size(), mtime: info.ModTime().UnixNano(), kind: kind})
 		}
 	}
 	return nil
