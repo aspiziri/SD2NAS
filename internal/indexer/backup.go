@@ -26,6 +26,8 @@ type BackupResult struct {
 	Bytes   int64     `json:"bytes"`
 	Removed []string  `json:"removed"` // old backups deleted (file names), never null
 	Error   string    `json:"error,omitempty"`
+
+	written bool // the backup file is in place (not encoded)
 }
 
 // ErrBackupInside is CheckBackupDir's refusal.
@@ -69,7 +71,7 @@ func (s *Service) backupNow(ctx context.Context) {
 	s.mu.Unlock()
 
 	res := s.backup(ctx)
-	if ctx.Err() != nil { // shutting down: an interrupted backup is not a failed one
+	if !res.written && ctx.Err() != nil { // shutting down: an interrupted backup is not a failed one
 		s.log.Info("catalog backup interrupted by shutdown", "path", res.Path)
 		s.mu.Lock()
 		s.status.BackingUp = false
@@ -109,6 +111,7 @@ func (s *Service) backup(ctx context.Context) *BackupResult {
 		s.log.Error("catalog backup failed", "path", res.Path, "err", err)
 		return res // nothing is pruned after a failure
 	}
+	res.written = true // recorded even if Close runs from here on
 	if info, err := os.Stat(res.Path); err != nil {
 		s.log.Warn("catalog backup written but its size is unknown", "path", res.Path, "err", err)
 	} else {

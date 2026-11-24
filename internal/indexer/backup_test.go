@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -235,5 +236,40 @@ func TestCheckBackupDir(t *testing.T) {
 		if err := CheckBackupDir(root, d); err != nil {
 			t.Errorf("CheckBackupDir(%q) = %v; want nil", d, err)
 		}
+	}
+}
+
+// cancelOnLog cancels when a record with message msg is logged.
+type cancelOnLog struct {
+	slog.Handler
+	msg    string
+	cancel context.CancelFunc
+}
+
+func (h *cancelOnLog) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *cancelOnLog) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.cancel()
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+// A backup that was written just as Close cancels is still recorded (T11-m2).
+func TestBackupCompletedAtCloseRecorded(t *testing.T) {
+	s, db, _ := setup(t)
+	fixedNow(s)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	s.log = slog.New(&cancelOnLog{Handler: slog.DiscardHandler, msg: "catalog backup", cancel: cancel})
+	s.backupNow(ctx)
+	if ctx.Err() == nil {
+		t.Fatal("the backup's closing log line was never seen")
+	}
+	if st := s.Status(); st.LastBackup == nil || st.LastBackup.Error != "" || st.BackingUp {
+		t.Errorf("status = %+v; want the finished backup", st)
+	}
+	if _, err := db.LastArchiveBackup(t.Context()); err != nil {
+		t.Errorf("LastArchiveBackup = %v; want the backup recorded", err)
 	}
 }
