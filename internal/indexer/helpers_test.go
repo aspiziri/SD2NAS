@@ -22,7 +22,11 @@ func setup(t *testing.T) (*Service, *catalog.DB, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	s, err := New(Config{DB: db, PhotosRoot: photos})
 	if err != nil {
 		t.Fatal(err)

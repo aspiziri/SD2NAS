@@ -100,6 +100,17 @@ func TestListingSkipsHeldFolder(t *testing.T) {
 		t.Fatalf("got %v busy %d", rels(got), r.BusyFolders)
 	}
 
+	sc, err := s.newScan(t.Context(), catalog.DefaultSettings(), &ScanResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.walk(filepath.Join(photos, ArchiveDir), ArchiveDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !sc.skipped["Archive/2025-05-30 - Trip"] {
+		t.Fatalf("held folder not in skipped: %v", sc.skipped)
+	}
+
 	locks.release("archive/2025-05-30 - trip")
 	put(t, photos, "Archive/2025/05/T/d.JPG", "d", t0)
 	put(t, photos, "Archive/2025/05/U/e.JPG", "e", t0)
@@ -116,12 +127,12 @@ func TestListingUnreadableFolder(t *testing.T) {
 	s, _, photos := setup(t)
 	put(t, photos, "Archive/A/a.JPG", "a", t0)
 	put(t, photos, "Archive/B/b.JPG", "b", t0)
-	real := s.readDir
+	realReadDir := s.readDir
 	s.readDir = func(p string) ([]os.DirEntry, error) {
 		if filepath.Base(p) == "A" {
 			return nil, errors.New("boom")
 		}
-		return real(p)
+		return realReadDir(p)
 	}
 	r := &ScanResult{}
 	sc, err := s.newScan(t.Context(), catalog.DefaultSettings(), r)
