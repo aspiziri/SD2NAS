@@ -40,7 +40,7 @@ func (e *WrongStateError) Error() string {
 func (e *WrongStateError) Is(target error) bool { return target == ErrWrongState }
 
 // SchemaVersion is the schema version this build creates and understands.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 const dsnParams = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" +
 	"&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"

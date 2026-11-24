@@ -458,8 +458,8 @@ func TestMigrateV2ToV3(t *testing.T) {
 	}
 	defer d.Close()
 	ctx := t.Context()
-	if v, err := d.Version(ctx); err != nil || v != 3 {
-		t.Fatalf("version = %d, %v; want 3", v, err)
+	if v, err := d.Version(ctx); err != nil || v != SchemaVersion {
+		t.Fatalf("version = %d, %v; want %d", v, err, SchemaVersion)
 	}
 	files, err := d.IngestFiles(ctx, 1)
 	if err != nil {
@@ -499,6 +499,41 @@ func TestMigrateV2ToV3(t *testing.T) {
 		if promoted != wantPromoted || checked.Valid {
 			t.Errorf("asset %d: promoted_at %v checked_at %v; want promoted_at %v, checked_at NULL", n, promoted, checked, wantPromoted)
 		}
+	}
+}
+
+func TestMigrateV3ToV4(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sd2nas.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{schemaV1, schemaV2, schemaV3, "PRAGMA user_version = 3",
+		`INSERT INTO settings (key, value) VALUES ('staging_warn_days', '7')`} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := t.Context()
+	if v, err := d.Version(ctx); err != nil || v != 4 {
+		t.Fatalf("version = %d, %v; want 4", v, err)
+	}
+	var val string
+	if err := d.db.QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'staging_warn_days'").Scan(&val); err != nil || val != "7" {
+		t.Fatalf("setting = %q, %v; want 7", val, err)
+	}
+	var n int
+	err = d.db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_index_list('notifications') WHERE name = 'notifications_pending'").Scan(&n)
+	if err != nil || n != 1 {
+		t.Errorf("index notifications_pending: count %d, %v; want 1", n, err)
 	}
 }
 

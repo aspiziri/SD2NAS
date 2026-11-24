@@ -85,8 +85,8 @@ func TestBackupWritesAndPrunes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, err := b.Version(t.Context()); err != nil || v != 3 {
-		t.Errorf("backup version = %d, %v; want 3", v, err)
+	if v, err := b.Version(t.Context()); err != nil || v != catalog.SchemaVersion {
+		t.Errorf("backup version = %d, %v; want %d", v, err, catalog.SchemaVersion)
 	}
 	asset(t, b, "content a")
 	if err := b.Close(); err != nil { // Windows cannot rename over an open file

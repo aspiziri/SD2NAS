@@ -39,7 +39,7 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"aliases", "archive_changes", "archive_copies", "archive_scans", "assets", "clock_warnings", "fingerprints", "ingest_files", "ingests", "settings", "staging_folders"}
+	want := []string{"aliases", "archive_changes", "archive_copies", "archive_scans", "assets", "clock_warnings", "fingerprints", "ingest_files", "ingests", "notifications", "settings", "staging_folders"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("tables = %v, want %v", got, want)
 	}
