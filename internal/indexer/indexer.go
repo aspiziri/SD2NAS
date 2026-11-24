@@ -349,19 +349,25 @@ func (s *Service) progress(force bool, fn func(*Progress)) {
 // StartRescan starts a manual pass in the background. It is false when a
 // pass is running or the service is closed. full asks for a re-index (Decision 22).
 func (s *Service) StartRescan(full bool) bool {
+	return s.startPass(TriggerManual, full)
+}
+
+// startPass starts a pass in the background; false when one is running or
+// the service is closed.
+func (s *Service) startPass(trigger string, full bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || !s.pass.TryLock() {
 		return false
 	}
 	s.wg.Add(1)
-	s.status.Running = &Progress{Trigger: TriggerManual, Full: full, StartedAt: s.now()}
+	s.status.Running = &Progress{Trigger: trigger, Full: full, StartedAt: s.now()}
 	s.reportLocked(true)
 	go func() {
 		defer s.wg.Done()
 		defer s.pass.Unlock()
-		if _, err := s.runPass(s.bgCtx, TriggerManual, full); err != nil {
-			s.log.Error("archive scan failed", "err", err)
+		if _, err := s.runPass(s.bgCtx, trigger, full); err != nil {
+			s.log.Error("archive scan failed", "trigger", trigger, "err", err)
 		}
 	}()
 	return true

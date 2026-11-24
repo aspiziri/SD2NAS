@@ -1,6 +1,9 @@
 package indexer
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -89,9 +92,63 @@ func TestBackupWritesAndPrunes(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := os.WriteFile(filepath.Join(dir, today), []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	again := s.backup(t.Context())
 	if again.Error != "" || len(again.Removed) != 0 {
 		t.Errorf("second backup = %+v", again)
+	}
+	head, err := os.ReadFile(filepath.Join(dir, today))
+	if err != nil || !bytes.HasPrefix(head, []byte("SQLite format 3")) {
+		t.Errorf("same-day file was not replaced: %v", err)
+	}
+}
+
+// A directory and a symlink named like a backup are not backups: prune keeps them.
+func TestPruneIgnoresNonRegularBackupNames(t *testing.T) {
+	s, _, photos := setup(t)
+	now := fixedNow(s)
+	dir := filepath.Join(photos, "Management", "SD2NAS")
+	writeOldBackups(t, dir, now, 16)
+	if err := os.Mkdir(filepath.Join(dir, "catalog-2020-01-01.db"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keep := []string{"catalog-2020-01-01.db"}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("t"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "catalog-2020-01-02.db")); err == nil {
+		keep = append(keep, "catalog-2020-01-02.db")
+	}
+	res := s.backup(t.Context())
+	if res.Error != "" {
+		t.Fatalf("backup error: %s", res.Error)
+	}
+	got := dirNames(t, dir)
+	for _, n := range keep {
+		if !slices.Contains(got, n) {
+			t.Errorf("%s was removed; folder = %v", n, got)
+		}
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("symlink target touched: %v", err)
+	}
+}
+
+// Close in the middle of a backup is not a failed backup: nothing is recorded.
+func TestBackupInterruptedRecordsNothing(t *testing.T) {
+	s, db, _ := setup(t)
+	fixedNow(s)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	s.backupNow(ctx)
+	if st := s.Status(); st.LastBackup != nil || st.BackingUp {
+		t.Errorf("status = %+v; want no LastBackup and not backing up", st)
+	}
+	if _, err := db.LastArchiveBackup(t.Context()); !errors.Is(err, catalog.ErrNotFound) {
+		t.Errorf("LastArchiveBackup = %v; want ErrNotFound", err)
 	}
 }
 
@@ -144,7 +201,7 @@ func TestBackupInsideArchiveRefused(t *testing.T) {
 	fixedNow(s)
 	dir := filepath.Join(photos, "Archive", "x")
 	if err := db.SetSetting(t.Context(), catalog.KeyBackupDir, dir); err != nil {
-		t.Skipf("the catalog already refuses it: %v", err)
+		t.Fatalf("the catalog now refuses it (a contract change): %v", err)
 	}
 	if res := s.backup(t.Context()); res.Error == "" {
 		t.Errorf("backup into Archive/ succeeded: %+v", res)

@@ -78,21 +78,15 @@ func (s *Service) loop() {
 }
 
 // nightly backs up the catalog first, whatever a pass is doing (Decision 16),
-// then runs the nightly pass unless one is already running (paused or not).
+// then starts the nightly pass in the background (so a paused or long pass
+// never keeps the loop from re-arming) unless one is already running, paused
+// or not. A pending re-index is continued by runPass.
 func (s *Service) nightly() {
 	s.backupNow(s.bgCtx)
 	if s.bgCtx.Err() != nil {
 		return
 	}
-	if !s.pass.TryLock() {
+	if !s.startPass(TriggerNightly, false) {
 		s.log.Info("nightly rescan skipped: a scan is already running")
-		return
-	}
-	defer s.pass.Unlock()
-	if s.bgCtx.Err() != nil { // Close ran meanwhile: record nothing
-		return
-	}
-	if _, err := s.runPass(s.bgCtx, TriggerNightly, false); err != nil { // continues a pending re-index
-		s.log.Error("nightly archive scan failed", "err", err)
 	}
 }

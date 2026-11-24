@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	_ "time/tzdata"
@@ -119,6 +120,66 @@ func TestNightlyBacksUpThenScans(t *testing.T) {
 	s.Close() // returns: the loop ended
 }
 
+// probeCtx closes reached the first time Done is asked for.
+type probeCtx struct {
+	context.Context
+	once    sync.Once
+	reached chan struct{}
+}
+
+func (p *probeCtx) Done() <-chan struct{} {
+	p.once.Do(func() { close(p.reached) })
+	return p.Context.Done()
+}
+
+// A nightly pass paused by the owner must not keep the loop from re-arming,
+// so the next night's backup still happens.
+func TestPausedNightlyPassDoesNotBlockNextBackup(t *testing.T) {
+	s, _, photos := setup(t)
+	s.idleEvery = time.Hour
+	putFive(t, photos)
+	var tick atomic.Int64
+	base := time.Date(2026, 6, 15, 2, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return base.Add(time.Duration(tick.Add(1)) * 30 * time.Minute) }
+	var once sync.Once
+	s.beforeRead = func(_ context.Context, _ string) {
+		once.Do(func() {
+			if _, err := s.Pause(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	ft := &fakeTimer{}
+	s.after = ft.after
+	s.Start()
+	waitFor(t, "the first timer", func() bool { return ft.count() == 1 })
+	armed := s.Status().NextScan
+	ft.fire(t, 0)
+	waitFor(t, "the nightly pass paused", func() bool {
+		r := s.Status().Running
+		return r != nil && r.Trigger == TriggerNightly && r.PausedBy == "user"
+	})
+	waitFor(t, "the loop to re-arm", func() bool { return ft.count() == 2 })
+	first := s.Status()
+	ft.fire(t, 1)
+	waitFor(t, "the second backup", func() bool {
+		b := s.Status().LastBackup
+		return b != nil && b.At.After(first.LastBackup.At)
+	})
+	waitFor(t, "the loop to re-arm again", func() bool { return ft.count() == 3 })
+	st := s.Status()
+	if st.Running == nil || st.Running.Trigger != TriggerNightly || st.Running.PausedBy != "user" {
+		t.Errorf("Running = %+v; want the nightly pass still paused", st.Running)
+	}
+	if !st.NextScan.After(armed) {
+		t.Errorf("NextScan = %v; want it after %v", st.NextScan, armed)
+	}
+	if _, err := s.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the pass to finish", func() bool { return s.Status().Running == nil })
+}
+
 func TestNightlyBackupWhilePaused(t *testing.T) {
 	s, db, photos := setup(t)
 	s.idleEvery = time.Hour
@@ -171,10 +232,14 @@ func TestNightlyBackupWhilePaused(t *testing.T) {
 
 func TestSettingsChangedReschedules(t *testing.T) {
 	s, db, _ := setup(t)
+	now := fixedNow(s)
 	ft := &fakeTimer{}
 	s.after = ft.after
 	s.Start()
 	waitFor(t, "the first timer", func() bool { return ft.count() == 1 })
+	if d, want := ft.wait(0), nextRun(now, 3*time.Hour).Sub(now); d != want {
+		t.Errorf("first wait = %v; want %v", d, want)
+	}
 	v := s.Status().Version
 	if err := db.SetSetting(t.Context(), catalog.KeyArchiveRescanAt, "05:15"); err != nil {
 		t.Fatal(err)
@@ -185,8 +250,8 @@ func TestSettingsChangedReschedules(t *testing.T) {
 	if next.Hour() != 5 || next.Minute() != 15 {
 		t.Errorf("NextScan = %v; want 05:15", next)
 	}
-	if d := ft.wait(1); d <= 0 || d > 24*time.Hour+time.Hour {
-		t.Errorf("timer wait = %v; want a positive wait of at most a day", d)
+	if d, want := ft.wait(1), nextRun(now, 5*time.Hour+15*time.Minute).Sub(now); d != want {
+		t.Errorf("timer wait = %v; want %v (until 05:15)", d, want)
 	}
 	if s.Status().Version <= v {
 		t.Error("Version did not advance")
@@ -200,11 +265,14 @@ func TestCloseWhileRescanWaits(t *testing.T) {
 	put(t, photos, "Archive/T/a.JPG", "content a", t0)
 	s.pass.Lock() // stands in for a running pass
 	done := make(chan error, 1)
+	reached := make(chan struct{})
 	go func() {
-		_, err := s.Rescan(context.Background(), TriggerManual, false)
+		// Rescan hands its ctx to context.WithCancel after taking its place in
+		// the wait group, so Done being asked for proves it is on its way to the lock.
+		_, err := s.Rescan(&probeCtx{Context: context.Background(), reached: reached}, TriggerManual, false)
 		done <- err
 	}()
-	time.Sleep(50 * time.Millisecond) // let it block on the lock
+	<-reached
 	closed := make(chan struct{})
 	go func() {
 		s.Close()

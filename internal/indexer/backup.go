@@ -69,6 +69,14 @@ func (s *Service) backupNow(ctx context.Context) {
 	s.mu.Unlock()
 
 	res := s.backup(ctx)
+	if ctx.Err() != nil { // shutting down: an interrupted backup is not a failed one
+		s.log.Info("catalog backup interrupted by shutdown", "path", res.Path)
+		s.mu.Lock()
+		s.status.BackingUp = false
+		s.reportLocked(true)
+		s.mu.Unlock()
+		return
+	}
 
 	dbctx := context.WithoutCancel(ctx)
 	if b, err := json.Marshal(res); err != nil {
