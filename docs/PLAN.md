@@ -423,7 +423,7 @@ mockup. Everything else is reversible by doing the opposite operation.
     "changed since indexed"
   - gone, and not seen elsewhere → `state = missing`, still counted as seen
   - new file not from SD2NAS (copied in by hand) → index it
-  - the catalog backup (§3) runs first, at the same time
+  - at that time the catalog backup (§3) runs first, then the night's pass; the pass is skipped if one is already running or paused
 
   "Changed since indexed" entries are already applied when listed; accepting them clears the list. A running pass can be paused and resumed from the Archive index page. "Re-index everything" re-reads every file without emptying the index; an interrupted one continues at the next pass.
 - **Manual "Rescan now"** from the UI.
@@ -844,10 +844,11 @@ Archive index → Rescan now; the page shows progress, and the container log
 has an `archive scan` line when it finishes. Tick the "Backfill run against
 the real archive" item with the file count and how long it took; it stays
 open until then.
-Known limitations: in rare cases (two catalog rows at one path after an
-interrupted pass, plus a failed read) a present file can show as missing for
-one pass and heals on the next; a backward wall-clock step can run the
-nightly backup and pass twice in one night.
+Known limitations: a file moved into a folder a pass could not list (a
+promote held it, or it was unreadable) can show as missing for one pass and
+heals on the next; while a listed file can't be read (or its folder became
+held after the listing), a file gone from the archive with exactly its size
+is marked missing a pass later.
 
 ### M6: Unraid integration
 - [ ] `unassigned-devices.sh`: ingest, unmount, notify
