@@ -100,8 +100,12 @@ func (sc *scan) run() error {
 	}
 
 	if err := sc.walk(filepath.Join(s.photosRoot, ArchiveDir), ArchiveDir, 0); err != nil {
-		if sc.ctx.Err() != nil {
-			return err
+		if cerr := sc.ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if errors.Is(err, fs.ErrNotExist) { // went missing between the check and the listing
+			r.Skipped = msgArchiveMissing
+			return nil
 		}
 		r.errorf("%s: %v", ArchiveDir, err)
 		r.Skipped = msgArchiveUnread
@@ -238,6 +242,10 @@ func (sc *scan) read(f *file, full bool) (ok bool, err error) {
 		sc.r.errorf("%s: no longer a regular file", f.rel)
 		return false, nil
 	}
+	if !full && !f.matches(before) {
+		full = true // the hash taken from a copy row is for a file that has since been replaced
+		f.sha = ""
+	}
 	if f.fp, err = s.fingerprint(p); err != nil {
 		return sc.readFailed(f.rel, err)
 	}
@@ -263,6 +271,12 @@ func (sc *scan) read(f *file, full bool) (ok bool, err error) {
 	}
 	f.size, f.mtime = after.Size(), after.ModTime().UnixNano()
 	return true, nil
+}
+
+// matches reports whether info has the size and time the listing saw: a hash
+// taken from the catalog for f.rel is only good for a file that still does.
+func (f file) matches(info os.FileInfo) bool {
+	return info.Size() == f.size && info.ModTime().UnixNano() == f.mtime
 }
 
 // readFailed sorts a failed read: cancellation stops the pass, a vanished

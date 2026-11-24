@@ -479,3 +479,54 @@ func TestEditedFileRecordsChange(t *testing.T) {
 		t.Errorf("changes = %+v, %d, %v", ch, total, err)
 	}
 }
+
+func TestCopyRowHashNotTrustedForReplacedFile(t *testing.T) {
+	s, db, photos := setup(t)
+	p := put(t, photos, "Archive/X/a.JPG", "old-content", t0)
+	err := db.PutArchiveCopy(t.Context(), catalog.ArchiveCopy{RelPath: "Archive/X/a.JPG", SHA256: sum("old-content"),
+		Size: 11, Mtime: mtimeOf(t, p), CheckedAt: t0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.beforeRead = func(_ context.Context, rel string) { // the file is replaced after the listing
+		put(t, photos, rel, "replacement-content", t0.Add(time.Hour))
+	}
+	n := countHashes(s)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Added: 1})
+	if n.Load() != 1 {
+		t.Errorf("hash calls = %d; want 1", n.Load())
+	}
+	noAsset(t, db, "old-content")
+	if a := asset(t, db, "replacement-content"); a.RelPath != "Archive/X/a.JPG" || a.Size != 19 {
+		t.Errorf("asset = %+v", a)
+	}
+}
+
+func TestPromoteFinishedAfterHashNeverCopyOfItself(t *testing.T) {
+	s, db, photos := setup(t)
+	ctx := t.Context()
+	f, err := db.CreateStagingFolder(ctx, "T", nil, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := put(t, photos, "Archive/T/x.JPG", "xray", t0)
+	err = db.InsertAsset(ctx, catalog.Asset{SHA256: sum("xray"), Size: 4, Kind: media.KindImage, State: catalog.StateStaged,
+		RelPath: "Staging/T/x.JPG", Mtime: 7, UpdatedAt: t0}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.afterHash = func(string) { // the promote's catalog write lands after the file was read
+		if _, err := db.ArchiveFolder(ctx, f.ID, "Staging/T/", "Archive/T/", t0); err != nil {
+			t.Error(err)
+		}
+	}
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Unchanged: 1})
+	if a := asset(t, db, "xray"); a.State != catalog.StateArchived || a.RelPath != "Archive/T/x.JPG" || a.Mtime != mtimeOf(t, p) {
+		t.Errorf("asset = %+v", a)
+	}
+	if c := copyRows(t, db); len(c) != 0 {
+		t.Errorf("copy rows = %v", c)
+	}
+}
