@@ -41,10 +41,15 @@ The script runs when Unassigned Devices mounts a card. It imports the card, unmo
    - **Automount** on;
    - **Read Only** on;
    - **Share** off;
-   - the device script to `/boot/config/plugins/unassigned.devices/sd2nas.sh`;
-   - **Run Device Script File in the background** on.
+   - **Enable Device Script** and **Run Device Script File in the background** on;
+   - replace everything in **Device Script content** with these two lines, then Save:
 
-   Unassigned Devices keeps settings per slot, so repeat this for every slot.
+     ```
+     #!/bin/bash
+     exec bash /boot/config/plugins/unassigned.devices/sd2nas.sh
+     ```
+
+   Unassigned Devices names each slot's script file after the device and doesn't let you change its path, so this wrapper hands the card to `sd2nas.sh`. Its settings are per slot, so repeat this for every slot. Updating `sd2nas.sh` updates every slot.
 5. Insert a card. You get `<card>: N new, M already known. Card safe to format.` and the card is unmounted.
 
 ## Notifications
