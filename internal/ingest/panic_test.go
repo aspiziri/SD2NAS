@@ -112,3 +112,35 @@ func TestClassifyPanicFailsFile(t *testing.T) {
 		t.Errorf("ARW row = %+v", row)
 	}
 }
+
+func TestPanicOnSecondFileKeepsCounts(t *testing.T) {
+	e := newEnv(t)
+	card := e.fixtureCard(t, "SONY_A7IV")
+	var calls atomic.Int32
+	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+		if calls.Add(1) == 2 {
+			panic("boom")
+		}
+		return media.CopyHashed(ctx, src, dst)
+	}
+	m := newManager(t, e)
+
+	out := submitCard(t, m, card)
+	if out.Status != catalog.StatusFailed || out.Error != "internal error: boom" {
+		t.Fatalf("result = status %q, error %q; want failed, internal error: boom", out.Status, out.Error)
+	}
+	if out.Counts.New != 1 {
+		t.Errorf("Counts.New = %d, want 1 (the file copied before the panic)", out.Counts.New)
+	}
+	level, msg := Describe(out)
+	if level != LevelAlert || !strings.Contains(msg, " 1 new copied before it stopped.") {
+		t.Errorf("Describe = %q, %q; want an alert containing %q", level, msg, " 1 new copied before it stopped.")
+	}
+	row, err := e.cat.Ingest(t.Context(), out.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Counts.New != 1 {
+		t.Errorf("catalog row Counts.New = %d, want 1", row.Counts.New)
+	}
+}
