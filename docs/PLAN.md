@@ -117,10 +117,10 @@ neither imports nor ignores, turn it into a warning instead.
   been in staging longer than 30 days. The threshold is a setting. It is `staging_warn_days` (default 30, 0 turns it off); the daily notification comes with M6's card script.
 
 **Catalog backup:** the database is the only record of what you culled, and
-that can't be rebuilt from the archive. Nightly, after the rescan, SD2NAS writes
+that can't be rebuilt from the archive. Nightly, just before the rescan (so a paused scan can't hold it up), SD2NAS writes
 `VACUUM INTO /photos/Management/SD2NAS/catalog-YYYY-MM-DD.db` and keeps the
 last 14, next to the existing `Management/immich`. It sits outside `Archive/`,
-so neither the indexer nor Capture One sees it. The folder is a setting. This is
+so neither the indexer nor Capture One sees it. The folder is a setting. It is `backup_dir` (empty = `/photos/Management/SD2NAS`; never inside `Archive/` or `Staging/`); a failed backup is shown on the Archive index page and deletes nothing. This is
 on top of the Appdata Backup plugin.
 
 ---
@@ -268,6 +268,7 @@ identical first and last 64 KB is a safe match for camera files. A
 path, new hash), it stores the new hash and keeps the old one in `aliases` and
 the old fingerprint in `fingerprints`. The untouched original on the card still
 matches.
+Schema version 3 adds the `missing` ingest outcome (`ingests.missing`), `archive_copies` (other archive paths holding an asset's content), `archive_changes` ("changed since indexed"), `archive_scans` (the indexer's passes and backups), and `assets.checked_at` / `promoted_at`. A change in place moves the old fingerprints (their values are kept), aliases and ingest history to the new hash.
 
 **Culled stays remembered:** culling or discarding deletes the file and sets
 `state = culled`, `rel_path = NULL`. The row and fingerprint stay, so it's
@@ -408,16 +409,11 @@ mockup. Everything else is reversible by doing the opposite operation.
   ~150 MB/s. Run it overnight. **No thumbnails** are made for the archive: v1
   has no archive browser, and making 150k thumbnails would add hours of
   exiftool and ffmpeg work for nothing.
-- **What gets indexed inside a session folder:** top-level media, `Capture/`,
-  `Selects/`, `Trash/`, `Videos/`, `Other/`. **Skipped:** `Output/` (exports
-  made from originals, never from a card), `CaptureOne/` subfolders (cache and
-  settings) and `*.cosessiondb`. The indexer only walks `Archive/`, so
-  `Staging/` and `Management/` are never indexed. Files in `Trash/` still count as
-  seen, so rejected shots don't come back from the card.
+- **What gets indexed:** every file under `Archive/` with an import format, except hidden and NAS metadata names (always skipped) and what the `archive_skip` setting lists — by default `Output/` and `CaptureOne/` folders inside a session and `*.cosessiondb`. A rule added later leaves what is already indexed there known; it just isn't looked at any more. Files in `Trash/` count as seen, so rejected shots don't come back from the card.
 - **Moves are recognized:** Capture One moves files between `Capture/`,
   `Selects/` and `Trash/`. When a path disappears and the same hash shows up at
   a new path in the same scan, it's recorded as a move, not as "missing" plus
-  "new".
+  "new". A copy of archived content at a second path is remembered as a copy and not re-read; when the primary path goes, the asset moves to the copy.
 - Folder names give a date hint but are **parsed as text, never as a strict
   date**: the archive contains names like `2007-09-31 - Random Party`
   (September has 30 days), which a strict date parser would reject.
@@ -427,7 +423,9 @@ mockup. Everything else is reversible by doing the opposite operation.
     "changed since indexed"
   - gone, and not seen elsewhere → `state = missing`, still counted as seen
   - new file not from SD2NAS (copied in by hand) → index it
-  - then the catalog backup (§3)
+  - at that time the catalog backup (§3) runs first, then the night's pass; the pass is skipped if one is already running or paused
+
+  "Changed since indexed" entries are already applied when listed; accepting them clears the list. A running pass can be paused and resumed from the Archive index page. "Re-index everything" re-reads every file without emptying the index; an interrupted one continues at the next pass.
 - **Manual "Rescan now"** from the UI.
 
 ---
@@ -436,7 +434,7 @@ mockup. Everything else is reversible by doing the opposite operation.
 
 JSON throughout. Server-sent events at `/api/events` push ingest progress,
 staging changes, promote jobs and indexer progress, which replaces
-CameraImport's polling. Event types: `ingest.current` and `ingest.finished` (M3); `staging.changed` and `promote.progress` (M4; it carries `{running, queued, last}`); `indexer.progress` is reserved for M5.
+CameraImport's polling. Event types: `ingest.current` and `ingest.finished` (M3); `staging.changed` and `promote.progress` (M4; it carries `{running, queued, last}`); `indexer.progress` (M5) carries the indexer status.
 
 ```
 POST   /api/ingest                       {path,label,uuid}  ?wait=1 blocks until done
@@ -463,7 +461,9 @@ GET    /api/thumbs/{sha}                 small (~400px), cached
 GET    /api/preview/{sha}                large (~1600px) for the phone lightbox
 
 GET    /api/archive/stats
-POST   /api/archive/rescan
+POST   /api/archive/rescan               {full}  a rescan, or a re-index when full
+POST   /api/archive/pause
+POST   /api/archive/resume
 GET    /api/archive/changed
 POST   /api/archive/changed/accept
 
@@ -471,6 +471,8 @@ GET    /api/settings
 PUT    /api/settings
 GET    /healthz
 ```
+
+`GET/PUT /api/settings` (M5) read and change the catalog settings as strings; no settings page until M7.
 
 **Request guard (always on):** without a login, any webpage open in a browser
 on your network could otherwise send requests to `tower:8080` and cull files.
@@ -796,12 +798,59 @@ and checkboxes on desktop, and by long-press and drag on touch.
 - [ ] Owner's hardware checks: real long-press and swipe-select on iOS, and a promote on the real share
 
 ### M5: Archive indexer
-- [ ] Resumable backfill with progress, Capture One skip rules, move detection
-- [ ] Nightly rescan, aliases, "changed since indexed" view
-- [ ] Nightly catalog backup to the array
-- [ ] Backfill run against the real archive
-- [ ] When the indexer finds content in `Archive/` whose asset is `culled` (a promote interrupted between the rename and the catalog write), mark it `archived` at that path
-- [ ] `missing` assets (catalogued copy vanished without a cull) stay known so they are not re-imported, but do not count toward safe to format: add a blocking count and message ('N files' archive copies are missing')
+- [x] Resumable backfill with progress, Capture One skip rules, move detection
+- [x] Nightly rescan, aliases, "changed since indexed" view
+- [x] Nightly catalog backup to the array
+- [ ] Backfill run against the real archive (the owner's, on the NAS)
+- [x] When the indexer finds content in `Archive/` whose asset is `culled` (a promote interrupted between the rename and the catalog write), mark it `archived` at that path
+- [x] `missing` assets (catalogued copy vanished without a cull) stay known so they are not re-imported, but do not count toward safe to format: add a blocking count and message ('N files' archive copies are missing')
+
+Implementation plan: `docs/plans/m5-archive-indexer.md`. One walker serves
+the backfill, the nightly rescan and "Re-index everything": the first pass
+is a rescan over an empty index, every file is committed as it is read, so
+an interrupted pass carries on where it stopped. A pass lists `Archive/`
+(stat only), then reads only new files and files whose size or modified
+time changed, one at a time (new paths before changed ones), waiting while
+an import or promote runs or while the owner has paused it from the Archive
+index page (the file being read finishes first). Moves are found by quick
+fingerprint, size and modified time (no full read); the same content at a
+second archive path is recorded in `archive_copies`; a file changed in place
+gets its new hash at once, the old one becomes an alias and the path is
+listed under "changed since indexed" until accepted (accepting only clears
+the list); an original found again in `Archive/` whose hash is an alias
+becomes its own asset again. Only a pass that ran to the end marks files
+`missing`, each after re-checking that it and `Archive/` are still there;
+folders a promote holds are skipped and picked up next time; staged content
+found in the archive is left alone and culled content becomes archived.
+"Re-index everything" re-reads every indexed file without emptying the index
+(cards keep matching while it runs); a stopped re-index is continued by the
+next pass. Imports give files whose archive copy is missing the outcome
+`missing`, which blocks safe to format ("N files' archive copies are
+missing"). Only import formats are indexed; hidden and NAS metadata names,
+non-regular files and non-media are always skipped, and the `archive_skip`
+setting (default `Output/, CaptureOne/, *.cosessiondb`, comma-separated)
+lists what else to skip; rows already indexed under a newly skipped path
+stay known and are never marked missing. Nothing runs at startup: at
+`archive_rescan_at` (default 03:00 container time) the catalog is backed up
+with `VACUUM INTO` to `backup_dir` (default `/photos/Management/SD2NAS`,
+keeping 14) first, then the nightly pass runs — the first one is the
+backfill. A pass that is running or paused at that time doesn't hold the
+backup up: the backup still runs and the nightly pass is skipped. Or press
+"Rescan now". Schema version 3. Settings are read and changed with
+`GET/PUT /api/settings` until M7's page, e.g. from the Unraid terminal
+`curl -s -X PUT -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' http://localhost:4040/api/settings -d '{"archive_skip":"Output/, CaptureOne/, *.cosessiondb, Exports/"}'`.
+**To run the backfill:** after updating, either wait for 03:00 or open
+Archive index → Rescan now; the page shows progress, and the container log
+has an `archive scan` line when it finishes. Tick the "Backfill run against
+the real archive" item with the file count and how long it took; it stays
+open until then.
+Known limitations: a moved file that a pass can't read keeps its entry only
+when the pass listed it with the entry's size and modified time; otherwise
+(its folder couldn't be listed because a promote held it or it was
+unreadable, or the file was touched) the old entry can show as missing for
+that pass and heals on the next. While a listed file can't be read, a file
+gone from the archive with exactly its size and modified time is marked
+missing only once that file reads.
 
 ### M6: Unraid integration
 - [ ] `unassigned-devices.sh`: ingest, unmount, notify
@@ -811,12 +860,14 @@ and checkboxes on desktop, and by long-press and drag on touch.
 - [ ] Take an exclusive lock on `/config` at startup so a second instance can't fail the live job or delete its partials
 - [ ] The fallback poller must register its jobs with the API's ingest feed (`watch`), as `POST /api/ingest` does, so short imports still send `ingest.finished`
 - [ ] Daily notification for folders in staging longer than `staging_warn_days`
+- [ ] Notify when the nightly catalog backup fails or the nightly rescan finds missing files
 
 ### M7: Polish
 - [ ] Extra staging views (timeline, list)
 - [ ] "Shift times" tool for wrong camera clocks
 - [ ] Optional token auth
-- [ ] Settings page: `staging_warn_days`, the default promote pattern (now remembered per device), `day_starts_at`
+- [ ] Settings page: `staging_warn_days`, the default promote pattern (now remembered per device), `day_starts_at`, `archive_rescan_at`, `backup_dir`, `archive_skip`
+- [ ] Offer to re-import files whose archive copy is missing (imports now list them and refuse safe to format)
 - [ ] Cache thumbnail render failures per file so a corrupt file isn't re-rendered on every view
 - [ ] Byte-level copy progress for long videos (progress currently updates once per file)
 - [ ] Keep one `exiftool -stay_open` process for RAW thumbnails instead of one process per file

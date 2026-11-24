@@ -40,6 +40,7 @@ const (
 	OutcomeSeenBefore  Outcome = "seen_before"
 	OutcomeFailed      Outcome = "failed"
 	OutcomeUnsupported Outcome = "unsupported"
+	OutcomeMissing     Outcome = "missing" // the card file's asset is missing from the archive
 )
 
 // Counts are the outcomes of the ingest_files rows written for one ingest.
@@ -49,6 +50,7 @@ type Counts struct {
 	InArchive   int `json:"in_archive"`
 	InStaging   int `json:"in_staging"`
 	SeenBefore  int `json:"seen_before"`
+	Missing     int `json:"missing"`
 	Failed      int `json:"failed"`
 	Unsupported int `json:"unsupported"`
 }
@@ -67,6 +69,8 @@ func (c *Counts) Add(o Outcome) {
 		c.InStaging++
 	case OutcomeSeenBefore:
 		c.SeenBefore++
+	case OutcomeMissing:
+		c.Missing++
 	case OutcomeFailed:
 		c.Failed++
 	case OutcomeUnsupported:
@@ -126,7 +130,7 @@ type ClockWarning struct {
 const interruptedMessage = "interrupted: SD2NAS stopped before this import finished"
 
 const ingestCols = "id, card_path, card_label, card_uuid, card_size, started_at, finished_at, status, " +
-	"seen, new, in_archive, in_staging, seen_before, failed, unsupported, unsupported_exts, clock_warnings, safe_to_format, error, forgotten_at"
+	"seen, new, in_archive, in_staging, seen_before, missing, failed, unsupported, unsupported_exts, clock_warnings, safe_to_format, error, forgotten_at"
 
 func scanIngest(s scanner) (Ingest, error) {
 	var (
@@ -139,7 +143,7 @@ func scanIngest(s scanner) (Ingest, error) {
 		forgotten sql.NullString
 	)
 	err := s.Scan(&in.ID, &in.CardPath, &in.CardLabel, &in.CardUUID, &in.CardSize, &started, &finished, &status,
-		&in.Counts.Seen, &in.Counts.New, &in.Counts.InArchive, &in.Counts.InStaging, &in.Counts.SeenBefore,
+		&in.Counts.Seen, &in.Counts.New, &in.Counts.InArchive, &in.Counts.InStaging, &in.Counts.SeenBefore, &in.Counts.Missing,
 		&in.Counts.Failed, &in.Counts.Unsupported, &exts, &in.ClockWarnings, &safe, &in.Error, &forgotten)
 	if err != nil {
 		return Ingest{}, err
@@ -240,10 +244,10 @@ func (d *DB) FinishIngest(ctx context.Context, in Ingest) error {
 	}
 	c := in.Counts
 	res, err := d.db.ExecContext(ctx, `UPDATE ingests SET status = ?, finished_at = ?, seen = ?, new = ?,
-		in_archive = ?, in_staging = ?, seen_before = ?, failed = ?, unsupported = ?, unsupported_exts = ?,
+		in_archive = ?, in_staging = ?, seen_before = ?, missing = ?, failed = ?, unsupported = ?, unsupported_exts = ?,
 		clock_warnings = ?, card_size = ?, safe_to_format = ?, error = ?
 		WHERE id = ? AND status IN ('queued','running')`,
-		string(in.Status), formatTime(in.FinishedAt), c.Seen, c.New, c.InArchive, c.InStaging, c.SeenBefore,
+		string(in.Status), formatTime(in.FinishedAt), c.Seen, c.New, c.InArchive, c.InStaging, c.SeenBefore, c.Missing,
 		c.Failed, c.Unsupported, exts, in.ClockWarnings, in.CardSize, safe, in.Error, in.ID)
 	if err != nil {
 		return fmt.Errorf("finish ingest %d: %w", in.ID, err)
@@ -336,7 +340,7 @@ func hexOrNil(s string) (any, error) {
 
 func validOutcome(o Outcome) bool {
 	switch o {
-	case OutcomeNew, OutcomeInArchive, OutcomeInStaging, OutcomeSeenBefore, OutcomeFailed, OutcomeUnsupported:
+	case OutcomeNew, OutcomeInArchive, OutcomeInStaging, OutcomeSeenBefore, OutcomeFailed, OutcomeUnsupported, OutcomeMissing:
 		return true
 	}
 	return false

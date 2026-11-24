@@ -9,6 +9,7 @@ export const live = $state({
   finishedCount: 0, // bumps on every ingest.finished; pages reload on it
   staging: { version: 0, rescanning: false, last_rescan: null }, // the last staging.changed
   promote: null, // the last promote.progress: { running, queued: [...], last }; null until it arrives
+  indexer: { version: 0, running: null, last: null, last_backup: null, backing_up: false, pending_full: false, changed: 0, missing: 0, next_scan: null }, // the last indexer.progress
 });
 
 let source = null;
@@ -42,6 +43,9 @@ export function connectEvents() {
   });
   source.addEventListener('promote.progress', (e) => {
     live.promote = JSON.parse(e.data);
+  });
+  source.addEventListener('indexer.progress', (e) => {
+    live.indexer = JSON.parse(e.data);
   });
 }
 

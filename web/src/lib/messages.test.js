@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { plural, joinList, describeError, rescanSummary, promoteSummary, promoteToast, promoteStates } from './messages.js';
+import { plural, joinList, describeError, rescanSummary, promoteSummary, promoteToast, promoteStates, missingCopies } from './messages.js';
 import { ApiError } from './api.js';
 
 const scan = (o) => ({ adopted_folders: 0, added_files: 0, moved_files: 0, restored_files: 0, culled_files: 0, removed_folders: 0,
@@ -88,4 +88,10 @@ test('promoteToast', () => {
   assert.equal(promoteToast(two, undefined), 'Promoting 2 folders…');
   assert.equal(promoteToast(one, { running: { id: 1 }, queued: [] }), 'Queued: 1 folder waits for the promote ahead of it.');
   assert.equal(promoteToast(two, { running: null, queued: [{ id: 1 }] }), 'Queued: 2 folders wait for the promote ahead of them.');
+});
+
+test('missingCopies', () => {
+  assert.equal(missingCopies(1), "1 file's archive copy is missing");
+  assert.equal(missingCopies(2), "2 files' archive copies are missing");
+  assert.equal(missingCopies(1234), "1,234 files' archive copies are missing");
 });

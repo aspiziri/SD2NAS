@@ -89,3 +89,7 @@ export function promoteToast(job, before) {
   }
   return `Promoting ${plural(n, 'folder', 'folders')}…`;
 }
+
+// The same sentence the server writes for an import, but with thousands grouped.
+export const missingCopies = (n) =>
+  n === 1 ? "1 file's archive copy is missing" : `${formatCount(n)} files' archive copies are missing`;

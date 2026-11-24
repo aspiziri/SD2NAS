@@ -200,12 +200,55 @@ func TestRunKnownOutcomes(t *testing.T) {
 		}
 	}
 	out := e.run(t, card)
-	wantDone(t, out, catalog.Counts{Seen: 3, InArchive: 1, SeenBefore: 2}, true)
+	wantDone(t, out, catalog.Counts{Seen: 3, InArchive: 1, SeenBefore: 1, Missing: 1}, false)
 	wantStaged(t, e)
 	f := e.files(t, out.ID)["DCIM/100MSDCF/DSC00001.JPG"]
 	if f.Outcome != catalog.OutcomeInArchive || f.SHA256 != archivedSHA || f.RelPath != specs[0].relPath {
 		t.Errorf("archived row = %+v", f)
 	}
+	if m := e.files(t, out.ID)["DCIM/100MSDCF/DSC00003.JPG"]; m.Outcome != catalog.OutcomeMissing {
+		t.Errorf("missing row = %+v, want outcome missing", m)
+	}
+}
+
+func TestRunMissingBlocksSafeToFormat(t *testing.T) {
+	seed := func(t *testing.T, e *env, card string, states ...catalog.AssetState) {
+		t.Helper()
+		p := cardPath(card, cardJPG)
+		for i, st := range states {
+			a := catalog.Asset{SHA256: strings.Repeat(string(rune('a'+i)), 64), Size: mustSize(t, p), Kind: media.KindImage,
+				State: st, RelPath: "Archive/2025-06-01 - Hike/x.JPG", UpdatedAt: testNow}
+			if err := e.cat.InsertAsset(t.Context(), a, mustFP(t, p)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Run("missing only", func(t *testing.T) {
+		e := newEnv(t)
+		card := e.cards
+		writeJPEG(t, card, "DCIM/100MSDCF/DSC00001.JPG", mt.ExifSpec{DateTimeOriginal: "2025:06:01 10:00:00"})
+		p := cardPath(card, "DCIM/100MSDCF/DSC00001.JPG")
+		a := catalog.Asset{SHA256: mustHash(t, p), Size: mustSize(t, p), Kind: media.KindImage, State: catalog.StateMissing,
+			RelPath: "Archive/2025-06-01 - Hike/x.JPG", UpdatedAt: testNow}
+		if err := e.cat.InsertAsset(t.Context(), a, mustFP(t, p)); err != nil {
+			t.Fatal(err)
+		}
+		out := e.run(t, card)
+		wantDone(t, out, catalog.Counts{Seen: 1, Missing: 1}, false)
+		_, msg := Describe(out)
+		if !strings.HasSuffix(msg, "1 file's archive copy is missing. Do not format the card.") {
+			t.Errorf("message = %q", msg)
+		}
+	})
+	t.Run("archived wins", func(t *testing.T) {
+		e := newEnv(t)
+		card := e.fixtureCard(t, "SONY_A7IV")
+		seed(t, e, card, catalog.StateMissing, catalog.StateArchived)
+		out := e.run(t, card)
+		if out.Counts.Missing != 0 || out.Counts.InArchive != 1 || !out.SafeToFormat {
+			t.Errorf("ingest = %+v, want in_archive and safe", out)
+		}
+	})
 }
 
 func TestRunVerifyFull(t *testing.T) {
@@ -443,7 +486,7 @@ func TestKnownOutcomeRefusesUnknownState(t *testing.T) {
 		catalog.StateArchived: catalog.OutcomeInArchive,
 		catalog.StateStaged:   catalog.OutcomeInStaging,
 		catalog.StateCulled:   catalog.OutcomeSeenBefore,
-		catalog.StateMissing:  catalog.OutcomeSeenBefore,
+		catalog.StateMissing:  catalog.OutcomeMissing,
 	} {
 		if got, err := knownOutcome(state); err != nil || got != want {
 			t.Errorf("knownOutcome(%q) = %q, %v; want %q", state, got, err, want)

@@ -77,8 +77,8 @@ func (d *DB) CreateStagingFolder(ctx context.Context, name string, dates []strin
 // same place below to, setting state unless it is "", and only for assets
 // in onlyState unless that is "". SQLite's substr and length count
 // characters, not bytes, so the old prefix is measured in SQL: folder names
-// may hold any UTF-8.
-func rewritePrefix(ctx context.Context, tx *sql.Tx, from, to string, state, onlyState AssetState, at time.Time) (int64, error) {
+// may hold any UTF-8. With promoted, it also sets promoted_at = at.
+func rewritePrefix(ctx context.Context, tx *sql.Tx, from, to string, state, onlyState AssetState, promoted bool, at time.Time) (int64, error) {
 	lo, hi, err := prefixRange(from)
 	if err != nil {
 		return 0, err
@@ -91,6 +91,10 @@ func rewritePrefix(ctx context.Context, tx *sql.Tx, from, to string, state, only
 	if state != "" {
 		q += ", state = ?"
 		args = append(args, string(state))
+	}
+	if promoted {
+		q += ", promoted_at = ?"
+		args = append(args, formatTime(at))
 	}
 	q += " WHERE rel_path >= ? AND rel_path < ?"
 	args = append(args, lo, hi)
@@ -132,7 +136,7 @@ func (d *DB) RenameStagingFolder(ctx context.Context, id int64, name, oldPrefix,
 		if _, err := tx.ExecContext(ctx, "UPDATE staging_folders SET name = ? WHERE id = ?", name, id); err != nil {
 			return err
 		}
-		_, err = rewritePrefix(ctx, tx, oldPrefix, newPrefix, "", "", at)
+		_, err = rewritePrefix(ctx, tx, oldPrefix, newPrefix, "", "", false, at)
 		return err
 	})
 	if err != nil {
@@ -245,7 +249,7 @@ func (d *DB) changeAsset(ctx context.Context, verb, sha string, states []AssetSt
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", verb, sha, err)
 	}
-	return fmt.Errorf("%s %s: the asset is %s", verb, sha, state)
+	return &WrongStateError{Verb: verb, SHA256: sha, State: AssetState(state)}
 }
 
 var onlyStaged = []AssetState{StateStaged}
@@ -263,7 +267,7 @@ func (d *DB) CullAsset(ctx context.Context, sha string, at time.Time) error {
 
 // ArchiveAsset records that staged asset sha was promoted to relPath.
 func (d *DB) ArchiveAsset(ctx context.Context, sha, relPath string, at time.Time) error {
-	return d.changeAsset(ctx, "archive", sha, onlyStaged, "state = 'archived', rel_path = ?, updated_at = ?", relPath, formatTime(at))
+	return d.changeAsset(ctx, "archive", sha, onlyStaged, "state = 'archived', rel_path = ?, updated_at = ?, promoted_at = ?", relPath, formatTime(at), formatTime(at))
 }
 
 // RestageAsset records that the content of a culled or missing asset is in
@@ -283,7 +287,7 @@ func (d *DB) ArchiveFolder(ctx context.Context, id int64, fromPrefix, toPrefix s
 			return err
 		}
 		var err error
-		if n, err = rewritePrefix(ctx, tx, fromPrefix, toPrefix, StateArchived, StateStaged, at); err != nil {
+		if n, err = rewritePrefix(ctx, tx, fromPrefix, toPrefix, StateArchived, StateStaged, true, at); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, "DELETE FROM staging_folders WHERE id = ?", id)

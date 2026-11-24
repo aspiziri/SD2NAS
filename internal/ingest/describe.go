@@ -100,6 +100,9 @@ func describeDone(in catalog.Ingest) (level, body string) {
 	if c.Failed > 0 {
 		body += fmt.Sprintf(", %d failed", c.Failed)
 	}
+	if c.Missing > 0 {
+		body += ", " + missingCopies(c.Missing)
+	}
 	if c.Unsupported > 0 {
 		body += fmt.Sprintf(", %d %s not imported", c.Unsupported, plural(c.Unsupported, "file", "files"))
 		body += describeExts(in.UnsupportedExts)
@@ -114,6 +117,14 @@ func describeDone(in catalog.Ingest) (level, body string) {
 			in.ClockWarnings, plural(in.ClockWarnings, "file has", "files have"))
 	}
 	return LevelNormal, body
+}
+
+// missingCopies says how many card files match an asset whose archive copy is gone.
+func missingCopies(n int) string {
+	if n == 1 {
+		return "1 file's archive copy is missing"
+	}
+	return fmt.Sprintf("%d files' archive copies are missing", n)
 }
 
 // maxExts is how many unsupported extensions the message names.

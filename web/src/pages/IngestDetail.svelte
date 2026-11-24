@@ -6,7 +6,7 @@
   import { cardName, formatWhen, formatBytes, formatCount, levelClass, groupKnown, outcomeFiles } from '../lib/format.js';
   import LiveIngest from '../components/LiveIngest.svelte';
   import { navigate } from '../lib/router.svelte.js';
-  import { describeError, plural } from '../lib/messages.js';
+  import { describeError, plural, missingCopies } from '../lib/messages.js';
   import { toast } from '../lib/toast.svelte.js';
   import Dialog from '../components/Dialog.svelte';
 
@@ -120,6 +120,7 @@
   const files = $derived(ingest?.files ?? []);
   const groups = $derived(groupKnown(files));
   const seenBefore = $derived(outcomeFiles(files, 'seen_before'));
+  const missing = $derived(outcomeFiles(files, 'missing'));
   const failed = $derived(outcomeFiles(files, 'failed'));
   const unsupported = $derived(outcomeFiles(files, 'unsupported'));
   const clock = $derived(ingest?.clock_details ?? []);
@@ -134,6 +135,7 @@
 {/snippet}
 {#snippet pathRow(f)}<span class="mono">{f.card_path}</span>{/snippet}
 {#snippet errorRow(f)}<span class="mono">{f.card_path}</span>: {f.error}{/snippet}
+{#snippet missingRow(f)}<span class="mono">{f.card_path}</span> → <span class="mono">{f.rel_path}</span>{/snippet}
 {#snippet clockRow(w)}<span class="mono">{w.card_path}</span>: {w.detail}{/snippet}
 
 <p><a href="/ingest" class="btn">← Card ingest</a></p>
@@ -160,6 +162,7 @@
     <div class="stat"><b>{formatCount(c.in_archive)}</b>already in the archive</div>
     <div class="stat"><b>{formatCount(c.in_staging)}</b>already in staging</div>
     <div class="stat warn"><b>{formatCount(c.seen_before)}</b>imported before, since removed</div>
+    {#if c.missing}<div class="stat bad"><b>{formatCount(c.missing)}</b>archive copies missing</div>{/if}
     {#if c.failed}<div class="stat bad"><b>{formatCount(c.failed)}</b>failed</div>{/if}
     {#if c.unsupported}<div class="stat warn"><b>{formatCount(c.unsupported)}</b>not imported</div>{/if}
   </div>
@@ -181,6 +184,13 @@
         {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
       {/if}
       {@render fileList(seenBefore, pathRow)}
+    </details>
+  {/if}
+  {#if missing.length}
+    <details open>
+      <summary>{missingCopies(missing.length)}</summary>
+      <p class="muted small" style="margin:8px 0">SD2NAS knows these files, but their copies in the archive are gone, so the card isn't safe to format. Keep it until you've found or restored them; the Archive index page lists the missing files.</p>
+      {@render fileList(missing, missingRow)}
     </details>
   {/if}
   {#if failed.length}

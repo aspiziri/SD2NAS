@@ -22,10 +22,25 @@ var (
 	ErrNotFound = errors.New("catalog: not found")
 	// ErrBadHash reports a hash that is not 64 lowercase hex digits.
 	ErrBadHash = errors.New("catalog: hash must be 64 lowercase hex digits")
+	// ErrWrongState is what every *WrongStateError matches with errors.Is.
+	ErrWrongState = errors.New("catalog: the asset is in another state")
 )
 
+// WrongStateError: an asset update found the asset in a state it doesn't apply to.
+type WrongStateError struct {
+	Verb, SHA256 string
+	State        AssetState
+}
+
+func (e *WrongStateError) Error() string {
+	return fmt.Sprintf("%s %s: the asset is %s", e.Verb, e.SHA256, e.State)
+}
+
+// Is reports whether target is ErrWrongState.
+func (e *WrongStateError) Is(target error) bool { return target == ErrWrongState }
+
 // SchemaVersion is the schema version this build creates and understands.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 const dsnParams = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" +
 	"&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
