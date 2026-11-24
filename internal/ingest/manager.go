@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -273,7 +274,7 @@ func (m *Manager) run(j *Job) {
 	row.Status = catalog.StatusRunning
 	row.StartedAt = m.stamp()
 	j.set(row)
-	out, err := m.r.Run(m.ctx, row, j.progress)
+	out, err := m.runRecovered(row, j)
 	if err != nil {
 		m.r.log().Error("ingest failed", "ingest", row.ID, "error", err)
 		out = row
@@ -285,6 +286,32 @@ func (m *Manager) run(j *Job) {
 	m.running = nil
 	j.finish(out)
 	m.mu.Unlock()
+}
+
+// runRecovered runs the import and turns a panic into a failed import with
+// the counts reached so far, so the worker goes on with the next job
+// (§16 M6). Run's deferred folder releases and catalog rollbacks have run
+// by the time recover sees the panic.
+func (m *Manager) runRecovered(row catalog.Ingest, j *Job) (out catalog.Ingest, err error) {
+	defer func() {
+		p := recover()
+		if p == nil {
+			return
+		}
+		m.r.log().Error("ingest panicked", "ingest", row.ID, "panic", p, "stack", string(debug.Stack()))
+		out = row
+		out.Status = catalog.StatusFailed
+		out.Error = fmt.Sprintf("internal error: %v", p)
+		out.Counts = j.Progress().Counts
+		out.SafeToFormat = false
+		out.FinishedAt = m.stamp()
+		// Not cancellable: the failure must be recorded even during shutdown.
+		if ferr := m.r.cfg.Catalog.FinishIngest(context.WithoutCancel(m.ctx), out); ferr != nil {
+			// run replaces out.Error with err's text, so keep the panic in it (PF14).
+			err = fmt.Errorf("internal error: %v; record the failed ingest %d: %w", p, row.ID, ferr)
+		}
+	}()
+	return m.r.Run(m.ctx, row, j.progress)
 }
 
 func (j *Job) set(row catalog.Ingest) {
