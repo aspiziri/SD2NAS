@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -528,5 +529,587 @@ func TestPromoteFinishedAfterHashNeverCopyOfItself(t *testing.T) {
 	}
 	if c := copyRows(t, db); len(c) != 0 {
 		t.Errorf("copy rows = %v", c)
+	}
+}
+
+// countFingerprints wraps s.fingerprint and returns the number of quick reads so far.
+func countFingerprints(s *Service) *atomic.Int32 {
+	var n atomic.Int32
+	inner := s.fingerprint
+	s.fingerprint = func(path string) (string, error) {
+		n.Add(1)
+		return inner(path)
+	}
+	return &n
+}
+
+// archivedRow records content as archived at rel with no file behind it.
+func archivedRow(t *testing.T, db *catalog.DB, rel, content string) {
+	t.Helper()
+	err := db.InsertAsset(t.Context(), catalog.Asset{SHA256: sum(content), Size: int64(len(content)), Kind: media.KindImage,
+		State: catalog.StateArchived, RelPath: rel, Mtime: t0.UnixNano(), UpdatedAt: t0}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func remove(t *testing.T, photos, rel string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(photos, filepath.FromSlash(rel))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rename(t *testing.T, photos, from, to string) {
+	t.Helper()
+	dst := filepath.Join(photos, filepath.FromSlash(to))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(photos, filepath.FromSlash(from)), dst); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wantAsset checks the state and rel_path of the asset holding content.
+func wantAsset(t *testing.T, db *catalog.DB, content string, state catalog.AssetState, rel string) {
+	t.Helper()
+	if a := asset(t, db, content); a.State != state || a.RelPath != rel {
+		t.Errorf("asset %q = %s at %s; want %s at %s", content, a.State, a.RelPath, state, rel)
+	}
+}
+
+func changeEntries(t *testing.T, db *catalog.DB) []catalog.ArchiveChange {
+	t.Helper()
+	ch, _, _, err := db.ArchiveChanges(t.Context(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ch
+}
+
+func noErrors(t *testing.T, r ScanResult) {
+	t.Helper()
+	if len(r.Errors) != 0 || r.Skipped != "" || r.Stopped {
+		t.Errorf("errors %q skipped %q stopped %v", r.Errors, r.Skipped, r.Stopped)
+	}
+}
+
+func TestMoveWithinSession(t *testing.T) {
+	s, db, photos := setup(t)
+	const S = "Archive/2025-05-30 - Trip/"
+	put(t, photos, S+"a.JPG", "alpha", t0)
+	put(t, photos, S+"Capture/b.ARW", "bravo", t0)
+	rescan(t, s)
+	rename(t, photos, S+"Capture/b.ARW", S+"Selects/b.ARW")
+	n := countHashes(s)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Moved: 1})
+	noErrors(t, r)
+	if n.Load() != 0 {
+		t.Errorf("hash calls = %d; want 0", n.Load())
+	}
+	wantAsset(t, db, "bravo", catalog.StateArchived, S+"Selects/b.ARW")
+	if a := asset(t, db, "bravo"); a.Mtime != t0.UnixNano() {
+		t.Errorf("mtime = %d; want %d", a.Mtime, t0.UnixNano())
+	}
+}
+
+func TestSessionRenamedByHand(t *testing.T) {
+	s, db, photos := setup(t)
+	files := map[string]string{"a.JPG": "alpha", "Capture/b.ARW": "bravo", "Selects/c.JPG": "charlie"}
+	for name, c := range files {
+		put(t, photos, "Archive/2025-05-30 - Trip/"+name, c, t0)
+	}
+	rescan(t, s)
+	rename(t, photos, "Archive/2025-05-30 - Trip", "Archive/2025-05-30 - Coast Trip")
+	n := countHashes(s)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 3, Moved: 3})
+	noErrors(t, r)
+	if n.Load() != 0 {
+		t.Errorf("hash calls = %d; want 0", n.Load())
+	}
+	for name, c := range files {
+		wantAsset(t, db, c, catalog.StateArchived, "Archive/2025-05-30 - Coast Trip/"+name)
+	}
+}
+
+func TestMovedAndChangedIsNewPlusMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/Capture/b.ARW", "bravo", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/T/Capture/b.ARW")
+	put(t, photos, "Archive/T/Selects/b.ARW", "bravo, edited", t0.Add(time.Hour))
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Added: 1, Missing: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "bravo", catalog.StateMissing, "Archive/T/Capture/b.ARW")
+	wantAsset(t, db, "bravo, edited", catalog.StateArchived, "Archive/T/Selects/b.ARW")
+}
+
+func TestRescanChangedContent(t *testing.T) {
+	s, db, photos := setup(t)
+	p := put(t, photos, "Archive/T/a.JPG", "before", t0)
+	rescan(t, s)
+	oldFP, err := media.QuickFingerprint(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put(t, photos, "Archive/T/a.JPG", "after, longer", t0.Add(time.Hour))
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Changed: 1})
+	noErrors(t, r)
+	noAsset(t, db, "before")
+	wantAsset(t, db, "after, longer", catalog.StateArchived, "Archive/T/a.JPG")
+	if a, err := db.AssetBySHA(t.Context(), sum("before")); err != nil || a.SHA256 != sum("after, longer") {
+		t.Errorf("AssetBySHA(old) = %+v, %v", a, err)
+	}
+	ch := changeEntries(t, db)
+	if len(ch) != 1 || ch[0].RelPath != "Archive/T/a.JPG" || ch[0].OldSHA256 != sum("before") || ch[0].SHA256 != sum("after, longer") ||
+		ch[0].OldSize != 6 || ch[0].Size != 13 {
+		t.Errorf("changes = %+v", ch)
+	}
+	if got, err := db.AssetsByFingerprint(t.Context(), oldFP); err != nil || len(got) != 1 || got[0].SHA256 != sum("after, longer") {
+		t.Errorf("old fingerprint finds %+v, %v", got, err)
+	}
+}
+
+func TestChangeReverted(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "version-a", t0)
+	rescan(t, s)
+	put(t, photos, "Archive/T/a.JPG", "version-b", t0.Add(time.Hour))
+	if r := rescan(t, s); r.Changed != 1 {
+		t.Fatalf("first change: %+v", r)
+	}
+	put(t, photos, "Archive/T/a.JPG", "version-a", t0.Add(2*time.Hour))
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Changed: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "version-a", catalog.StateArchived, "Archive/T/a.JPG")
+	if a, err := db.AssetBySHA(t.Context(), sum("version-b")); err != nil || a.SHA256 != sum("version-a") {
+		t.Errorf("AssetBySHA(B) = %+v, %v", a, err)
+	}
+	if ch := changeEntries(t, db); len(ch) != 0 {
+		t.Errorf("changes = %+v", ch)
+	}
+}
+
+func TestChangedToKnownContent(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/p.JPG", "pppp", t0)
+	put(t, photos, "Archive/T/q.JPG", "qqqq", t0)
+	rescan(t, s)
+	put(t, photos, "Archive/T/p.JPG", "qqqq", t0.Add(time.Hour))
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Copies: 1, Missing: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "pppp", catalog.StateMissing, "Archive/T/p.JPG")
+	wantAsset(t, db, "qqqq", catalog.StateArchived, "Archive/T/q.JPG")
+	if c := copyRows(t, db); len(c) != 1 || c[0].RelPath != "Archive/T/p.JPG" || c[0].SHA256 != sum("qqqq") {
+		t.Errorf("copy rows = %+v", c)
+	}
+	if ch := changeEntries(t, db); len(ch) != 0 {
+		t.Errorf("changes = %+v", ch)
+	}
+	n, fp := countHashes(s), countFingerprints(s)
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 2})
+	if n.Load() != 0 || fp.Load() != 0 {
+		t.Errorf("reads after: %d hashes, %d fingerprints; want none", n.Load(), fp.Load())
+	}
+}
+
+func TestDuplicateRecordedAsCopy(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "dup", t0)
+	put(t, photos, "Archive/T/b.JPG", "dup", t0)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Added: 1, Copies: 1})
+	wantAsset(t, db, "dup", catalog.StateArchived, "Archive/T/a.JPG")
+	if c := copyRows(t, db); len(c) != 1 || c[0].RelPath != "Archive/T/b.JPG" || c[0].SHA256 != sum("dup") {
+		t.Fatalf("copy rows = %+v", c)
+	}
+
+	n, fp := countHashes(s), countFingerprints(s)
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 2})
+	if n.Load() != 0 || fp.Load() != 0 {
+		t.Errorf("reads: %d hashes, %d fingerprints; want none", n.Load(), fp.Load())
+	}
+
+	remove(t, photos, "Archive/T/a.JPG")
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Unchanged: 1, Moved: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "dup", catalog.StateArchived, "Archive/T/b.JPG")
+	if c := copyRows(t, db); len(c) != 0 {
+		t.Errorf("copy rows after the primary went = %+v", c)
+	}
+
+	remove(t, photos, "Archive/T/b.JPG")
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Missing: 1})
+	wantAsset(t, db, "dup", catalog.StateMissing, "Archive/T/b.JPG")
+
+	// Deleting a copy while its primary stays only drops the copy row.
+	put(t, photos, "Archive/U/x.JPG", "dup2", t0)
+	put(t, photos, "Archive/U/y.JPG", "dup2", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/U/y.JPG")
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Unchanged: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "dup2", catalog.StateArchived, "Archive/U/x.JPG")
+	if c := copyRows(t, db); len(c) != 0 {
+		t.Errorf("copy rows after the copy went = %+v", c)
+	}
+}
+
+func TestPrimaryGoneMovesToCopy(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "original", t0)
+	put(t, photos, "Archive/T/c.JPG", "original", t0)
+	rescan(t, s)
+	put(t, photos, "Archive/T/a.JPG", "edited!!", t0.Add(time.Hour))
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Added: 1, Moved: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "original", catalog.StateArchived, "Archive/T/c.JPG")
+	wantAsset(t, db, "edited!!", catalog.StateArchived, "Archive/T/a.JPG")
+	if c := copyRows(t, db); len(c) != 0 {
+		t.Errorf("copy rows = %+v", c)
+	}
+	if ch := changeEntries(t, db); len(ch) != 0 {
+		t.Errorf("changes = %+v", ch)
+	}
+}
+
+// A copy made in the same pass as the edit counts too: the hashing phase
+// reads new paths before changed ones.
+func TestCopiedThenEditedInPlace(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "original", t0)
+	rescan(t, s)
+	put(t, photos, "Archive/T/c.JPG", "original", t0)
+	put(t, photos, "Archive/T/a.JPG", "edited!!", t0.Add(time.Hour))
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Added: 1, Moved: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "original", catalog.StateArchived, "Archive/T/c.JPG")
+	wantAsset(t, db, "edited!!", catalog.StateArchived, "Archive/T/a.JPG")
+	if c := copyRows(t, db); len(c) != 0 {
+		t.Errorf("copy rows = %+v", c)
+	}
+	if ch := changeEntries(t, db); len(ch) != 0 {
+		t.Errorf("changes = %+v", ch)
+	}
+}
+
+// Content the catalog knows only as an alias (an earlier version of an
+// asset changed in place) is never made an asset of its own.
+func TestEarlierVersionLeftOut(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "original", t0)
+	rescan(t, s)
+	put(t, photos, "Archive/T/a.JPG", "edited!!", t0.Add(time.Hour))
+	rescan(t, s)
+	put(t, photos, "Archive/T/c.JPG", "original", t0)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1})
+	want := []string{"Archive/T/c.JPG holds an earlier version of Archive/T/a.JPG, which was changed in place; it is not indexed"}
+	if !reflect.DeepEqual(r.Errors, want) {
+		t.Errorf("errors = %q; want %q", r.Errors, want)
+	}
+	noAsset(t, db, "original")
+	if a, err := db.AssetBySHA(t.Context(), sum("original")); err != nil || a.SHA256 != sum("edited!!") {
+		t.Errorf("AssetBySHA(original) = %+v, %v", a, err)
+	}
+}
+
+// A change in place hands the old content's fingerprint to the new asset;
+// a same-size edit must not let the old bytes pass for the new content.
+func TestMoveShortcutNeedsSameMtime(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "version-a", t0)
+	rescan(t, s)
+	put(t, photos, "Archive/T/a.JPG", "version-b", t0.Add(time.Hour))
+	if r := rescan(t, s); r.Changed != 1 {
+		t.Fatalf("change: %+v", r)
+	}
+	remove(t, photos, "Archive/T/a.JPG")
+	put(t, photos, "Archive/T/c.JPG", "version-a", t0)
+	n := countHashes(s)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Missing: 1})
+	if n.Load() != 1 {
+		t.Errorf("hash calls = %d; want 1", n.Load())
+	}
+	want := []string{"Archive/T/c.JPG holds an earlier version of Archive/T/a.JPG, which was changed in place; it is not indexed"}
+	if !reflect.DeepEqual(r.Errors, want) {
+		t.Errorf("errors = %q; want %q", r.Errors, want)
+	}
+	wantAsset(t, db, "version-b", catalog.StateMissing, "Archive/T/a.JPG")
+}
+
+func TestGoneFileMarkedMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "alpha", t0)
+	put(t, photos, "Archive/T/b.JPG", "bravo", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/T/b.JPG")
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Unchanged: 1, Missing: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "bravo", catalog.StateMissing, "Archive/T/b.JPG")
+	m, err := db.MissingFiles(t.Context(), 10)
+	if err != nil || len(m) != 1 || m[0].RelPath != "Archive/T/b.JPG" || m[0].Size != 5 {
+		t.Errorf("MissingFiles = %+v, %v", m, err)
+	}
+}
+
+func TestMissingReappears(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "alpha", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/T/a.JPG")
+	if r := rescan(t, s); r.Missing != 1 {
+		t.Fatalf("missing: %+v", r)
+	}
+
+	put(t, photos, "Archive/T/a.JPG", "alpha", t0)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Reappeared: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/T/a.JPG")
+
+	remove(t, photos, "Archive/T/a.JPG")
+	if r := rescan(t, s); r.Missing != 1 {
+		t.Fatalf("missing again: %+v", r)
+	}
+	put(t, photos, "Archive/U/moved.JPG", "alpha", t0)
+	n := countHashes(s)
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Reappeared: 1})
+	noErrors(t, r)
+	if n.Load() != 0 {
+		t.Errorf("hash calls = %d; want 0", n.Load())
+	}
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/U/moved.JPG")
+}
+
+func TestArchiveVanishesBeforeMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "alpha", t0)
+	put(t, photos, "Archive/T/b.JPG", "bravo", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/T/a.JPG")
+	remove(t, photos, "Archive/T/b.JPG")
+	var calls int
+	s.beforeMissing = func(string) {
+		calls++
+		if calls == 1 { // the share drops: on Windows that reads as "file not found"
+			if err := os.Rename(filepath.Join(photos, "Archive"), filepath.Join(photos, "Archive-away")); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	r := rescan(t, s)
+	const want = "Archive/ went missing during the scan, so it was stopped (is the photos share still mounted?)"
+	if r.Skipped != want {
+		t.Errorf("Skipped = %q; want %q", r.Skipped, want)
+	}
+	if calls != 1 {
+		t.Errorf("beforeMissing calls = %d; want 1", calls)
+	}
+	wantCounts(t, r, ScanResult{})
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/T/a.JPG")
+	wantAsset(t, db, "bravo", catalog.StateArchived, "Archive/T/b.JPG")
+}
+
+func TestFileBackBeforeMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/T/a.JPG", "alpha", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/T/a.JPG")
+	s.beforeMissing = func(rel string) { put(t, photos, rel, "alpha", t0) }
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{})
+	noErrors(t, r)
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/T/a.JPG")
+}
+
+func TestStoppedPassMarksNothingMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	archivedRow(t, db, "Archive/T/gone.JPG", "gone")
+	put(t, photos, "Archive/T/a.JPG", "alpha", t0)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	s.beforeRead = func(context.Context, string) { cancel() }
+	r, err := s.Rescan(ctx, TriggerManual, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Stopped || r.Missing != 0 {
+		t.Errorf("result = %+v; want Stopped and nothing missing", r)
+	}
+	wantAsset(t, db, "gone", catalog.StateArchived, "Archive/T/gone.JPG")
+}
+
+func TestSkippedRowsNeverMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	if err := os.MkdirAll(filepath.Join(photos, "Archive", "S"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]string{"Archive/S/Output/x.JPG": "x", "Archive/S/Capture/CaptureOne/y.JPG": "y", "Archive/S/@eaDir/z.JPG": "z"}
+	for rel, c := range kept {
+		archivedRow(t, db, rel, c)
+	}
+	archivedRow(t, db, "Archive/S/gone.JPG", "gone")
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Missing: 1})
+	noErrors(t, r)
+	for rel, c := range kept {
+		wantAsset(t, db, c, catalog.StateArchived, rel)
+	}
+	wantAsset(t, db, "gone", catalog.StateMissing, "Archive/S/gone.JPG")
+}
+
+func TestNewSkipRuleKeepsIndexedRows(t *testing.T) {
+	s, db, photos := setup(t)
+	ctx := t.Context()
+	const S = "Archive/S/"
+	put(t, photos, S+"Edits/a.JPG", "a-edit", t0)
+	put(t, photos, S+"x.JPG", "x", t0)
+	rescan(t, s)
+
+	put(t, photos, S+"Edits/b.JPG", "b-edit", t0)
+	var set bool
+	s.beforeRead = func(_ context.Context, rel string) {
+		if !set {
+			set = true
+			if err := db.SetSetting(ctx, catalog.KeyArchiveSkip, catalog.DefaultArchiveSkip+", Edits/"); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 3, Unchanged: 2, Added: 1})
+	if !set {
+		t.Fatal("the setting was never changed")
+	}
+	wantAsset(t, db, "b-edit", catalog.StateArchived, S+"Edits/b.JPG")
+
+	put(t, photos, S+"Edits/c.JPG", "c-edit", t0)
+	remove(t, photos, S+"Edits/a.JPG")
+	var reads []string
+	s.beforeRead = func(_ context.Context, rel string) { reads = append(reads, rel) }
+	n, fp := countHashes(s), countFingerprints(s)
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Unchanged: 1})
+	noErrors(t, r)
+	if len(reads) != 0 || n.Load() != 0 || fp.Load() != 0 {
+		t.Errorf("reads %v, %d hashes, %d fingerprints; want none", reads, n.Load(), fp.Load())
+	}
+	wantAsset(t, db, "a-edit", catalog.StateArchived, S+"Edits/a.JPG")
+	wantAsset(t, db, "b-edit", catalog.StateArchived, S+"Edits/b.JPG")
+	noAsset(t, db, "c-edit")
+
+	if err := db.SetSetting(ctx, catalog.KeyArchiveSkip, catalog.DefaultArchiveSkip); err != nil {
+		t.Fatal(err)
+	}
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 3, Unchanged: 2, Added: 1, Missing: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "c-edit", catalog.StateArchived, S+"Edits/c.JPG")
+	wantAsset(t, db, "a-edit", catalog.StateMissing, S+"Edits/a.JPG")
+	wantAsset(t, db, "b-edit", catalog.StateArchived, S+"Edits/b.JPG")
+}
+
+func TestUnreadableFolderNotMissing(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/A/a.JPG", "alpha", t0)
+	put(t, photos, "Archive/B/b.JPG", "bravo", t0)
+	put(t, photos, "Archive/B/c.JPG", "charlie", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/B/c.JPG")
+	realReadDir := s.readDir
+	s.readDir = func(p string) ([]os.DirEntry, error) {
+		if filepath.Base(p) == "A" {
+			return nil, &fs.PathError{Op: "open", Path: p, Err: fs.ErrPermission}
+		}
+		return realReadDir(p)
+	}
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Unchanged: 1, Missing: 1})
+	if len(r.Errors) != 1 {
+		t.Errorf("errors = %q; want one problem", r.Errors)
+	}
+	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/A/a.JPG")
+	wantAsset(t, db, "charlie", catalog.StateMissing, "Archive/B/c.JPG")
+}
+
+func TestPromoteHeldFolderSkipped(t *testing.T) {
+	s, db, photos := setup(t)
+	locks := newFakeLocks()
+	s.locks = locks
+	const S = "Archive/2025-05-30 - Trip/"
+	put(t, photos, S+"new.JPG", "new", t0)
+	archivedRow(t, db, S+"gone.JPG", "gone")
+	locks.hold("Archive/2025-05-30 - Trip")
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{BusyFolders: 1})
+	noErrors(t, r)
+	noAsset(t, db, "new")
+	wantAsset(t, db, "gone", catalog.StateArchived, S+"gone.JPG")
+
+	locks.release("Archive/2025-05-30 - Trip")
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Added: 1, Missing: 1})
+	noErrors(t, r)
+	wantAsset(t, db, "new", catalog.StateArchived, S+"new.JPG")
+	wantAsset(t, db, "gone", catalog.StateMissing, S+"gone.JPG")
+}
+
+func TestHalfPromotedFolder(t *testing.T) {
+	s, db, photos := setup(t)
+	ctx := t.Context()
+	locks := newFakeLocks()
+	s.locks = locks
+	f, err := db.CreateStagingFolder(ctx, "T", nil, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{"x.JPG": "xray", "y.JPG": "yankee"}
+	for name, c := range files {
+		p := put(t, photos, "Archive/T/"+name, c, t0) // the promote's rename is done, its catalog write is not
+		err := db.InsertAsset(ctx, catalog.Asset{SHA256: sum(c), Size: int64(len(c)), Kind: media.KindImage, State: catalog.StateStaged,
+			RelPath: "Staging/T/" + name, Mtime: mtimeOf(t, p), UpdatedAt: t0}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	locks.hold("Archive/T")
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{BusyFolders: 1})
+	noErrors(t, r)
+	for name, c := range files {
+		wantAsset(t, db, c, catalog.StateStaged, "Staging/T/"+name)
+	}
+
+	if _, err := db.ArchiveFolder(ctx, f.ID, "Staging/T/", "Archive/T/", t0); err != nil {
+		t.Fatal(err)
+	}
+	locks.release("Archive/T")
+	n, fp := countHashes(s), countFingerprints(s)
+	r = rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 2})
+	noErrors(t, r)
+	if n.Load() != 0 || fp.Load() != 0 {
+		t.Errorf("reads: %d hashes, %d fingerprints; want none", n.Load(), fp.Load())
+	}
+	for name, c := range files {
+		wantAsset(t, db, c, catalog.StateArchived, "Archive/T/"+name)
 	}
 }

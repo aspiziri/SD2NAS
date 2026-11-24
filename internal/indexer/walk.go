@@ -105,7 +105,7 @@ type file struct {
 	rel         string
 	size, mtime int64
 	kind        media.Kind
-	sha, fp     string                // known content (a copy whose size and time match) / after reading
+	sha, fp     string                // known content (a copy whose size and time match, or a move by fingerprint) / after reading
 	editedFrom  *catalog.ArchiveEntry // the archived content this path held (its size or time changed, or a re-index)
 }
 
