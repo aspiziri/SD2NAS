@@ -406,8 +406,8 @@ func TestMigrateV1ToV2(t *testing.T) {
 	}
 	defer d.Close()
 	ctx := t.Context()
-	if v, err := d.Version(ctx); err != nil || v != 2 {
-		t.Fatalf("version = %d, %v; want 2", v, err)
+	if v, err := d.Version(ctx); err != nil || v != SchemaVersion {
+		t.Fatalf("version = %d, %v; want %d", v, err, SchemaVersion)
 	}
 	f, err := d.StagingFolderForDate(ctx, "2025-05-30", t0)
 	if err != nil || f.ID != 7 {
@@ -427,6 +427,111 @@ func TestMigrateV1ToV2(t *testing.T) {
 		if err != nil || n != 1 {
 			t.Errorf("index %s on %s: count %d, %v; want 1", want[1], want[0], n, err)
 		}
+	}
+}
+
+func TestMigrateV2ToV3(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sd2nas.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{schemaV1, schemaV2, "PRAGMA user_version = 2",
+		`INSERT INTO ingests (id, card_path, started_at, status) VALUES (1, '/cards/X', '2026-01-01T12:00:00.000Z', 'done')`,
+		`INSERT INTO ingest_files (ingest_id, card_path, size, outcome) VALUES (1, 'DCIM/c.JPG', 3, 'new')`,
+		`INSERT INTO ingest_files (ingest_id, card_path, size, outcome) VALUES (1, 'DCIM/a.JPG', 1, 'in_archive')`,
+		`INSERT INTO ingest_files (ingest_id, card_path, size, outcome, error) VALUES (1, 'DCIM/b.JPG', 2, 'seen_before', 'x')`,
+		`INSERT INTO assets (sha256, size, kind, state, rel_path, first_ingest, updated_at)
+			VALUES (X'` + hexN(1) + `', 1, 'image', 'archived', 'Archive/a.JPG', 1, '2026-02-02T10:00:00.000Z')`,
+		`INSERT INTO assets (sha256, size, kind, state, rel_path, updated_at)
+			VALUES (X'` + hexN(2) + `', 1, 'image', 'archived', 'Archive/b.JPG', '2026-02-03T10:00:00.000Z')`} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := t.Context()
+	if v, err := d.Version(ctx); err != nil || v != 3 {
+		t.Fatalf("version = %d, %v; want 3", v, err)
+	}
+	files, err := d.IngestFiles(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []IngestFile{
+		{CardPath: "DCIM/c.JPG", Size: 3, Outcome: OutcomeNew},
+		{CardPath: "DCIM/a.JPG", Size: 1, Outcome: OutcomeInArchive},
+		{CardPath: "DCIM/b.JPG", Size: 2, Outcome: OutcomeSeenBefore, Error: "x"},
+	}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("files = %+v, want %+v", files, want)
+	}
+	err = d.AddIngestFiles(ctx, 1, []IngestFile{{CardPath: "DCIM/m.JPG", Size: 4, Outcome: OutcomeMissing}})
+	if err != nil {
+		t.Fatalf("add missing file: %v", err)
+	}
+	if in := mustIngest(t, d, 1); in.Counts.Missing != 0 {
+		t.Errorf("migrated ingest missing = %d, want 0", in.Counts.Missing)
+	}
+	for _, name := range []string{"ingest_files_ingest", "ingest_files_sha256"} {
+		var n int
+		err := d.db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_index_list('ingest_files') WHERE name = ?", name).Scan(&n)
+		if err != nil || n != 1 {
+			t.Errorf("index %s: count %d, %v; want 1", name, n, err)
+		}
+	}
+	for n, wantPromoted := range map[byte]sql.NullString{
+		1: {String: "2026-02-02T10:00:00.000Z", Valid: true},
+		2: {},
+	} {
+		var promoted, checked sql.NullString
+		err := d.db.QueryRowContext(ctx, "SELECT promoted_at, checked_at FROM assets WHERE sha256 = ?", mustBlob(t, hexN(n))).Scan(&promoted, &checked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if promoted != wantPromoted || checked.Valid {
+			t.Errorf("asset %d: promoted_at %v checked_at %v; want promoted_at %v, checked_at NULL", n, promoted, checked, wantPromoted)
+		}
+	}
+}
+
+func mustBlob(t *testing.T, hexs string) []byte {
+	t.Helper()
+	b, err := hexToBlob(hexs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestCountsAddMissing(t *testing.T) {
+	var c Counts
+	c.Add(OutcomeMissing)
+	if want := (Counts{Seen: 1, Missing: 1}); c != want {
+		t.Errorf("counts = %+v, want %+v", c, want)
+	}
+}
+
+func TestFinishIngestStoresMissing(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	in := newIngest(t, d)
+	if err := d.StartIngest(ctx, in.ID, t1); err != nil {
+		t.Fatal(err)
+	}
+	counts := Counts{Seen: 2, Missing: 2}
+	if err := d.FinishIngest(ctx, Ingest{ID: in.ID, Status: StatusDone, FinishedAt: t2, Counts: counts}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustIngest(t, d, in.ID); got.Counts != counts {
+		t.Errorf("counts = %+v, want %+v", got.Counts, counts)
 	}
 }
 

@@ -245,7 +245,7 @@ func (d *DB) changeAsset(ctx context.Context, verb, sha string, states []AssetSt
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", verb, sha, err)
 	}
-	return fmt.Errorf("%s %s: the asset is %s", verb, sha, state)
+	return &WrongStateError{Verb: verb, SHA256: sha, State: AssetState(state)}
 }
 
 var onlyStaged = []AssetState{StateStaged}

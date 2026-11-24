@@ -2,7 +2,7 @@ package catalog
 
 // migrations[i] upgrades a database from user_version i to i+1. Append only;
 // never edit a migration that has shipped.
-var migrations = []string{schemaV1, schemaV2}
+var migrations = []string{schemaV1, schemaV2, schemaV3}
 
 const schemaV1 = `
 CREATE TABLE ingests (
@@ -107,4 +107,72 @@ CREATE TABLE staging_folders_new (
 INSERT INTO staging_folders_new (id, name, dates, created_at) SELECT id, name, dates, created_at FROM staging_folders;
 DROP TABLE staging_folders;
 ALTER TABLE staging_folders_new RENAME TO staging_folders;
+`
+
+// schemaV3 (M5): the archive indexer. Imports record files whose archive
+// copy is missing; the indexer keeps duplicate paths, in-place changes,
+// when it last read each file, and its scan history; promotes record when
+// they happened.
+const schemaV3 = `
+ALTER TABLE ingests ADD COLUMN missing INTEGER NOT NULL DEFAULT 0;  -- files whose archive copy is missing (block safe_to_format)
+
+-- SQLite can't change a CHECK constraint: rebuild ingest_files with the
+-- 'missing' outcome, keeping rowids (IngestFiles orders by rowid).
+CREATE TABLE ingest_files_new (
+  ingest_id  INTEGER NOT NULL REFERENCES ingests(id),
+  card_path  TEXT NOT NULL,
+  size       INTEGER NOT NULL,
+  quick_fp   BLOB,
+  sha256     BLOB,
+  outcome    TEXT NOT NULL CHECK (outcome IN ('new','in_archive','in_staging','seen_before','failed','unsupported','missing')),
+  error      TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO ingest_files_new (rowid, ingest_id, card_path, size, quick_fp, sha256, outcome, error)
+  SELECT rowid, ingest_id, card_path, size, quick_fp, sha256, outcome, error FROM ingest_files;
+DROP TABLE ingest_files;
+ALTER TABLE ingest_files_new RENAME TO ingest_files;
+CREATE INDEX ingest_files_ingest ON ingest_files(ingest_id);
+CREATE INDEX ingest_files_sha256 ON ingest_files(sha256);
+
+ALTER TABLE assets ADD COLUMN checked_at TEXT;   -- the indexer last read the file at rel_path then; NULL = never
+ALTER TABLE assets ADD COLUMN promoted_at TEXT;  -- set by promote; "Recently promoted" orders by it
+UPDATE assets SET promoted_at = updated_at WHERE state = 'archived' AND first_ingest IS NOT NULL;
+
+-- Other archive paths holding the content of an archived asset (an asset
+-- has one rel_path). No foreign key: a copy can outlive its asset (Forget
+-- deletes staged and culled ones); the indexer resolves such a copy again.
+CREATE TABLE archive_copies (
+  rel_path   TEXT PRIMARY KEY,
+  sha256     BLOB NOT NULL CHECK (length(sha256) = 32),
+  size       INTEGER NOT NULL,
+  mtime      INTEGER NOT NULL,
+  checked_at TEXT NOT NULL
+);
+CREATE INDEX archive_copies_sha256 ON archive_copies(sha256);
+
+-- "Changed since indexed": archive files whose content changed in place,
+-- until accepted. One row per path; a re-change gets a new id.
+CREATE TABLE archive_changes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  rel_path   TEXT NOT NULL UNIQUE,
+  old_sha256 BLOB NOT NULL CHECK (length(old_sha256) = 32),
+  sha256     BLOB NOT NULL CHECK (length(sha256) = 32),
+  old_size   INTEGER NOT NULL,
+  size       INTEGER NOT NULL,
+  indexed_at TEXT NOT NULL,                 -- when the old content was last indexed
+  changed_at TEXT NOT NULL
+);
+
+-- Indexer passes and nightly backups; result is JSON owned by internal/indexer.
+-- A pass with NULL finished_at is running (or the process died).
+CREATE TABLE archive_scans (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          TEXT NOT NULL CHECK (kind IN ('manual','nightly','backup')),
+  reread        INTEGER NOT NULL DEFAULT 0,   -- a full re-index: files not checked since reread_before are re-read
+  reread_before TEXT,
+  started_at    TEXT NOT NULL,
+  finished_at   TEXT,
+  complete      INTEGER NOT NULL DEFAULT 0,   -- ran to the end; an incomplete re-index is continued by the next pass
+  result        TEXT NOT NULL DEFAULT ''
+);
 `

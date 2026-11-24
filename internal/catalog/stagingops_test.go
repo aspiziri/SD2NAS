@@ -263,3 +263,26 @@ func TestArchiveFolder(t *testing.T) {
 		t.Errorf("row still there: %v", err)
 	}
 }
+
+func TestChangeAssetWrongState(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	sha := stagedAt(t, d, 1, "Staging/2025-05-30/a.JPG")
+	if err := d.ArchiveAsset(ctx, sha, "Archive/2025/a.JPG", t0); err != nil {
+		t.Fatal(err)
+	}
+	err := d.CullAsset(ctx, sha, t0)
+	if !errors.Is(err, ErrWrongState) {
+		t.Fatalf("err = %v, want ErrWrongState", err)
+	}
+	var ws *WrongStateError
+	if !errors.As(err, &ws) || ws.State != StateArchived {
+		t.Fatalf("errors.As = %v, %+v; want state archived", errors.As(err, &ws), ws)
+	}
+	if want := "cull " + sha + ": the asset is archived"; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	if err := d.CullAsset(ctx, hexN(9), t0); !errors.Is(err, ErrNotFound) || errors.Is(err, ErrWrongState) {
+		t.Errorf("unknown hash: err = %v, want ErrNotFound only", err)
+	}
+}
