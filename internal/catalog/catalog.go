@@ -112,16 +112,22 @@ func (d *DB) Version(ctx context.Context) (int, error) {
 }
 
 // tx runs fn in a transaction: commit if fn succeeds, else roll back and
-// return fn's error joined with any rollback failure.
-func (d *DB) tx(ctx context.Context, fn func(*sql.Tx) error) error {
+// return fn's error joined with any rollback failure. The rollback is
+// deferred before fn runs, so a panic in fn (or in Commit) still rolls
+// back and gives the single connection back before the panic goes on
+// (§16 M6). After a successful Commit the deferred Rollback is
+// sql.ErrTxDone, which is ignored.
+func (d *DB) tx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if err := fn(tx); err != nil {
+	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			return errors.Join(err, rbErr)
+			err = errors.Join(err, rbErr)
 		}
+	}()
+	if err := fn(tx); err != nil {
 		return err
 	}
 	return tx.Commit()
