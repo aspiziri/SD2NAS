@@ -16,11 +16,13 @@ import (
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/api"
+	"github.com/aspiziri/SD2NAS/internal/cardwatch"
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/config"
 	"github.com/aspiziri/SD2NAS/internal/indexer"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
 	"github.com/aspiziri/SD2NAS/internal/lockfile"
+	"github.com/aspiziri/SD2NAS/internal/notices"
 	"github.com/aspiziri/SD2NAS/internal/staging"
 	"github.com/aspiziri/SD2NAS/internal/thumbs"
 	"github.com/aspiziri/SD2NAS/web"
@@ -119,7 +121,7 @@ func run(log *slog.Logger) error {
 		lockProblem = lockErr
 	}
 	log.Info("starting sd2nas", "version", version, "addr", cfg.Addr,
-		"cards", cfg.Cards, "photos", cfg.Photos, "config", cfg.Data,
+		"cards", cfg.Cards, "photos", cfg.Photos, "config", cfg.Data, "poll_cards", cfg.PollCards,
 		"tz", os.Getenv("TZ"), "uid", os.Getuid(), "gid", os.Getgid())
 
 	srv := api.New(version, []api.Mount{
@@ -145,6 +147,7 @@ func run(log *slog.Logger) error {
 	defer stop()
 
 	var mgr *ingest.Manager
+	var watcher *cardwatch.Watcher
 	var db *catalog.DB
 	err = lockProblem
 	if err == nil {
@@ -159,6 +162,9 @@ func run(log *slog.Logger) error {
 			// script's request fails and the card stays mounted.
 			log.Error("catalog unavailable; ingest is disabled", "err", err)
 			srv.AddProblem("catalog: " + err.Error())
+		}
+		if cfg.PollCards {
+			log.Warn("card poller off: ingest is disabled")
 		}
 	} else {
 		defer func() {
@@ -201,6 +207,23 @@ func run(log *slog.Logger) error {
 			srv.MountSettings(db, idx, cfg.Photos)
 			idx.Start() // nightly backup and rescan; nothing runs at startup (Decision 14)
 		}
+		ncfg := notices.Config{DB: db, Staging: svc.List, Log: log,
+			StagingReady: func() bool { st := svc.Status(); return !st.Rescanning && st.LastRescan != nil }} // PF21
+		if idxErr == nil {
+			ncfg.Archive = idx.Status
+		}
+		if notes, err := notices.New(ncfg); err != nil {
+			log.Error("notices unavailable", "err", err)
+			srv.AddProblem("notices: " + err.Error())
+		} else {
+			srv.MountNotifications(notes) // srv.Close closes notes
+			notes.Start()                 // reads the indexer and staging status from its own goroutine (lock-order rules)
+		}
+		if cfg.PollCards {
+			watcher = cardwatch.New(cardwatch.Config{Root: cfg.Cards, Submit: srv.SubmitIngest, Log: log})
+			watcher.Start()
+			log.Info("card poller on: cards mounted under the cards folder after startup are imported", "cards", cfg.Cards)
+		}
 		svc.StartRescan() // §8: fix drift from SMB edits made while SD2NAS was down
 		if cacheErr != nil {
 			log.Error("thumbnail cache unavailable", "err", cacheErr)
@@ -225,6 +248,9 @@ func run(log *slog.Logger) error {
 
 	select {
 	case err := <-errc:
+		if watcher != nil {
+			watcher.Close()
+		}
 		if mgr != nil {
 			// The server never ran, so no handler waits on a job.
 			closeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -241,6 +267,9 @@ func run(log *slog.Logger) error {
 	// the HTTP server waits for them. It is nil when the catalog failed to open.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+	if watcher != nil {
+		watcher.Close() // before the manager, so it cannot submit into a closing one
+	}
 	var mgrErr error
 	if mgr != nil {
 		mgrErr = wrap("stopping ingest", mgr.Close(shutdownCtx))
