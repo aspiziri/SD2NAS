@@ -76,10 +76,10 @@ func TestStagingAPIErrors(t *testing.T) {
 		code int
 		in   string
 	}{
-		{"/api/staging/999/files", http.StatusNotFound, "999"},
-		{"/api/staging/abc/files", http.StatusBadRequest, "id"},
-		{"/api/staging/0/files", http.StatusBadRequest, "id"},
-		{"/api/staging/" + strconv.FormatInt(folders[0].ID, 10) + "/files?kind=bogus", http.StatusBadRequest, "kind"},
+		{"/api/staging/999/files", http.StatusNotFound, "That folder no longer exists."},
+		{"/api/staging/abc/files", http.StatusBadRequest, "The folder id must be a positive whole number."},
+		{"/api/staging/0/files", http.StatusBadRequest, "The folder id must be a positive whole number."},
+		{"/api/staging/" + strconv.FormatInt(folders[0].ID, 10) + "/files?kind=bogus", http.StatusBadRequest, "The kind must be jpg, raw or video."},
 	} {
 		rec := getFull(t, f, c.url)
 		var e struct {

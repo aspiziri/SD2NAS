@@ -342,6 +342,28 @@ func TestStagingMoveAndCullAPI(t *testing.T) {
 	wantCode(t, send(t, f.s, http.MethodPost, "/api/staging/cull", huge), http.StatusBadRequest, "")
 }
 
+// Every handler-level 400 is a plain sentence: capitalised, ending with a full stop.
+func TestStagingBadRequestSentences(t *testing.T) {
+	f := newFullServer(t)
+	for _, c := range []struct{ method, url, body, want string }{
+		{http.MethodPatch, "/api/staging/abc", `{"title":"x"}`, "The folder id must be a positive whole number."},
+		{http.MethodPatch, "/api/staging/1", `{`, "The request body is not valid JSON."},
+		{http.MethodPatch, "/api/staging/1", `{"title":"x","extra":1}`, "The request has a field this server does not know."},
+		{http.MethodPatch, "/api/staging/1", `{}`, "Give a title (an empty one removes it)."},
+		{http.MethodPost, "/api/staging/cull", `{"fileShas":["` + strings.Repeat("a", 5<<20) + `"]}`, "The request is too large."},
+		{http.MethodPost, "/api/staging/move", `{"fileShas":[]}`, "Give exactly one of toId and newTitle."},
+		{http.MethodPost, "/api/staging/move", `{"fileShas":[],"toId":0}`, "The destination folder id must be a positive whole number."},
+		{http.MethodPost, "/api/staging/move", `{"fileShas":[],"newTitle":" "}`, "Give the new folder a title."},
+		{http.MethodPost, "/api/staging/promote", `[]`, "The request body is not valid JSON."},
+		{http.MethodPost, "/api/ingest/1/forget", `{"deleteFiles":true}x`, "The request body must hold exactly one JSON value."},
+	} {
+		e := wantCode(t, send(t, f.s, c.method, c.url, c.body), http.StatusBadRequest, "")
+		if e.Error != c.want {
+			t.Errorf("%s %s %.30q: error %q, want %q", c.method, c.url, c.body, e.Error, c.want)
+		}
+	}
+}
+
 func TestStagingDiscardAPI(t *testing.T) {
 	f := newFullServer(t)
 	a := ingested(t, f)

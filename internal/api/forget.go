@@ -59,7 +59,7 @@ func (h *forgetHandlers) forget(w http.ResponseWriter, r *http.Request) {
 		DeleteFiles *bool `json:"deleteFiles"`
 	}
 	if err := decodeBody(w, r, &body, smallBody); err != nil {
-		writeError(w, http.StatusBadRequest, "The request body is not valid JSON.")
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if body.DeleteFiles == nil {

@@ -137,15 +137,23 @@ func writeOpError(w http.ResponseWriter, log *slog.Logger, subject, what string,
 }
 
 // decodeBody reads a JSON body of at most limit bytes into v, refusing
-// unknown fields and trailing data.
+// unknown fields and trailing data. Its error is a plain sentence for the
+// 400 answer (no Go error text).
 func decodeBody(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		return fmt.Errorf("bad request body: %w", err)
+		var tooBig *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooBig):
+			return errors.New("The request is too large.")
+		case strings.HasPrefix(err.Error(), "json: unknown field"):
+			return errors.New("The request has a field this server does not know.")
+		}
+		return errors.New("The request body is not valid JSON.")
 	}
 	if dec.More() {
-		return errors.New("bad request body: more than one JSON value")
+		return errors.New("The request body must hold exactly one JSON value.")
 	}
 	return nil
 }
@@ -157,7 +165,7 @@ func opContext(r *http.Request) context.Context { return context.WithoutCancel(r
 func (h *stagingHandlers) pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	id, err := positiveInt(r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "id: "+err.Error())
+		writeError(w, http.StatusBadRequest, "The folder id must be a positive whole number.")
 		return 0, false
 	}
 	return id, true
@@ -176,7 +184,7 @@ func (h *stagingHandlers) rename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Title == nil {
-		writeError(w, http.StatusBadRequest, "title is required (\"\" removes the title)")
+		writeError(w, http.StatusBadRequest, "Give a title (an empty one removes it).")
 		return
 	}
 	f, err := h.svc.Rename(opContext(r), id, *body.Title)
@@ -228,20 +236,20 @@ func (h *stagingHandlers) move(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if (body.ToID == nil) == (body.NewTitle == nil) {
-		writeError(w, http.StatusBadRequest, "give exactly one of toId and newTitle")
+		writeError(w, http.StatusBadRequest, "Give exactly one of toId and newTitle.")
 		return
 	}
 	req := staging.MoveRequest{SHAs: body.FileShas}
 	if body.ToID != nil {
 		if *body.ToID <= 0 {
-			writeError(w, http.StatusBadRequest, "toId must be a positive integer")
+			writeError(w, http.StatusBadRequest, "The destination folder id must be a positive whole number.")
 			return
 		}
 		req.ToID = *body.ToID
 	} else {
 		req.NewTitle = *body.NewTitle
 		if strings.TrimSpace(req.NewTitle) == "" {
-			writeError(w, http.StatusBadRequest, "a new folder needs a title")
+			writeError(w, http.StatusBadRequest, "Give the new folder a title.")
 			return
 		}
 	}
@@ -275,7 +283,7 @@ func (h *stagingHandlers) promote(w http.ResponseWriter, r *http.Request) {
 		Pattern string  `json:"pattern"`
 	}
 	if err := decodeBody(w, r, &body, smallBody); err != nil {
-		writeError(w, http.StatusBadRequest, "The request body is not valid JSON.")
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	job, err := h.svc.Promote(opContext(r), body.IDs, body.Pattern)
@@ -321,15 +329,15 @@ func (h *stagingHandlers) list(w http.ResponseWriter, r *http.Request) {
 func (h *stagingHandlers) files(w http.ResponseWriter, r *http.Request) {
 	id, err := positiveInt(r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "id: "+err.Error())
+		writeError(w, http.StatusBadRequest, "The folder id must be a positive whole number.")
 		return
 	}
 	ff, err := h.svc.Files(r.Context(), id, r.URL.Query().Get("kind"))
 	switch {
 	case errors.Is(err, staging.ErrBadKind):
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, "The kind must be jpg, raw or video.")
 	case errors.Is(err, catalog.ErrNotFound):
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no staging folder %d", id))
+		writeError(w, http.StatusNotFound, "That folder no longer exists.")
 	case err != nil:
 		h.log.Error("list staging files", "id", id, "err", err)
 		writeError(w, http.StatusInternalServerError, err.Error())

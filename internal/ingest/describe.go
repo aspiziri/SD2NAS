@@ -87,6 +87,11 @@ func describeBody(in catalog.Ingest) (level, body string) {
 
 func describeDone(in catalog.Ingest) (level, body string) {
 	c := in.Counts
+	if !in.ForgottenAt.IsZero() {
+		// Forgetting drops the files from the catalog, so "safe to format" would be false.
+		return LevelWarning, "forgotten on " + in.ForgottenAt.Format("2006-01-02") +
+			": the files it brought in are no longer tracked, so inserting the card imports them again. Do not format the card."
+	}
 	if c.Seen == 0 && c.Unsupported == 0 {
 		return LevelWarning, "no photos or videos found. Do not format the card."
 	}
