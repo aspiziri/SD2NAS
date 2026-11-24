@@ -93,15 +93,17 @@ func (r *ScanResult) finalError(msg string) {
 	r.Errors = append(r.Errors, msg)
 }
 
-// Status is the indexer.progress event data (Decision 19). Task 11 adds
-// LastBackup, BackingUp and NextScan.
+// Status is the indexer.progress event data (Decision 19).
 type Status struct {
-	Version     uint64      `json:"version"`      // bumps after each pass, backup, accept and settings change
-	Running     *Progress   `json:"running"`      // nil when no pass runs
-	Last        *ScanResult `json:"last"`         // the last finished pass; nil before the first
-	PendingFull bool        `json:"pending_full"` // a re-index didn't finish; the next pass continues it
-	Changed     int         `json:"changed"`      // "changed since indexed" entries
-	Missing     int         `json:"missing"`      // missing assets
+	Version     uint64        `json:"version"`      // bumps after each pass, backup, accept and settings change
+	Running     *Progress     `json:"running"`      // nil when no pass runs
+	Last        *ScanResult   `json:"last"`         // the last finished pass; nil before the first
+	PendingFull bool          `json:"pending_full"` // a re-index didn't finish; the next pass continues it
+	Changed     int           `json:"changed"`      // "changed since indexed" entries
+	Missing     int           `json:"missing"`      // missing assets
+	LastBackup  *BackupResult `json:"last_backup"`  // the last nightly catalog backup; nil before the first
+	BackingUp   bool          `json:"backing_up"`
+	NextScan    time.Time     `json:"next_scan,omitzero"` // the next nightly backup and pass
 }
 
 // Progress is a running pass.
@@ -158,6 +160,10 @@ type Service struct {
 	lastPub    time.Time // real clock
 	userPaused bool      // the owner paused the running pass; reset when a pass ends
 
+	started    bool // Start has run
+	after      func(time.Duration) <-chan time.Time
+	reschedule chan struct{} // SettingsChanged wakes the nightly loop (buffer 1)
+
 	wake      chan struct{} // Resume wakes a waiting pass (buffer 1)
 	idleEvery time.Duration // how often a waiting pass looks at busy again
 }
@@ -176,6 +182,8 @@ func New(cfg Config) (*Service, error) {
 		readDir:     os.ReadDir,
 		fingerprint: media.QuickFingerprint,
 		wake:        make(chan struct{}, 1),
+		after:       time.After,
+		reschedule:  make(chan struct{}, 1),
 		idleEvery:   2 * time.Second,
 	}
 	if s.now == nil {
@@ -228,10 +236,34 @@ func (s *Service) loadState(ctx context.Context) error {
 			s.status.Last = &r
 		}
 	}
+	if err := s.loadLastBackup(ctx); err != nil {
+		return err
+	}
 	if err := s.refreshPendingFull(ctx); err != nil {
 		return err
 	}
 	return s.refreshCounts(ctx)
+}
+
+// loadLastBackup loads the last recorded backup into the status.
+func (s *Service) loadLastBackup(ctx context.Context) error {
+	b, err := s.db.LastArchiveBackup(ctx)
+	switch {
+	case errors.Is(err, catalog.ErrNotFound):
+		return nil
+	case err != nil:
+		return err
+	}
+	var r BackupResult
+	if err := json.Unmarshal([]byte(b.Result), &r); err != nil {
+		s.log.Error("last catalog backup is unreadable", "scan", b.ID, "err", err)
+		return nil
+	}
+	if r.Removed == nil {
+		r.Removed = []string{}
+	}
+	s.status.LastBackup = &r
+	return nil
 }
 
 // refreshPendingFull reloads PendingFull. Call it without s.mu.
@@ -274,6 +306,10 @@ func (s *Service) statusLocked() Status {
 	if st.Last != nil {
 		l := *st.Last
 		st.Last = &l
+	}
+	if st.LastBackup != nil {
+		b := *st.LastBackup
+		st.LastBackup = &b
 	}
 	return st
 }
@@ -355,6 +391,9 @@ func (s *Service) Rescan(ctx context.Context, trigger string, full bool) (ScanRe
 
 	s.pass.Lock()
 	defer s.pass.Unlock()
+	if s.bgCtx.Err() != nil { // Close ran while this waited: record nothing
+		return ScanResult{}, ErrClosed
+	}
 	return s.runPass(ctx, trigger, full)
 }
 

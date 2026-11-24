@@ -71,10 +71,7 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	if st.SkipRules == nil {
 		st.SkipRules = []string{}
 	}
-	st.BackupDir = set.BackupDir
-	if st.BackupDir == "" {
-		st.BackupDir = filepath.Join(s.photosRoot, "Management", "SD2NAS")
-	}
+	st.BackupDir = s.BackupDir(set)
 	st.ArchivePath = filepath.Join(s.photosRoot, ArchiveDir)
 	_, statErr := os.Stat(st.ArchivePath)
 	st.ArchivePresent = statErr == nil
