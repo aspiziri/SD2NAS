@@ -2,21 +2,39 @@
   import { onMount, untrack } from 'svelte';
   import { api } from '../lib/api.js';
   import { live } from '../lib/live.svelte.js';
+  import { navigate } from '../lib/router.svelte.js';
   import { isId } from '../lib/paths.js';
-  import { formatBytes, formatCount, dateRange, kindChips, extLabel } from '../lib/format.js';
+  import { formatBytes, dateRange, kindChips, extLabel } from '../lib/format.js';
+  import { clickAction, toggleKey, selectRange, dragSelection, prune } from '../lib/selection.js';
+  import { folderDate, folderName, checkTitle } from '../lib/naming.js';
+  import { describeError, plural } from '../lib/messages.js';
+  import { longPressSelect } from '../lib/press.js';
+  import { toast } from '../lib/toast.svelte.js';
   import Thumb from '../components/Thumb.svelte';
   import Lightbox from '../components/Lightbox.svelte';
+  import Dialog from '../components/Dialog.svelte';
+  import SelectionBar from '../components/SelectionBar.svelte';
 
   let { id } = $props();
   let kind = $state(''); // the chip asked for; '' = all
   let data = $state(null);
   let shownKind = $state(''); // the kind `data` was loaded for
   let error = $state('');
+  let gone = $state(false); // the folder no longer exists (merged, promoted, discarded)
   let open = $state(-1); // index into data.files shown full screen; -1 = none
-  let ctl = null; // the load in flight; a newer one aborts it
+  let ctl = null;
 
-  // Switching chips quickly must not let an older, slower answer land last.
-  // A failed load keeps the last good data on screen (error shows above it).
+  let selected = $state(new Set()); // file hashes
+  let anchor = null;
+  let drag = null; // { base, anchor, adding } while a finger drag-selects
+
+  let dialog = $state(''); // '' | 'move' | 'cull'
+  let busy = $state(false);
+  let dialogError = $state('');
+  let others = $state(null); // the other staging folders, for "Move to…"
+  let dest = $state('new'); // 'new' or a folder id as a string
+  let title = $state('');
+
   async function load(k) {
     if (!isId(id)) {
       error = 'There is no such staging folder.';
@@ -27,11 +45,11 @@
     try {
       const res = await api(`/api/staging/${id}/files` + (k ? `?kind=${k}` : ''), { signal: mine.signal });
       if (mine.signal.aborted) return;
-      // Keep the preview on the same file if the list changed under it.
       const sha = open >= 0 ? data?.files[open]?.sha256 : null;
       data = res;
       shownKind = k;
       error = '';
+      selected = prune(selected, res.files.map((f) => f.sha256));
       if (open >= 0) {
         const j = res.files.findIndex((x) => x.sha256 === sha);
         if (j >= 0) open = j;
@@ -39,12 +57,16 @@
       }
     } catch (err) {
       if (err.name === 'AbortError' || mine.signal.aborted) return;
+      if (err.status === 404) {
+        gone = true;
+        data = null;
+      }
       error = err.message;
     }
   }
 
-  // Load on mount, when the chip changes, when an import finishes, and when
-  // the live stream comes back after a real drop (not on the first connect).
+  // M3's triggers, plus staging.changed with a version other than the one
+  // on screen (another tab or device changed this folder).
   let started = false;
   let lastKind = '';
   let wasConnected = false;
@@ -54,6 +76,7 @@
     const k = kind;
     const connected = live.connected;
     const finishedCount = live.finishedCount;
+    const version = live.staging.version;
     untrack(() => {
       const reconnected = connected && !wasConnected && wasConnectedEver;
       if (connected) wasConnectedEver = true;
@@ -62,7 +85,8 @@
       finishedSeen = finishedCount;
       const changed = k !== lastKind;
       lastKind = k;
-      if (!started || changed || reconnected || finished) {
+      const stale = data !== null && version !== data.version;
+      if (!gone && (!started || changed || reconnected || finished || stale)) {
         started = true;
         load(k);
       }
@@ -70,77 +94,262 @@
   });
   $effect(() => () => ctl?.abort());
 
-  // After a reload with the preview open, this page sits on the preview's
-  // history entry with nothing shown, so the first Back would seem to do
-  // nothing. Step back to the folder's own entry (same URL; popstate below
-  // keeps the preview closed), so the first Back leaves the folder.
   onMount(() => {
     if (history.state?.lightbox) history.back();
   });
 
-  // The preview takes a history entry, so the phone's back gesture closes
-  // it instead of leaving the folder.
   function show(i) {
-    if (open >= 0) return; // already open: never push a second history entry
+    if (open >= 0) return;
     open = i;
     history.pushState({ lightbox: true }, '');
   }
   function hide() {
-    if (history.state?.lightbox) history.back(); // popstate below closes it
+    if (history.state?.lightbox) history.back();
     else open = -1;
   }
   function onpopstate() {
     if (!history.state?.lightbox) open = -1;
   }
+
+  const files = $derived(data?.files ?? []);
+  const order = $derived(files.map((f) => f.sha256));
+  const selecting = $derived(selected.size > 0);
+
+  function toggle(key) {
+    selected = toggleKey(selected, key);
+    anchor = key;
+  }
+  function clear() {
+    selected = new Set();
+    anchor = null;
+  }
+  function selectAll() {
+    selected = new Set(order);
+  }
+
+  function onTileClick(e, i) {
+    const key = files[i].sha256;
+    const act = clickAction({ selecting, shift: e.shiftKey, toggle: e.ctrlKey || e.metaKey });
+    if (act === 'open') return show(i);
+    selected = act === 'range' ? selectRange(selected, order, anchor, key) : toggleKey(selected, key);
+    anchor = key;
+  }
+
+  // Touch: long-press selects (or unselects) a tile; keep the finger down
+  // and drag to do the same to every tile between it and the finger.
+  const press = {
+    onlong(key) {
+      const adding = !selected.has(key);
+      drag = { base: new Set(selected), anchor: key, adding };
+      selected = dragSelection(drag.base, order, key, key, adding);
+    },
+    ondrag(key) {
+      if (drag) selected = dragSelection(drag.base, order, drag.anchor, key, drag.adding);
+    },
+    ondragend() {
+      if (drag) anchor = drag.anchor;
+      drag = null;
+    },
+  };
+
+  function onkeydown(e) {
+    if (dialog || open >= 0 || e.target.closest?.('input, textarea, select')) return;
+    if (e.key === 'Escape' && selecting) clear();
+    else if ((e.ctrlKey || e.metaKey) && e.key === 'a' && files.length) {
+      e.preventDefault();
+      selectAll();
+    }
+  }
+
+  // run sends one action. fn returns true when it navigated away.
+  async function run(fn) {
+    busy = true;
+    dialogError = '';
+    try {
+      const left = await fn();
+      dialog = '';
+      if (!left) load(shownKind);
+    } catch (err) {
+      dialogError = describeError(err);
+      load(shownKind);
+    } finally {
+      busy = false;
+    }
+  }
+
+  const prefix = $derived(data ? folderDate(data.folder) : '');
+  const titleCheck = $derived(checkTitle(title, prefix));
+  const newName = $derived(folderName(prefix, titleCheck.title));
+  const moveReady = $derived(dest === 'new' ? !!titleCheck.title && !titleCheck.error : dest !== '');
+
+  async function openMove() {
+    dialogError = '';
+    title = '';
+    dest = 'new';
+    others = null;
+    dialog = 'move';
+    try {
+      const res = await api('/api/staging');
+      others = res.folders.filter((f) => f.id !== data.folder.id);
+    } catch (err) {
+      others = [];
+      dialogError = `Couldn't list the other folders: ${describeError(err)}`;
+    }
+  }
+
+  function doMove() {
+    const shas = [...selected];
+    const fid = data.folder.id; // a refetch may clear data while the request runs (pre-flight D13)
+    const body = dest === 'new' ? { fileShas: shas, newTitle: titleCheck.title } : { fileShas: shas, toId: Number(dest) };
+    run(async () => {
+      const res = await api('/api/staging/move', { method: 'POST', body });
+      toast(`Moved ${plural(res.moved, 'file', 'files')} to “${res.folder.name}”`);
+      clear();
+      if (res.removed.includes(fid)) {
+        navigate('/staging', { replace: true });
+        return true;
+      }
+      return false;
+    });
+  }
+
+  function doCull() {
+    const shas = [...selected];
+    const fid = data.folder.id;
+    run(async () => {
+      const res = await api('/api/staging/cull', { method: 'POST', body: { fileShas: shas } });
+      toast(`Culled ${plural(res.culled, 'file', 'files')}`);
+      clear();
+      if (res.removed.includes(fid)) {
+        navigate('/staging', { replace: true });
+        return true;
+      }
+      return false;
+    });
+  }
 </script>
 
-<svelte:window {onpopstate} />
+<svelte:window {onpopstate} {onkeydown} />
 
 <p><a href="/staging" class="btn">← Staging</a></p>
 
-{#if error && !data}
+{#if gone}
+  <div class="note warn">This folder no longer exists: it was merged, promoted or discarded. <a href="/staging">Back to staging</a></div>
+{:else if error && !data}
   <div class="note bad">{error}</div>
 {:else if !data}
   <p class="muted">Loading…</p>
 {:else}
   {@const f = data.folder}
   <h1>{f.name}</h1>
-  <p class="sub">{dateRange(f.dates)} · {formatCount(f.files)} files · {formatBytes(f.bytes)}</p>
+  <p class="sub">{dateRange(f.dates)} · {plural(f.files, 'file', 'files')} · {formatBytes(f.bytes)}</p>
   {#if error}
     <div class="note bad" role="alert">Couldn't refresh this folder: {error}</div>
   {/if}
   {#each f.warnings as w}<div class="note warn">{w}</div>{/each}
-  <div class="toolbar">
+  {#if selecting}
+    <SelectionBar count={selected.size} total={files.length} onclear={clear} onall={selectAll}>
+      <button class="btn" onclick={openMove}>Move to…</button>
+      <button class="btn danger" onclick={() => { dialogError = ''; dialog = 'cull'; }}>Cull</button>
+    </SelectionBar>
+  {/if}
+  <div class="toolbar row" class:hidden-phone={selecting}>
     <div class="chips">
       {#each kindChips(f.counts) as c (c.kind)}
         <button class="chip" class:on={shownKind === c.kind} onclick={() => (kind = c.kind)}>{c.label} {c.count}</button>
       {/each}
     </div>
+    <span class="spacer"></span>
+    {#if !selecting}
+      <span class="muted small only-desktop">Ctrl-click or tick files to select them</span>
+      <span class="muted small only-phone">Long-press to select; drag to select more</span>
+    {/if}
   </div>
-  {#if data.files.length === 0}
+  {#if files.length === 0}
     <p class="muted">No files here.</p>
   {:else}
-    <div class="grid">
-      {#each data.files as file, i (file.sha256)}
-        <button class="tile" onclick={() => show(i)} aria-label="Show {file.name}">
-          <Thumb sha={file.sha256} kind={file.kind} label={extLabel(file)} />
-          <span class="fn">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠ </span>{/if}{file.name}</span>
-        </button>
+    <div class="grid selectable" class:selecting use:longPressSelect={press}>
+      {#each files as file, i (file.sha256)}
+        {@const on = selected.has(file.sha256)}
+        <div class="cell" class:sel={on} data-key={file.sha256}>
+          <button class="tile" onclick={(e) => onTileClick(e, i)} aria-label={selecting ? `${on ? 'Unselect' : 'Select'} ${file.name}` : `Show ${file.name}`}>
+            <Thumb sha={file.sha256} kind={file.kind} label={extLabel(file)} />
+            <span class="fn">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠ </span>{/if}{file.name}</span>
+          </button>
+          <button class="pick" class:on onclick={() => toggle(file.sha256)} aria-pressed={on} aria-label="{on ? 'Unselect' : 'Select'} {file.name}"><span>✓</span></button>
+        </div>
       {/each}
     </div>
   {/if}
-  {#if open >= 0 && open < data.files.length}
+  {#if open >= 0 && open < files.length}
     <Lightbox files={data.files} bind:index={open} onclose={hide} />
   {/if}
+
+  <Dialog open={dialog === 'move'} title="Move {plural(selected.size, 'file', 'files')}" onclose={() => !busy && (dialog = '')} {busy}>
+    <div class="dests" role="radiogroup" aria-label="Destination">
+      <label class="dest"><input type="radio" bind:group={dest} value="new" /> <span>New folder…</span></label>
+      {#if dest === 'new'}
+        <div class="newfolder">
+          <div class="prefixed">
+            {#if prefix}<span class="mono">{prefix} -</span>{/if}
+            <input type="text" bind:value={title} placeholder="Title, e.g. Picks" aria-label="New folder title" />
+          </div>
+          {#if titleCheck.error}<div class="field-error">{titleCheck.error}</div>{/if}
+          {#if titleCheck.title && !titleCheck.error}<p class="small" style="margin:6px 0 0">New folder: <span class="mono">{newName}</span></p>{/if}
+        </div>
+      {/if}
+      {#if others === null}
+        <p class="muted small">Loading folders…</p>
+      {:else}
+        {#each others as o (o.id)}
+          <label class="dest"><input type="radio" bind:group={dest} value={String(o.id)} /> <span>{o.name} <span class="muted small">({plural(o.files, 'file', 'files')})</span></span></label>
+        {/each}
+      {/if}
+    </div>
+    <p class="muted small">Files keep their names and their <span class="mono">Capture/</span> or <span class="mono">Videos/</span> subfolder; a clash gets a -1 suffix.</p>
+    {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
+    {#snippet actions()}
+      <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
+      <button class="btn primary" onclick={doMove} disabled={busy || !moveReady}>{busy ? 'Moving…' : 'Move'}</button>
+    {/snippet}
+  </Dialog>
+
+  <Dialog open={dialog === 'cull'} title="Cull {plural(selected.size, 'file', 'files')}?" onclose={() => !busy && (dialog = '')} {busy} danger>
+    <p class="muted">They are deleted from staging.</p>
+    <div class="note">They stay in the ingest history, so they won't be re-imported the next time this card goes in.</div>
+    {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
+    {#snippet actions()}
+      <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
+      <button class="btn bad" onclick={doCull} disabled={busy}>{busy ? 'Culling…' : `Cull ${plural(selected.size, 'file', 'files')}`}</button>
+    {/snippet}
+  </Dialog>
 {/if}
 
 <style>
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
-  .tile { background: none; border: 0; padding: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; min-width: 0; border-radius: 6px; }
+  .cell { position: relative; min-width: 0; border-radius: 6px; }
+  .tile { display: block; width: 100%; background: none; border: 0; padding: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; border-radius: 6px; }
   .tile:hover { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .cell.sel :global(.thumb) { outline: 3px solid var(--accent); outline-offset: 1px; }
+  .cell.sel .tile :global(img) { opacity: .8; }
   .fn { display: block; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 3px; }
   .warn { color: var(--warn); }
+  /* The tick: a 44 px hit area with a 24 px circle, top-left on the thumbnail.
+     Shown on hover with a mouse, and always while selecting. */
+  .pick { position: absolute; top: 0; left: 0; width: 44px; height: 44px; padding: 0; border: 0; background: none; cursor: pointer;
+    display: grid; place-items: center; opacity: 0; transition: opacity .1s; }
+  .pick span { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700;
+    background: rgba(0,0,0,.45); border: 2px solid #fff; color: transparent; }
+  .pick.on span { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .selecting .pick, .pick.on, .pick:focus-visible { opacity: 1; }
+  @media (hover: hover) { .cell:hover .pick { opacity: 1; } }
+  /* On touch the invisible tick must not swallow taps meant for the tile. */
+  @media (hover: none) { .grid:not(.selecting) .pick { pointer-events: none; } }
+  .dests { display: grid; gap: 2px; max-height: 50dvh; overflow: auto; margin: 0 -4px; padding: 0 4px; }
+  .dest { display: flex; gap: 10px; align-items: center; min-height: 44px; cursor: pointer; overflow-wrap: anywhere; }
+  .newfolder { margin: 0 0 8px 28px; }
   @media (max-width: 760px) {
     .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+    .hidden-phone { display: none; }
   }
 </style>

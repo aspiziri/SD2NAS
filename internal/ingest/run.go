@@ -13,6 +13,7 @@ import (
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/media"
+	"github.com/aspiziri/SD2NAS/internal/staging"
 )
 
 // Request is what the card script posts.
@@ -29,11 +30,13 @@ type Config struct {
 	Now        func() time.Time                  // nil: time.Now
 	FreeSpace  func(path string) (uint64, error) // nil: FreeSpace
 	Log        *slog.Logger                      // nil: slog.Default()
+	Locks      *staging.Locks                    // folder locks shared with staging operations; nil: a private set
 }
 
 // Runner imports cards into Staging.
 type Runner struct {
-	cfg Config
+	cfg   Config
+	locks *staging.Locks
 	// Seams, set by NewRunner to the media functions; package tests replace
 	// them to inject failures or block.
 	fingerprint func(path string) (string, error)                          // media.QuickFingerprint
@@ -43,7 +46,11 @@ type Runner struct {
 
 // NewRunner returns a Runner for cfg.
 func NewRunner(cfg Config) *Runner {
-	return &Runner{cfg: cfg, fingerprint: media.QuickFingerprint, hashFile: media.HashFile, copyFile: media.CopyHashed}
+	locks := cfg.Locks
+	if locks == nil {
+		locks = staging.NewLocks()
+	}
+	return &Runner{cfg: cfg, locks: locks, fingerprint: media.QuickFingerprint, hashFile: media.HashFile, copyFile: media.CopyHashed}
 }
 
 func (r *Runner) now() time.Time {
@@ -90,6 +97,7 @@ type ingestRun struct {
 	captureDur  time.Duration
 	copyDur     time.Duration
 	copyBytes   int64
+	held        map[int64]func() // staging folder id → release; kept until the run ends (Decision 1)
 }
 
 func (j *ingestRun) cat() *catalog.DB { return j.r.cfg.Catalog }
@@ -112,6 +120,7 @@ func (r *Runner) Run(ctx context.Context, in catalog.Ingest, p *Progress) (catal
 		stagingRoot: filepath.Join(r.cfg.PhotosRoot, StagingDir),
 		log:         r.log().With("ingest", in.ID, "card", CardName(in)),
 		p:           p,
+		held:        map[int64]func(){},
 	}
 	if err := j.cat().StartIngest(j.dbctx, in.ID, now); err != nil {
 		text := "start import: " + err.Error()
@@ -122,6 +131,7 @@ func (r *Runner) Run(ctx context.Context, in catalog.Ingest, p *Progress) (catal
 		return in, fmt.Errorf("start ingest %d: %w", in.ID, errors.Join(err, finishErr))
 	}
 	status, errText := j.pipeline()
+	j.releaseFolders()
 	return j.finish(status, errText)
 }
 
@@ -433,6 +443,54 @@ func captureOf(path string, kind media.Kind) (media.Capture, *media.VideoMeta, e
 	return c, meta, nil
 }
 
+// maxFolderAttempts bounds how often folderFor looks a folder up again
+// after waiting for it.
+const maxFolderAttempts = 5
+
+// folderFor returns the staging folder for date and holds its lock until
+// the run ends. A staging operation may hold it: the import waits, and
+// since that operation may rename, merge away or promote the folder, it
+// looks the row up again once it has the lock.
+func (j *ingestRun) folderFor(date string) (catalog.StagingFolder, error) {
+	var taken int64 // the lock this call took last and still holds only for that folder
+	drop := func() {
+		if taken != 0 {
+			j.held[taken]()
+			delete(j.held, taken)
+			taken = 0
+		}
+	}
+	for range maxFolderAttempts {
+		f, err := j.cat().StagingFolderForDate(j.dbctx, date, j.now)
+		if err != nil {
+			drop()
+			return catalog.StagingFolder{}, err
+		}
+		if f.ID != taken {
+			drop() // the folder moved on while we waited: the old lock is stale
+		}
+		if _, ok := j.held[f.ID]; ok {
+			return f, nil
+		}
+		release, err := j.r.locks.Lock(j.ctx, staging.HolderIngest, f.ID)
+		if err != nil {
+			return catalog.StagingFolder{}, err
+		}
+		j.held[f.ID] = release
+		taken = f.ID
+	}
+	drop()
+	return catalog.StagingFolder{}, fmt.Errorf("the staging folder for %s kept changing while the import waited for it", date)
+}
+
+// releaseFolders gives back every folder lock the run holds.
+func (j *ingestRun) releaseFolders() {
+	for id, release := range j.held {
+		release()
+		delete(j.held, id)
+	}
+}
+
 func (j *ingestRun) importOne(f newFile) fileResult {
 	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
 	start := time.Now()
@@ -444,8 +502,11 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 	if c.Fallback != nil {
 		j.log.Warn("capture time fell back", "file", f.Rel, "source", c.Source, "reason", c.Fallback)
 	}
-	folder, err := j.cat().StagingFolderForDate(j.dbctx, media.FolderDate(c.Time, j.settings.DayStartsAt), j.now)
+	folder, err := j.folderFor(media.FolderDate(c.Time, j.settings.DayStartsAt))
 	if err != nil {
+		if j.ctx.Err() != nil {
+			return fileResult{canceled: true}
+		}
 		return fail(fmt.Errorf("staging folder: %w", err))
 	}
 	if folder.Name == "" || folder.Name == "." || folder.Name == ".." || strings.ContainsAny(folder.Name, `/\`) {
@@ -540,8 +601,9 @@ func (j *ingestRun) copyNew(f newFile, dir, name string) (dst, sum string, dup b
 		case media.CopyFailDestTaken:
 			j.log.Warn("destination appeared during the copy; choosing another name", "dst", filepath.ToSlash(dst))
 		case media.CopyFailStalePartial:
-			// Ingest is the only writer of partials in Staging and runs alone,
-			// so this one was left by an earlier, interrupted copy.
+			// Partials in Staging come from an import (which runs alone) or from
+			// a staging move into a folder this import can't hold, so this one
+			// was left by an earlier, interrupted copy.
 			if rmErr := os.Remove(dst + media.PartialSuffix); rmErr != nil {
 				return dst, "", false, errors.Join(err, rmErr)
 			}

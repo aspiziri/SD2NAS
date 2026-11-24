@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
@@ -28,12 +30,165 @@ const MaxSamples = 5
 
 var ErrBadKind = errors.New("staging: kind must be jpg, raw or video")
 
+// Config wires a Service.
+type Config struct {
+	DB         *catalog.DB
+	PhotosRoot string
+	Locks      *Locks              // shared with ingest.Config.Locks; nil: a private set
+	Now        func() time.Time    // nil: time.Now
+	Log        *slog.Logger        // nil: slog.Default()
+	Removed    func(shas []string) // after files are culled, discarded or forgotten (thumbnail cleanup); nil: nothing
+}
+
+// Service reads and changes the folders under Staging/.
 type Service struct {
 	db         *catalog.DB
 	photosRoot string
+	locks      *Locks
+	now        func() time.Time
+	log        *slog.Logger
+	removedFn  func([]string)
+	rules      media.Rules
+	rename     func(oldpath, newpath string) error // os.Rename; tests inject EXDEV
+	afterHash  func(path string)                   // tests: runs between hashing a rescanned file and checking it didn't change
+
+	bgCtx    context.Context // cancelled by Close; promote and rescan run on it
+	bgCancel context.CancelFunc
+	wg       sync.WaitGroup
+
+	mu     sync.Mutex // guards status, notify, closed
+	status Status
+	notify func(Status)
+	closed bool
+
+	pmu        sync.Mutex // guards the promote fields below; take s.mu first when both are needed
+	queue      []*queuedJob
+	running    *queuedJob
+	last       *PromoteJob
+	jobSeq     int64
+	working    bool // a worker goroutine is draining the queue
+	promoteFn  func(PromoteQueue)
+	lastReport time.Time
 }
 
-func New(db *catalog.DB, photosRoot string) *Service { return &Service{db: db, photosRoot: photosRoot} }
+// New is NewService with only the catalog and the photos root.
+func New(db *catalog.DB, photosRoot string) *Service {
+	return NewService(Config{DB: db, PhotosRoot: photosRoot})
+}
+
+func NewService(cfg Config) *Service {
+	s := &Service{db: cfg.DB, photosRoot: cfg.PhotosRoot, locks: cfg.Locks, now: cfg.Now, log: cfg.Log,
+		removedFn: cfg.Removed, rules: media.DefaultRules(), rename: os.Rename}
+	if s.locks == nil {
+		s.locks = NewLocks()
+	}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	if s.log == nil {
+		s.log = slog.Default()
+	}
+	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
+	return s
+}
+
+// Status is what the staging.changed event carries (Decision 14).
+type Status struct {
+	Version    uint64        `json:"version"`     // bumps on every change to staging
+	Rescanning bool          `json:"rescanning"`  // a reconcile pass is running
+	LastRescan *RescanResult `json:"last_rescan"` // the last finished pass; nil before the first
+}
+
+// RescanResult is what one reconcile pass did (Task 8 fills it).
+type RescanResult struct {
+	StartedAt      time.Time `json:"started_at"`
+	FinishedAt     time.Time `json:"finished_at"`
+	AdoptedFolders int       `json:"adopted_folders"`          // directories that had no row
+	AddedFiles     int       `json:"added_files"`              // media files the catalog didn't know
+	MovedFiles     int       `json:"moved_files"`              // tracked files found at a new path
+	RestoredFiles  int       `json:"restored_files"`           // culled content put back
+	CulledFiles    int       `json:"culled_files"`             // tracked files gone from disk
+	RemovedFolders int       `json:"removed_folders"`          // rows whose directory is gone
+	Duplicates     int       `json:"duplicates"`               // copies of content tracked elsewhere, left alone
+	BusyFolders    int       `json:"busy_folders"`             // skipped: an import or operation held them
+	Errors         []string  `json:"errors"`                   // at most maxRescanErrors problems, then why the pass stopped, if it did
+	ErrorsOmitted  int       `json:"errors_omitted,omitempty"` // problems past the cap, only logged
+	Skipped        string    `json:"skipped,omitempty"`        // why nothing (more) was done
+	log            *slog.Logger
+}
+
+var ErrClosed = errors.New("staging: shutting down")
+
+func (s *Service) Status() Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status
+}
+
+// OnChange registers fn to receive the status after every change. Call it
+// before serving. fn runs with the service's lock held, so the events it
+// publishes stay in order; it must not block or call back into s.
+func (s *Service) OnChange(fn func(Status)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notify = fn
+}
+
+// Touch records a change to staging made elsewhere (an import finished).
+func (s *Service) Touch() { s.changed() }
+
+func (s *Service) changed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Version++
+	s.notifyLocked()
+}
+
+func (s *Service) notifyLocked() {
+	if s.notify != nil {
+		s.notify(s.status)
+	}
+}
+
+// removed reports hashes whose files are gone for good.
+func (s *Service) removed(shas []string) {
+	if len(shas) > 0 && s.removedFn != nil {
+		s.removedFn(shas)
+	}
+}
+
+// Close stops a running promote or rescan between files and waits for it.
+// Calling it again does nothing.
+func (s *Service) Close() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.bgCancel()
+	s.dropQueue()
+	s.wg.Wait()
+}
+
+func (s *Service) folderDir(name string) string { return filepath.Join(s.photosRoot, Dir, name) }
+
+// abs is the OS path of rel_path rel.
+func (s *Service) abs(rel string) string { return filepath.Join(s.photosRoot, filepath.FromSlash(rel)) }
+
+// relOf is OS path p as a rel_path; an error when p is outside the photos root.
+func (s *Service) relOf(p string) (string, error) {
+	rel, err := filepath.Rel(s.photosRoot, p)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("%s is not inside the photos share %s", p, s.photosRoot)
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+// safeName rejects a catalog folder name that isn't a single path element.
+func safeName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("staging folder name %q is not a single folder name", name)
+	}
+	return nil
+}
 
 type KindCounts struct {
 	JPG   int `json:"jpg"`
@@ -61,12 +216,17 @@ type Folder struct {
 	LastCapture   string     `json:"last_capture,omitempty"`
 	Samples       []Sample   `json:"samples"`
 	ClockWarnings int        `json:"clock_warnings"` // files with at least one clock warning
+	AgeDays       int        `json:"age_days"`       // whole days since created_at
+	Stale         bool       `json:"stale"`          // AgeDays >= staging_warn_days (and that setting isn't 0)
 	Warnings      []string   `json:"warnings"`
 }
 
 type Listing struct {
-	Folders   []Folder `json:"folders"`   // ordered by name
-	Untracked []string `json:"untracked"` // directories in Staging/ with no catalog row (M4 adopts them)
+	Version        uint64   `json:"version"`          // Status().Version read before the listing was built
+	StaleAfterDays int      `json:"stale_after_days"` // the setting; 0 = off
+	Stale          int      `json:"stale"`            // how many folders are stale
+	Folders        []Folder `json:"folders"`          // ordered by name
+	Untracked      []string `json:"untracked"`        // directories in Staging/ with no catalog row (M4 adopts them)
 }
 
 type File struct {
@@ -81,8 +241,9 @@ type File struct {
 }
 
 type FolderFiles struct {
-	Folder Folder `json:"folder"`
-	Files  []File `json:"files"`
+	Version uint64 `json:"version"`
+	Folder  Folder `json:"folder"`
+	Files   []File `json:"files"`
 }
 
 var nameRE = regexp.MustCompile(`^([0-9]{4}-[0-9]{2}-[0-9]{2})(?: - (.+))?$`)
@@ -109,9 +270,28 @@ func KindName(k media.Kind) string {
 	return string(k)
 }
 
+// ageRule flags folders that have sat in staging too long (§3, Decision 13).
+type ageRule struct {
+	now      time.Time
+	warnDays int // 0 = never
+}
+
+func (s *Service) ageRule(ctx context.Context) (ageRule, error) {
+	set, err := s.db.Settings(ctx)
+	if err != nil {
+		return ageRule{}, err
+	}
+	return ageRule{now: s.now(), warnDays: set.StagingWarnDays}, nil
+}
+
 // List returns every staging folder with its summary, plus the directories
 // on disk the catalog does not know.
 func (s *Service) List(ctx context.Context) (Listing, error) {
+	version := s.Status().Version
+	age, err := s.ageRule(ctx)
+	if err != nil {
+		return Listing{}, err
+	}
 	rows, err := s.db.StagingFolders(ctx)
 	if err != nil {
 		return Listing{}, err
@@ -139,11 +319,15 @@ func (s *Service) List(ctx context.Context) (Listing, error) {
 		byFolder[name] = append(byFolder[name], a)
 	}
 	warned := warnedFiles(ws)
-	out := Listing{Folders: []Folder{}, Untracked: []string{}}
+	out := Listing{Version: version, StaleAfterDays: age.warnDays, Folders: []Folder{}, Untracked: []string{}}
 	known := map[string]bool{}
 	for _, row := range rows {
 		known[row.Name] = true
-		out.Folders = append(out.Folders, summarize(row, sortFiles(byFolder[row.Name]), warned, onDisk[row.Name]))
+		f := summarize(row, sortFiles(byFolder[row.Name]), warned, onDisk[row.Name], age)
+		if f.Stale {
+			out.Stale++
+		}
+		out.Folders = append(out.Folders, f)
 	}
 	for name := range onDisk {
 		if !known[name] {
@@ -185,7 +369,7 @@ func sortFiles(assets []catalog.Asset) []catalog.Asset {
 	return out
 }
 
-func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[string][]string, onDisk bool) Folder {
+func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[string][]string, onDisk bool, age ageRule) Folder {
 	date, title := SplitName(row.Name)
 	f := Folder{
 		ID: row.ID, Name: row.Name, Date: date, Title: title,
@@ -230,6 +414,11 @@ func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[str
 		f.Warnings = append(f.Warnings, "1 file has a suspicious capture time")
 	case n > 1:
 		f.Warnings = append(f.Warnings, fmt.Sprintf("%d files have a suspicious capture time", n))
+	}
+	f.AgeDays = max(0, int(age.now.Sub(row.CreatedAt)/(24*time.Hour)))
+	if age.warnDays > 0 && f.AgeDays >= age.warnDays {
+		f.Stale = true
+		f.Warnings = append(f.Warnings, fmt.Sprintf("In staging for %d days", f.AgeDays))
 	}
 	return f
 }
@@ -288,12 +477,17 @@ func (s *Service) Files(ctx context.Context, id int64, kind string) (FolderFiles
 	default:
 		return FolderFiles{}, fmt.Errorf("%w, not %q", ErrBadKind, kind)
 	}
+	version := s.Status().Version
+	age, err := s.ageRule(ctx)
+	if err != nil {
+		return FolderFiles{}, err
+	}
 	row, err := s.db.StagingFolderByID(ctx, id)
 	if err != nil {
 		return FolderFiles{}, err
 	}
-	if row.Name == "" || row.Name == "." || row.Name == ".." || strings.ContainsAny(row.Name, `/\`) {
-		return FolderFiles{}, fmt.Errorf("staging folder %d has a name that is not a single folder name: %q", id, row.Name)
+	if err := safeName(row.Name); err != nil {
+		return FolderFiles{}, fmt.Errorf("staging folder %d: %w", id, err)
 	}
 	prefix := Dir + "/" + row.Name + "/"
 	assets, err := s.db.AssetsUnder(ctx, prefix, catalog.StateStaged)
@@ -312,7 +506,7 @@ func (s *Service) Files(ctx context.Context, id int64, kind string) (FolderFiles
 	}
 	sorted := sortFiles(assets)
 	warned := warnedFiles(ws)
-	out := FolderFiles{Folder: summarize(row, sorted, warned, onDisk), Files: []File{}}
+	out := FolderFiles{Version: version, Folder: summarize(row, sorted, warned, onDisk, age), Files: []File{}}
 	for _, a := range sorted {
 		if kind != "" && KindName(a.Kind) != kind {
 			continue

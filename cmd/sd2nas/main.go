@@ -91,18 +91,32 @@ func run(log *slog.Logger) error {
 				log.Error("closing catalog", "err", err)
 			}
 		}()
-		mgr = ingest.NewManager(ingest.NewRunner(ingest.Config{Catalog: db, PhotosRoot: cfg.Photos, Log: log}), cfg.Cards)
+		locks := staging.NewLocks() // shared: imports and staging operations lock the same folders
+		mgr = ingest.NewManager(ingest.NewRunner(ingest.Config{Catalog: db, PhotosRoot: cfg.Photos, Log: log, Locks: locks}), cfg.Cards)
 		if err := mgr.Recover(ctx); err != nil {
 			log.Error("startup recovery failed", "err", err)
 			srv.AddProblem("startup recovery: " + err.Error())
 		}
+		cache, cacheErr := thumbs.New(thumbs.Config{Dir: filepath.Join(cfg.Data, "thumbs"), Log: log})
+		svc := staging.NewService(staging.Config{DB: db, PhotosRoot: cfg.Photos, Locks: locks, Log: log,
+			Removed: func(shas []string) {
+				if cacheErr != nil {
+					return
+				}
+				for _, sha := range shas {
+					if err := cache.Remove(sha); err != nil {
+						log.Warn("could not remove cached thumbnails", "sha", sha, "err", err)
+					}
+				}
+			}})
 		mgr.Start()
 		srv.MountIngest(mgr, db, api.DefaultMaxWait)
-		srv.MountStaging(staging.New(db, cfg.Photos))
-		cache, err := thumbs.New(thumbs.Config{Dir: filepath.Join(cfg.Data, "thumbs"), Log: log})
-		if err != nil {
-			log.Error("thumbnail cache unavailable", "err", err)
-			srv.AddProblem("thumbnails: " + err.Error())
+		srv.MountStaging(svc) // srv.Close closes svc
+		srv.MountForget(mgr, db, svc)
+		svc.StartRescan() // §8: fix drift from SMB edits made while SD2NAS was down
+		if cacheErr != nil {
+			log.Error("thumbnail cache unavailable", "err", cacheErr)
+			srv.AddProblem("thumbnails: " + cacheErr.Error())
 		} else {
 			for _, w := range cache.MissingTools() {
 				log.Warn(w)

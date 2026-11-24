@@ -49,6 +49,30 @@ test('a network failure is status 0', async () => {
   await assert.rejects(api('/api/x'), (err) => err.status === 0 && err.message.startsWith('SD2NAS is not reachable'));
 });
 
+test('204 No Content resolves to null', async () => {
+  respond(null, { status: 204 });
+  assert.equal(await api('/api/x', { method: 'DELETE' }), null);
+});
+
+test('a 200 with an empty or blank body resolves to null', async () => {
+  respond('', { status: 200 });
+  assert.equal(await api('/api/x', { method: 'POST' }), null);
+  respond('  \n', { status: 200 });
+  assert.equal(await api('/api/x', { method: 'POST' }), null);
+});
+
+test('an error keeps its JSON body in data', async () => {
+  respond('{"error":"2025-05-30 is being imported into. Try again when the import finishes.","code":"folder_busy","folder_id":3,"holder":"ingest"}', { status: 409 });
+  await assert.rejects(api('/api/staging/3', { method: 'PATCH', body: { title: 'x' } }), (err) =>
+    err instanceof ApiError && err.status === 409 && err.data.code === 'folder_busy' && err.data.holder === 'ingest' &&
+    err.message.startsWith('2025-05-30 is being imported into'));
+});
+
+test('an error without a JSON body has null data', async () => {
+  respond('oops', { status: 502, statusText: 'Bad Gateway' });
+  await assert.rejects(api('/api/x'), (err) => err.status === 502 && err.data === null);
+});
+
 test('getHealth reports a network failure as "not reachable", which the banner shows as is', async () => {
   globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
   await assert.rejects(getHealth(), (err) =>

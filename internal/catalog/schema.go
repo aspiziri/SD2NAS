@@ -2,7 +2,7 @@ package catalog
 
 // migrations[i] upgrades a database from user_version i to i+1. Append only;
 // never edit a migration that has shipped.
-var migrations = []string{schemaV1}
+var migrations = []string{schemaV1, schemaV2}
 
 const schemaV1 = `
 CREATE TABLE ingests (
@@ -85,4 +85,26 @@ CREATE TABLE staging_folders (
 );
 
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+`
+
+// schemaV2 (M4): "Forget this import" marks the ingest instead of deleting
+// it, and forgetting finds an import's assets by first_ingest.
+const schemaV2 = `
+ALTER TABLE ingests ADD COLUMN forgotten_at TEXT;   -- set by "Forget this import"; NULL = never
+CREATE INDEX assets_first_ingest ON assets(first_ingest);
+-- Forgetting deletes per asset: keep those deletes (and the foreign-key checks) off full scans.
+CREATE INDEX fingerprints_sha256 ON fingerprints(sha256);
+CREATE INDEX aliases_sha256 ON aliases(sha256);
+
+-- Folder ids are never reused (a lock or a waiter may still hold a deleted
+-- folder's id): rebuild staging_folders with AUTOINCREMENT, keeping every id.
+CREATE TABLE staging_folders_new (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE,
+  dates      TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+INSERT INTO staging_folders_new (id, name, dates, created_at) SELECT id, name, dates, created_at FROM staging_folders;
+DROP TABLE staging_folders;
+ALTER TABLE staging_folders_new RENAME TO staging_folders;
 `

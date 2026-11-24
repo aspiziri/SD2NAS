@@ -17,6 +17,8 @@ var (
 	ErrBadCardPath = errors.New("ingest: not a card folder")
 	ErrQueueFull   = errors.New("ingest: too many imports waiting")
 	ErrClosed      = errors.New("ingest: shutting down")
+	// ErrBusy reports that an import is running or waiting.
+	ErrBusy = errors.New("ingest: an import is running or waiting")
 )
 
 const MaxQueued = 8 // jobs waiting behind the running one
@@ -65,6 +67,7 @@ type Manager struct {
 	queue     []*Job
 	closed    bool
 	started   bool
+	holds     int // Exclusive holds; while > 0 no queued job starts
 }
 
 // Job is one submitted ingest.
@@ -172,6 +175,31 @@ func (m *Manager) Current() (running *Job, queued []*Job) {
 	return m.running, append([]*Job(nil), m.queue...)
 }
 
+// Exclusive holds new imports back until release is called, for work that
+// must not overlap one (forgetting an import, Decision 10). Submit still
+// queues jobs, but none starts while any hold is held. It fails with
+// ErrBusy while an import runs or waits.
+func (m *Manager) Exclusive() (release func(), err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running != nil || len(m.queue) > 0 {
+		return nil, ErrBusy
+	}
+	m.holds++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			m.holds--
+			m.mu.Unlock()
+			select {
+			case m.wake <- struct{}{}:
+			default:
+			}
+		})
+	}, nil
+}
+
 // Close cancels the running job and the queued ones, and waits for the
 // worker or ctx.
 func (m *Manager) Close(ctx context.Context) error {
@@ -224,7 +252,7 @@ func (m *Manager) next() *Job {
 			m.mu.Unlock()
 			return nil
 		}
-		if len(m.queue) > 0 {
+		if len(m.queue) > 0 && m.holds == 0 {
 			j := m.queue[0]
 			m.queue = m.queue[1:]
 			m.running = j

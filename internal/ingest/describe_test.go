@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 )
@@ -23,6 +24,10 @@ func TestDescribe(t *testing.T) {
 		{"done staging only", func(in *catalog.Ingest) {
 			in.Status, in.Counts, in.SafeToFormat = catalog.StatusDone, counts{Seen: 2, InStaging: 2}, true
 		}, LevelNormal, p + "0 new, 2 already known. Card safe to format."},
+		{"forgotten is not safe to format", func(in *catalog.Ingest) {
+			in.Status, in.Counts, in.SafeToFormat = catalog.StatusDone, counts{Seen: 3, New: 2, InArchive: 1}, true
+			in.ForgottenAt = time.Date(2026, 3, 9, 14, 0, 0, 0, time.UTC)
+		}, LevelWarning, p + "forgotten on 2026-03-09: the files it brought in are no longer tracked, so inserting the card imports them again. Do not format the card."},
 		{"done failed", func(in *catalog.Ingest) {
 			in.Status, in.Counts = catalog.StatusDone, counts{Seen: 3, New: 1, InStaging: 1, Failed: 1}
 		}, LevelWarning, p + "1 new, 1 already known, 1 failed. Do not format the card."},
