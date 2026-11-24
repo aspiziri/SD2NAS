@@ -4,10 +4,12 @@ import (
 	"context"
 	"log/slog"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
+	"github.com/aspiziri/SD2NAS/internal/indexer"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
 	"github.com/aspiziri/SD2NAS/internal/media/mediatest"
 	"github.com/aspiziri/SD2NAS/internal/staging"
@@ -24,6 +26,8 @@ type fullServer struct {
 	locks                *staging.Locks
 	svc                  *staging.Service
 	mgr                  *ingest.Manager
+	idx                  *indexer.Service
+	busy                 *atomic.Bool // makes the indexer wait, as a running import or promote does
 }
 
 func newFullServer(t *testing.T) fullServer {
@@ -72,6 +76,15 @@ func newFullServer(t *testing.T) fullServer {
 	s.MountStaging(svc) // s.Close closes svc
 	s.MountForget(m, db, svc)
 	s.MountThumbs(db, cache, photos)
+	busy := new(atomic.Bool)
+	f := fullServer{s: s, card: card, photos: photos, config: config, db: db, cache: cache, locks: locks, svc: svc, mgr: m, busy: busy}
+	idx, err := indexer.New(indexer.Config{DB: db, PhotosRoot: photos, Locks: locks, Log: discard, Busy: busy.Load})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.idx = idx
+	s.MountArchive(idx) // s.Close closes idx
+	s.MountSettings(db, idx, photos)
 	t.Cleanup(s.Close)
-	return fullServer{s: s, card: card, photos: photos, config: config, db: db, cache: cache, locks: locks, svc: svc, mgr: m}
+	return f
 }

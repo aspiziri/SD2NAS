@@ -18,6 +18,7 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/api"
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/config"
+	"github.com/aspiziri/SD2NAS/internal/indexer"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
 	"github.com/aspiziri/SD2NAS/internal/staging"
 	"github.com/aspiziri/SD2NAS/internal/thumbs"
@@ -113,6 +114,19 @@ func run(log *slog.Logger) error {
 		srv.MountIngest(mgr, db, api.DefaultMaxWait)
 		srv.MountStaging(svc) // srv.Close closes svc
 		srv.MountForget(mgr, db, svc)
+		idx, idxErr := indexer.New(indexer.Config{DB: db, PhotosRoot: cfg.Photos, Locks: locks, Log: log,
+			Busy: func() bool { // Decision 13: imports and promotes go first
+				running, queued := mgr.Current()
+				return running != nil || len(queued) > 0 || svc.Promotes().Running != nil
+			}})
+		if idxErr != nil {
+			log.Error("archive indexer unavailable", "err", idxErr)
+			srv.AddProblem("archive indexer: " + idxErr.Error())
+		} else {
+			srv.MountArchive(idx) // srv.Close closes idx (after the staging service)
+			srv.MountSettings(db, idx, cfg.Photos)
+			idx.Start() // nightly backup and rescan; nothing runs at startup (Decision 14)
+		}
 		svc.StartRescan() // §8: fix drift from SMB edits made while SD2NAS was down
 		if cacheErr != nil {
 			log.Error("thumbnail cache unavailable", "err", cacheErr)
