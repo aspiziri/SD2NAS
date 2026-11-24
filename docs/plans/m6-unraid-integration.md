@@ -25,7 +25,7 @@
   - Allowed: `context.WithoutCancel`, `context.AfterFunc`, `min`/`max`, `slices`, `maps`, `t.Context()`, `slog.DiscardHandler`, range over an int, `sync.Mutex.TryLock`.
 - **No new dependencies.** `go.mod`, `go.sum`, `web/package.json` and `web/package-lock.json` must not change.
   - `golang.org/x/sys` is only an indirect dependency and **must not be imported**. Locking uses `syscall` (Linux `syscall.Flock`, Windows `kernel32.dll` `LockFileEx`/`UnlockFileEx` through `syscall.NewLazyDLL`, as `internal/ingest/freespace_windows.go` does).
-  - The card script uses only bash, curl, sed, mktemp, logger and the Unraid commands named below. No jq.
+  - The card script uses only bash, curl, sed, mktemp, rm, logger and the Unraid commands named below. No jq.
 - **M6 touches:**
   - `internal/catalog/` (`catalog.go`, `schema.go`, new `notifications.go`)
   - `internal/media/` (`exif.go`, `video.go`: panic recovery only)
@@ -37,7 +37,7 @@
   - `deploy/unassigned-devices.sh` (new), `deploy/doc.go`, `deploy/*_test.go`, `deploy/unraid/sd2nas.xml`
   - `README.md` (new) and `docs/PLAN.md` (last task)
 
-  Do not modify `web/`, `internal/indexer/`, `internal/staging/`, `internal/thumbs/`, `.github/`, `deploy/Dockerfile` or `deploy/entrypoint.sh`. The indexer and staging packages are only *read* (`indexer.Status`, `staging.Listing`).
+  Do not modify `web/`, `internal/indexer/`, `internal/staging/`, `internal/thumbs/`, `.github/`, `deploy/Dockerfile` or `deploy/entrypoint.sh`, with one exception: Task 5 changes the schema-version assertion in `internal/indexer/backup_test.go` (test-only). The indexer and staging packages are otherwise only *read* (`indexer.Status`, `staging.Listing`, `staging.Status`).
 - **Binding values** (reviewers check them verbatim):
   - **Config lock:**
     - The file is `<config>/sd2nas.lock` (`/config/sd2nas.lock` in the container). It is created if missing and never deleted.
@@ -49,14 +49,16 @@
   - **Panics:**
     - **A panic in an import:**
       - The import is recorded as `failed` with the error `internal error: <panic value>` and the counts it had reached.
-      - The card script's text is therefore `<card>: import failed: internal error: <v>. Card left mounted.` (level `alert`, HTTP 500).
+      - The card script's text is therefore `<card>: import failed: internal error: <v>.`[` <N> new copied before it stopped.`]` Card left mounted.` (level `alert`, HTTP 500). The bracketed part appears only when `Counts.New > 0`, as `Describe` already words it.
+      - If recording the failure itself fails, the error is `internal error: <v>; record the failed ingest <id>: <err>`, so the panic text is never lost.
       - The worker goes on to the next queued job.
       - The log line is `ingest panicked`, with keys `ingest`, `panic` and `stack`.
     - **A panic while classifying a file:** that file gets outcome `failed` with the error `internal error: <v>`, and the log line is `classifying a file panicked` (keys `file`, `panic`, `stack`).
     - **`media.ReadExif`:** a panic becomes the error `exif <path>: the decoder panicked: <v>`.
     - **`media.ReadVideoMeta`:** a panic becomes the error `video <path>: the parser panicked: <v>`.
   - **Notices** (catalog table `notifications`, schema version **4**):
-    - Levels are `normal`, `warning` and `alert`. Messages are one line (control characters become spaces), at most 1000 bytes (cut at a rune boundary and ended with `…`).
+    - Levels are `normal`, `warning` and `alert`. Messages are one line (control characters become spaces, trimmed), at most 1000 bytes (cut at a rune boundary and ended with `…`).
+    - `catalog.AddNotification` enforces this for every caller, because the text take's two-line framing depends on it.
     - **Keys and texts:**
 
       | Key | Level | Message |
@@ -74,7 +76,10 @@
     - **Checks:**
       - Every **30 s**, plus once at `Start`.
       - Archive notices are queued only for events at most **24 h** old when first seen.
-      - The stale-staging check runs once per local day, at or after **09:00** container time (`time.Local`). If it fails, it is retried after 1 h.
+      - The service remembers in memory each key it has already stored or found, so the 30 s checks don't open a write transaction each time.
+      - The stale-staging check runs once per local day, at or after **09:00** container time (`time.Local`).
+      - It runs only once the startup staging reconcile has finished (`staging.Status().Rescanning` false and `LastRescan` set).
+      - If it fails, it is retried after 1 h.
       - Notices are deleted **30 days** after `created_at`.
       - A take returns at most **100** notices, oldest first.
   - **Endpoints:**
@@ -186,7 +191,7 @@
    - Its jobs are watched by the ingest feed, so they send `ingest.finished`.
 
    Pinned in Task 8 (`TestSubmitIngestWatched`) and Task 9 (every `TestPoller*`).
-6. **Shutdown.** The notices loop and the poller stop on `Close`. The poller closes before the manager. `docker stop` stays under 2 s (Task 12 smoke run).
+6. **Shutdown.** The notices loop and the poller stop on `Close`. The poller closes before the manager. The notices service closes first among `srv.Close`'s closers, before staging and the indexer. `docker stop` stays under 2 s (Task 12 smoke run).
 7. **Docs match reality.** The README and §16's owner steps name the exact Unassigned Devices, Notification Settings and User Scripts settings, and the script's config file. The owner-only items stay unticked.
 
 ## Decisions
@@ -213,6 +218,7 @@
 4. **The stale-staging check runs once a day at 09:00 container time, a constant.** (owner may override)
    - "Daily" means the first 30 s check at or after 09:00 local, so the hourly delivery lands in the morning, not at night.
    - Restarts don't repeat it (key `staging:<date>`) and don't skip it: a restart after 09:00 runs it if today's key doesn't exist.
+   - It waits for the startup staging reconcile to finish, so folders adopted at startup are in the list.
    - **Cost of the alternative** (a `notify_at` setting): one settings key, its validation, and an update to `settings_test`, which hard-codes 7 keys.
 5. **Missing-file notices come from any pass that newly marks files missing, not only the nightly one.** (owner may override) Missing files block "safe to format" and may mean a dropped disk, which matters however the pass started. Cost of nightly-only: one condition, but a manual pass the owner walked away from would stay silent.
 6. **Levels:** stale staging `warning`, backup failed `alert`, files missing `alert`. (owner may override) The cost is trivial; the levels decide which notices reach the phone under the Notification Settings agent ticks.
@@ -243,6 +249,7 @@
 13. **`--restart=unless-stopped` goes in the template's Extra Parameters.** (owner may override)
     - Unraid sets no restart policy, so without it a crash leaves SD2NAS down until someone notices. The card script would then say "SD2NAS did not answer".
     - Existing installs must add it by hand (README).
+    - With it, Docker restarts a second instance that exits 3 on the config lock, with back-off, and it logs the same line each time. That is harmless; the README tells the owner to stop the duplicate.
     - Cost of leaving it out: no self-healing after a crash.
 14. **The config lock.**
     - It is `/config/sd2nas.lock`, taken with `flock(LOCK_EX|LOCK_NB)` or `LockFileEx(EXCLUSIVE|FAIL_IMMEDIATELY)` on 1 byte at offset 2³², so the holder line at the start stays readable. The OS drops it when the process dies.
@@ -395,12 +402,12 @@ var readBoxStructure = mp4.ReadBoxStructure // video.go
 ```go
 	defer func() {
 		if p := recover(); p != nil {
-			d, err = nil, fmt.Errorf("exif %s: the decoder panicked: %v", path, p) // video.go: meta, "video %s: the parser panicked: %v"
+			err = fmt.Errorf("exif %s: the decoder panicked: %v", path, p) // video.go: "video %s: the parser panicked: %v"
 		}
 	}()
 ```
 
-  Name the first result (`d *ExifData` / `meta *VideoMeta`), or assign through the existing named result. Keep every other behaviour unchanged.
+  Keep the blank first result `_`. It stays nil after a panic, so the recover assigns only `err`. Renaming it would turn the existing `d := &ExifData{…}` / `meta := &VideoMeta{}` into a compile error. Keep every other behaviour unchanged.
 - [ ] **Step 4: Run**: `go test ./internal/media/` → PASS; `gofmt -l .`, `go vet ./...`, `go test ./...` → PASS.
 - [ ] **Step 5: Commit**
 
@@ -433,8 +440,9 @@ Suggested implementer: sonnet (opus reviewer: locks and the job lifecycle).
     - Then submit the same card again → it finishes `done`. The worker kept going.
     - `m.Close` returns nil.
   - `TestPanicReleasesFolderLocks`:
-    - With `copyFile` panicking, use the env's shared `*staging.Locks`.
-    - After `Done`, `locks.TryLock(staging.HolderOperation, <the staging folder id the run created>)` succeeds; look the folder up with `StagingFolders`. Release it afterwards.
+    - With `copyFile` panicking:
+    - `newEnv` passes no `Locks`, so the Runner has a private set: use `e.r.locks`.
+    - After `Done`, `e.r.locks.TryLock(staging.HolderOperation, <the staging folder id the run created>)` succeeds. Look the folder up with `StagingFolders`, and release the lock afterwards.
   - `TestClassifyPanicFailsFile`:
     - Set `r.fingerprint` to panic for one file of the card (match by name suffix) and to call `media.QuickFingerprint` otherwise.
     - The import finishes `done` with `Counts.Failed == 1` and `SafeToFormat` false.
@@ -482,7 +490,8 @@ func (m *Manager) runRecovered(row catalog.Ingest, j *Job) (out catalog.Ingest, 
 		out.FinishedAt = m.stamp()
 		// Not cancellable: the failure must be recorded even during shutdown.
 		if ferr := m.r.cfg.Catalog.FinishIngest(context.WithoutCancel(m.ctx), out); ferr != nil {
-			err = fmt.Errorf("record the failed ingest %d: %w", row.ID, ferr)
+			// run replaces out.Error with err's text, so keep the panic in it (PF14).
+			err = fmt.Errorf("internal error: %v; record the failed ingest %d: %w", p, row.ID, ferr)
 		}
 	}()
 	return m.r.Run(m.ctx, row, j.progress)
@@ -543,7 +552,7 @@ func (l *Lock) Release() error                                          // unloc
   - **`Acquire`:**
     - `os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)`; on error return `fmt.Errorf("lockfile: %w", err)`.
     - `lockFile(f)`. On error, close `f`. `ErrHeld` → `errors.Join(&HeldError{Path: path, Holder: holderOf(path)}, closeErr)`. Anything else → `errors.Join(fmt.Errorf("lockfile: lock %s: %w", path, err), closeErr)`, keeping `ErrUnsupported` matchable.
-    - On success: `f.Truncate(0)`, then `f.WriteAt([]byte(info+"\n"), 0)`. If either fails, unlock and close, and return the error.
+    - On success: `f.Truncate(0)`, then `f.WriteAt([]byte(info+"\n"), 0)`. If either fails, return `errors.Join(fmt.Errorf("lockfile: write %s: %w", path, err), unlockFile(f), f.Close())`.
   - `holderOf` reads at most 256 bytes and returns the first line trimmed (`""` on any error).
   - **`Release`:** `errors.Join(unlockFile(l.f), l.f.Close())`.
   - **`lock_unix.go`** (`//go:build linux || darwin`):
@@ -715,7 +724,7 @@ Suggested implementer: sonnet.
 
 **Files:**
 - Create: `internal/catalog/notifications.go`, `internal/catalog/notifications_test.go`
-- Modify: `internal/catalog/schema.go`, `internal/catalog/catalog.go` (`SchemaVersion` only), `internal/catalog/catalog_test.go` (the table list), `internal/catalog/ingests_test.go` (a v3→v4 migration test)
+- Modify: `internal/catalog/schema.go`, `internal/catalog/catalog.go` (`SchemaVersion` only), `internal/catalog/catalog_test.go` (the table list), `internal/catalog/ingests_test.go` (a v3→v4 migration test; `TestMigrateV2ToV3`'s `v != 3` at line 461 becomes `v != SchemaVersion`), `internal/catalog/archive_test.go` (`TestBackupVacuumInto`'s `v != 3` at line 762 → `SchemaVersion`), `internal/indexer/backup_test.go` (the backup's `v != 3` at line 88 → `catalog.SchemaVersion`; the only edit allowed in `internal/indexer/`)
 
 **Interfaces:**
 - Consumes: `d.tx`, `formatTime`/`parseTime`, the migration runner.
@@ -744,11 +753,13 @@ type Notification struct {
 
 // AddNotification stores n unless one with n.Key exists (added = false). In
 // the same transaction it deletes notifications created more than
-// NoticeKeep before n.CreatedAt. An empty key or message, or an unknown
-// level, is an error.
+// NoticeKeep before n.CreatedAt. It stores the message as one line
+// (control characters become spaces, trimmed) of at most 1000 bytes, cut
+// at a rune boundary and ended with "…"; the text take relies on it. An
+// empty key, a message empty after that, or an unknown level is an error.
 func (d *DB) AddNotification(ctx context.Context, n Notification) (added bool, err error)
 func (d *DB) HasNotification(ctx context.Context, key string) (bool, error)
-// PendingNotifications: not taken yet, oldest (lowest id) first, at most MaxTake.
+// PendingNotifications: not taken yet, oldest (lowest id) first, at most MaxTake. Never nil.
 func (d *DB) PendingNotifications(ctx context.Context) ([]Notification, error)
 // TakeNotifications marks the pending ones (oldest first, at most MaxTake)
 // taken at now and returns them, in one transaction. Never nil.
@@ -763,12 +774,15 @@ func (d *DB) TakeNotifications(ctx context.Context, now time.Time) ([]Notificati
     - `Open` → `Version` 4, the setting is intact, and `pragma_index_list('notifications')` contains `notifications_pending`.
   - `notifications_test.go`:
     - `TestAddNotificationOnce`: adding key `k` twice → `true`, then `false`; `PendingNotifications` has one row, with every field read back (time at ms precision).
-    - `TestAddNotificationRejects`: an empty key, an empty message or level `"loud"` → error, and nothing stored.
+    - `TestAddNotificationRejects`: an empty key, an empty (or all-control-character) message, or level `"loud"` → error, and nothing stored.
+    - `TestAddNotificationSanitizes` (the 1000-byte cut is tested here, PF19):
+      - the message `"a\nb\tc "` is stored as `a b c`;
+      - a 1500-byte message of multi-byte runes is stored as at most 1000 bytes of valid UTF-8, ending with `…`.
     - `TestTakeNotifications`:
       - Add 3 notices; `TakeNotifications(now)` returns them in id order.
       - A second take returns `[]` (not nil).
       - `HasNotification` stays true for each.
-      - Pending is empty.
+      - Pending is empty: a non-nil `[]Notification{}` (assert `!= nil` and `len == 0`).
     - `TestTakeNotificationsCap`: add 105; the first take returns 100 (ids 1–100), the second 5.
     - `TestNotificationsPruned`:
       - Add one with `CreatedAt = now-31d`, then one with `CreatedAt = now`.
@@ -806,7 +820,7 @@ CREATE INDEX notifications_pending ON notifications(taken_at, id);
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/catalog/
+git add internal/catalog/ internal/indexer/backup_test.go
 git commit -m "Add catalog schema 4 with a notifications queue for the Unraid host
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -837,6 +851,7 @@ type Config struct {
 	DB      *catalog.DB
 	Archive func() indexer.Status                           // nil: no archive notices
 	Staging func(context.Context) (staging.Listing, error)  // nil: no stale-staging notice
+	StagingReady func() bool                                // the startup staging reconcile has finished; nil: always ready
 	Now     func() time.Time                                // nil: time.Now
 	Log     *slog.Logger                                    // nil: slog.Default()
 	Every   time.Duration                                   // 0: CheckEvery
@@ -873,7 +888,12 @@ func (s *Service) Take(ctx context.Context) ([]catalog.Notification, error)    /
     - 3 folders → `a, b and c`
     - 7 folders → `…: f1, f2, f3, f4, f5 and 2 more.`
     - ordering by `AgeDays` descending, then name
-    - a 1500-byte message is cut to ≤ 1000 bytes and ends with `…`
+  - `TestCheckArchiveNoRepeatWrites`:
+    - A backup failure stays in the status. After the first check queues it, ten more checks make no `add` call (count them through an unexported counter in `add`).
+    - A new `Service` makes one `add` (it finds the key stored), then none.
+  - `TestCheckStagingWaitsForRescan`:
+    - At 09:00, `StagingReady` returns false → Staging is not called, and no day is marked done.
+    - Once it returns true (09:01) → the check runs.
   - `TestCheckStagingErrorRetriesHourly`:
     - Staging returns an error at 09:00 → no notice, and it is logged.
     - At 09:30 → not called. At 10:00 → called again, succeeds, and the notice is queued.
@@ -894,11 +914,24 @@ func (s *Service) checkArchive(ctx context.Context) {
 	}
 	st, now := s.cfg.Archive(), s.now()
 	if b := st.LastBackup; b != nil && b.Error != "" && fresh(now, b.At) {
-		s.add(ctx, "backup:"+b.At.UTC().Format(time.RFC3339Nano), catalog.NoticeAlert,
+		s.addOnce(ctx, "backup:"+b.At.UTC().Format(time.RFC3339Nano), catalog.NoticeAlert,
 			"Nightly catalog backup failed: "+strings.TrimRight(b.Error, ". ")+". Older backups were kept.")
 	}
 	if l := st.Last; l != nil && l.Missing > 0 && fresh(now, l.FinishedAt) {
-		s.add(ctx, "missing:"+l.FinishedAt.UTC().Format(time.RFC3339Nano), catalog.NoticeAlert, missingText(l.Missing))
+		s.addOnce(ctx, "missing:"+l.FinishedAt.UTC().Format(time.RFC3339Nano), catalog.NoticeAlert, missingText(l.Missing))
+	}
+}
+
+// addOnce adds a notice unless this service already stored or found its
+// key, so an event that stays in the status doesn't cost a write
+// transaction every 30 s (PF13). add logs a failure, and the next check
+// retries it.
+func (s *Service) addOnce(ctx context.Context, key, level, msg string) {
+	if s.known[key] {
+		return
+	}
+	if err := s.add(ctx, key, level, msg); err == nil {
+		s.known[key] = true
 	}
 }
 
@@ -915,6 +948,9 @@ func (s *Service) checkStaging(ctx context.Context) {
 	due := time.Date(y, m, d, int(StagingCheckAt/time.Hour), int(StagingCheckAt%time.Hour/time.Minute), 0, 0, now.Location())
 	if day == s.stagingDay || now.Before(due) || now.Before(s.stagingRetry) {
 		return
+	}
+	if s.cfg.StagingReady != nil && !s.cfg.StagingReady() {
+		return // the startup reconcile may still adopt folders (PF21)
 	}
 	key := "staging:" + day
 	has, err := s.cfg.DB.HasNotification(ctx, key)
@@ -953,8 +989,8 @@ func (s *Service) retryStaging(now time.Time, err error) {
 }
 ```
 
-  - `stagingDay` and `stagingRetry` are touched only by the loop goroutine (and by tests calling `check`), so they need no lock.
-  - `add` sanitises the message (control characters → spaces, trimmed, at most 1000 bytes). It calls `AddNotification` with `CreatedAt: s.now()`, logs `notice queued` (keys `key`, `level`) when added, and logs and returns any error.
+  - `stagingDay`, `stagingRetry` and `known` are touched only by the loop goroutine (and by tests calling `check`), so they need no lock. `known` is a `map[string]bool` holding a few keys a day; entries older than `MaxAge` may be dropped.
+  - `add` calls `AddNotification` with `CreatedAt: s.now()`; `AddNotification` sanitises the message (Task 5). `add` logs `notice queued` (keys `key`, `level`) when added, logs and returns any error, and increments an unexported counter the tests read.
   - `staleText` sorts a copy of the folders by `AgeDays` descending, then by name, and builds the Global Constraints text.
   - `Start` adds to a `sync.WaitGroup` under the mutex, the same way the indexer does, and runs `check(ctx)` at once and then on a `time.Ticker`. `Close` sets `closed`, cancels and waits.
 - [ ] **Step 4: Run**: `go test ./internal/notices/` and the race command → PASS; `go list -f '{{join .Imports "\n"}}' ./internal/notices/ | grep -E 'internal/(api|ingest)'` prints nothing; `gofmt -l .`, `go vet ./...`, `go test ./...` → PASS.
@@ -990,10 +1026,10 @@ Suggested implementer: sonnet (opus reviewer: quoting, escaping, failure paths).
     - The script runs with `exec.CommandContext` (30 s) and an **explicit** env:
       - `PATH=<stubs>:<os PATH>`, `SD2NAS_CONF=<tmp>/none.cfg`, `SD2NAS_NOTIFY=<stubs>/notify`, `SD2NAS_TEST_CALLS`;
       - defaults `ACTION=ADD`, `DEVICE=/dev/sdz1`, `LABEL=SONY_A7IV`, `SERIAL=reader`, `MOUNTPOINT=/mnt/disks/SONY_A7IV`, `SD2NAS_URL=<server>`;
-      - overridden by `env`.
+      - overridden by `env`. An empty value in `env` removes that key from the environment.
     - The script must exit 0. It returns the calls; a helper filters them by name.
     - The fake SD2NAS is an `httptest.Server` that records each request (method, path, raw query, headers, body) and answers per test.
-  - `TestScriptSyntax`: `bash -n deploy/unassigned-devices.sh` succeeds.
+  - `TestScriptSyntax`: `bash -n unassigned-devices.sh` succeeds (the test's working directory is `deploy/`).
   - `TestScriptImportsAndUnmounts`:
     - Ingest replies 200 `normal\nSONY_A7IV: 2 new, 0 already known. Card safe to format.\n`. Take replies 200 `warning\n2 folders have been in Staging for 30 days or more: B and A.\nalert\nNightly catalog backup failed: x. Older backups were kept.\n`.
     - **Requests, in order:**
@@ -1005,7 +1041,10 @@ Suggested implementer: sonnet (opus reviewer: quoting, escaping, failure paths).
       3. `notify -e SD2NAS -s SD2NAS -d "SONY_A7IV: 2 new, 0 already known. Card safe to format." -i normal`;
       4. `notify` … `-i warning`;
       5. `notify` … `-i alert`, each with the exact message.
-  - `TestScriptEscapesLabel`: `LABEL` = `a"b\c<TAB>d<LF>e` and `MOUNTPOINT=/mnt/disks/we"ird\` → the body is valid JSON, with label `a"b\c d e` and path `/cards/we"ird\`.
+  - `TestScriptEscapesLabel`:
+    - `LABEL` = `a"b\c&d<TAB>e<LF>f\` and `MOUNTPOINT=/mnt/disks/we"ird&\`.
+    - The body is valid JSON (decoded with `DisallowUnknownFields`), with label `a"b\c&d e f\` and path `/cards/we"ird&\`.
+    - This covers `"`, `\`, a trailing `\`, `&` (bash 5.2's `patsub_replacement`) and control characters.
   - `TestScriptRefused`: ingest replies 507 `alert\nSONY_A7IV: not imported, staging would drop below the 50.0 GB free-space reserve (…). Card left mounted.\n` → no `rc.unassigned`, and `notify … -d <that message> -i alert`.
   - `TestScriptNotSD2NASReply`:
     - 404 `{"error":"not found"}` → `SD2NAS could not import SONY_A7IV (HTTP 404). Card left mounted. Check SD2NAS.` (alert), no unmount.
@@ -1018,12 +1057,12 @@ Suggested implementer: sonnet (opus reviewer: quoting, escaping, failure paths).
   - `TestScriptNoMountPoint`: `MOUNTPOINT=""` → `Unassigned Devices gave no mount point for /dev/sdz1, so the card was not imported.` (alert), and no ingest request.
   - `TestScriptOtherActions`:
     - `UNMOUNT`, `REMOVE`, `ERROR_UNMOUNT` and `""` → no requests and no calls.
-    - `ERROR_MOUNT` → only `notify … -d "Unassigned Devices could not mount the card in /dev/sdz1, so it was not imported." -i alert`.
+    - `ERROR_MOUNT` → no requests, and the only call other than `logger` is `notify … -d "Unassigned Devices could not mount the card in /dev/sdz1, so it was not imported." -i alert`.
   - `TestScriptNotifyAction`:
     - `ACTION=NOTIFY` → only the take request. An empty 200 body → no `notify`.
     - A body `loud\nx\n` → no `notify`, and a `logger` call containing `ignored a notice`.
     - A take answering 503 → only a `logger` call containing `HTTP 503`.
-  - `TestScriptConfigFileAndToken`: `SD2NAS_CONF` points to a file containing `SD2NAS_URL=<server>` and `SD2NAS_TOKEN=abc`, and the env has no `SD2NAS_URL` → both requests carry `Authorization: Bearer abc`.
+  - `TestScriptConfigFileAndToken`: `SD2NAS_CONF` points to a file containing `SD2NAS_URL=<server>` and `SD2NAS_TOKEN=abc`, and `env` sets `SD2NAS_URL: ""` (removing it) → both requests carry `Authorization: Bearer abc`.
 - [ ] **Step 2: Run and confirm they fail** (the script doesn't exist): Linux command, or `go test ./deploy/` in Docker.
 - [ ] **Step 3: Write `deploy/unassigned-devices.sh`** exactly. It is LF and executable (`git add --chmod=+x`).
 
@@ -1061,15 +1100,16 @@ log() {
 # notify LEVEL TEXT: an Unraid notification, plus a syslog line.
 notify() {
 	log "$1: $2"
-	if ! "$SD2NAS_NOTIFY" -e "SD2NAS" -s "SD2NAS" -d "$2" -i "$1"; then
+	if ! "$SD2NAS_NOTIFY" -e "SD2NAS" -s "SD2NAS" -d "$2" -i "$1" </dev/null; then
 		log "the notification above could not be sent"
 	fi
 }
 
 # json_string TEXT: TEXT as a JSON string; control characters become spaces.
 json_string() {
-	local s=${1//\\/\\\\}
-	s=${s//\"/\\\"}
+	local bs='\' q='"' s=$1
+	s=${s//"$bs"/"$bs$bs"}
+	s=${s//"$q"/"$bs$q"}
 	s=${s//[[:cntrl:]]/ }
 	printf '"%s"' "$s"
 }
@@ -1088,7 +1128,7 @@ post() {
 		-X POST -H "X-SD2NAS: 1" -H "Content-Type: application/json" "${auth[@]}" \
 		--data-binary "$3" "$SD2NAS_URL$1")
 	rc=$?
-	BODY=$(cat "$tmp")
+	BODY=$(<"$tmp")
 	rm -f "$tmp"
 	return "$rc"
 }
@@ -1204,7 +1244,7 @@ Suggested implementer: sonnet.
 
 **Files:**
 - Create: `internal/api/notifications.go`, `internal/api/notifications_test.go`
-- Modify: `internal/api/ingestfeed.go` (add `SubmitIngest`), `internal/api/ingest_test.go` or a new `internal/api/submit_test.go`
+- Modify: `internal/api/ingestfeed.go` (add `SubmitIngest`), `internal/api/ingest.go` (`post` uses `SubmitIngest`; the `DefaultMaxWait` comment), `internal/api/ingest_test.go` or a new `internal/api/submit_test.go`
 
 **Interfaces:**
 - Consumes: `notices.Service` (`Pending`, `Take`, `Close`, `ErrClosed`), `writeJSON`, `writeError`, `writeFail`, `wantsText`, `s.feed`.
@@ -1234,7 +1274,8 @@ func (s *Server) SubmitIngest(ctx context.Context, req ingest.Request) (*ingest.
   - `TestSubmitIngestWatched`:
     - Build a minimal ingest server: `s := New("test", nil); s.feedInterval = time.Hour; s.MountIngest(m, db, time.Minute)` over a started manager and a copy of the SONY card (as `newFullServer` builds them). The feed's loop then never ticks during the test, so only manual ticks run.
     - Register a finished hook (`s.addFinishedHook`) that records rows.
-    - `j, err := f.s.SubmitIngest(ctx, ingest.Request{Path: f.card})`, then wait for `<-j.Done()`, then call `f.s.feed.tick()` once → the hook saw `j.ID()`.
+    - `card` comes from `mediatest.CopyCard(filepath.Join("..", "..", "testdata"), "SONY_A7IV", cards)`, with the manager built over `cards` as `newFullServer` builds it.
+    - `j, err := s.SubmitIngest(ctx, ingest.Request{Path: card})`, then wait for `<-j.Done()`, then call `s.feed.tick()` once → the hook saw `j.ID()`.
     - Without the `watch` in `SubmitIngest` the job, never seen running by a tick, would get no `ingest.finished`; this test pins that.
   - `TestSubmitIngestWithoutMount`: `New("test", nil).SubmitIngest(...)` → an error, and no panic.
 - [ ] **Step 2: Run and confirm they fail**: `go test ./internal/api/ -run 'Notifications|SubmitIngest' -v`.
@@ -1254,13 +1295,20 @@ func (s *Server) SubmitIngest(ctx context.Context, req ingest.Request) (*ingest.
 }
 ```
 
+  - **`ingest.go` (PF18):**
+    - `ingestHandlers` gets a field `submit func(context.Context, ingest.Request) (*ingest.Job, error)`, set to `s.SubmitIngest` in `MountIngest`.
+    - `post` calls `h.submit(r.Context(), …)` instead of `h.m.Submit` followed by `h.feed.watch`, so submit-and-watch lives in one place. Its error handling is unchanged.
+    - The existing ingest API tests must still pass unchanged.
+  - **`ingest.go` (PF11):** the `DefaultMaxWait` comment becomes `// DefaultMaxWait is the ?wait=1 ceiling. The card script's curl --max-time 7260 waits 60 s longer, so this reply reaches it first.`
+
   Handlers in `notifications.go`:
   - **`pending`:** `n.Pending(r.Context())`, then `writeJSON(200, map[string]any{"pending": list})`.
   - **`take`:** `n.Take(r.Context())`.
     - JSON → `{"notifications": list}`.
     - Text → set the headers, `WriteHeader(200)`, then `fmt.Fprintf(w, "%s\n%s\n", n.Level, n.Message)` per notice.
   - **Errors:** `notices.ErrClosed` → `writeFail(w, r, 503, "SD2NAS is shutting down")`. Anything else → log (`take notices` / `list notices`, key `err`) and `writeFail(w, r, 500, err.Error())`. `writeFail` gives JSON unless `?format=text`.
-  - `s.closers = append(s.closers, n.Close)`.
+  - `s.closers = append([]func(){n.Close}, s.closers...)` (PF16). Notices close **first**, before the staging service and the indexer that `MountStaging`/`MountArchive` registered earlier, so a late tick never reads a closed service.
+  - Test `TestNotificationsCloseFirst`: append a test closer that records the order before calling `MountNotifications`; `s.Close()` runs `n.Close` first (check that `Take` already returns `ErrClosed` inside the test closer).
 - [ ] **Step 4: Run**: `go test ./internal/api/` and the race command → PASS; `gofmt -l .`, `go vet ./...`, `go test ./...` → PASS.
 - [ ] **Step 5: Commit**
 
@@ -1341,7 +1389,7 @@ func (w *Watcher) Close() // stops and waits; safe twice
     - Register the flag with `fs.BoolVar(&c.PollCards, "poll-cards", c.PollCards, "import cards that appear under the cards folder without the host script (env SD2NAS_POLL_CARDS)")`.
     - The env must be parsed **before** `fs.Parse`, so the flag overrides it.
   - **`mount_unix.go`** (`//go:build linux || darwin`): `isMount(dir, root string) (bool, error)` compares `syscall.Stat_t.Dev` of the two.
-  - **`mount_other.go`:** returns `true, nil`; non-Linux hosts can't tell, so they rely on the `DCIM`/`PRIVATE` rule.
+  - **`mount_other.go`** (`//go:build !linux && !darwin`): returns `true, nil`. Those hosts can't tell, so they rely on the `DCIM`/`PRIVATE` rule.
   - **The tick**, which pins the behaviour:
 
 ```go
@@ -1439,7 +1487,7 @@ Suggested implementer: sonnet.
 - Modify: `cmd/sd2nas/main.go`
 
 **Interfaces:**
-- Consumes: `notices.New/Start`, `srv.MountNotifications`, `srv.SubmitIngest`, `cardwatch.New/Start/Close`, `cfg.PollCards`, `idx.Status`, `svc.List`.
+- Consumes: `notices.New/Start`, `srv.MountNotifications`, `srv.SubmitIngest`, `cardwatch.New/Start/Close`, `cfg.PollCards`, `idx.Status`, `svc.List`, `svc.Status`.
 - Produces: no exports.
 
 - [ ] **Step 1: Implement.**
@@ -1448,7 +1496,8 @@ Suggested implementer: sonnet.
   - Inside the catalog-open `else` block, after the indexer block and before `svc.StartRescan()`:
 
 ```go
-		ncfg := notices.Config{DB: db, Staging: svc.List, Log: log}
+		ncfg := notices.Config{DB: db, Staging: svc.List, Log: log,
+			StagingReady: func() bool { st := svc.Status(); return !st.Rescanning && st.LastRescan != nil }} // PF21
 		if idxErr == nil {
 			ncfg.Archive = idx.Status
 		}
@@ -1562,7 +1611,8 @@ Suggested implementer: sonnet.
   7. **Troubleshooting:**
      - `grep sd2nas /var/log/syslog` (the script logs every result there).
      - Open `/healthz`.
-     - A container that exits with code 3 found another SD2NAS using the same appdata folder (the log names it).
+     - A container that exits with code 3 found another SD2NAS using the same appdata folder. The log line names it: `/config is in use by another SD2NAS (pid … on … since …); stop it first`.
+     - With `--restart=unless-stopped`, Docker keeps restarting that container and the line repeats. That is harmless, but stop the duplicate container.
      - An import can be started by hand: `curl -s -X POST -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' 'http://localhost:<port>/api/ingest?wait=1&format=text' -d '{"path":"/cards/<folder under /mnt/disks>"}'`.
   8. **Development:** point to `docs/PLAN.md` §14 (`go run ./cmd/sd2nas --cards ./testdata/cards --photos ./tmp/photos --config ./tmp/config`, `npm run dev` in `web/`).
 - [ ] **Step 5: Run**: `go test ./deploy/` (Windows: the template test runs and the script tests skip) and the Linux command → PASS. No `xmllint` is needed, because the Go test parses the template.
@@ -1597,7 +1647,7 @@ Suggested implementer: sonnet (the image smoke run needs Docker).
        5. User Scripts: `SD2NAS notices`, Hourly, `ACTION=NOTIFY bash /boot/config/plugins/unassigned.devices/sd2nas.sh`. Run it once by hand; `grep sd2nas /var/log/syslog` shows no `could not fetch notices` line.
        6. Insert a real card → a Notice `<card>: N new, … Card safe to format.`, and the card is unmounted in Unassigned Devices. Reinsert it → `0 new, N already known. … Card safe to format.` Tick the end-to-end item with the date and counts.
        7. On that import's page, check the "not imported" list (`Thumbs.db`, `desktop.ini`, `.DSC`, `.SRT`, anything else) and tick the ignore-list item, noting the result.
-       8. Optional: `curl -s -X PUT -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' http://localhost:4040/api/settings -d '{"backup_dir":"/proc/sd2nas-test","archive_rescan_at":"<the next minute>"}'`. Wait 2 minutes and run the User Scripts entry → an Alert `Nightly catalog backup failed: …`. Then restore `backup_dir` to `""` and `archive_rescan_at` to `03:00`.
+       8. Optional: `curl -s -X PUT -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' http://localhost:4040/api/settings -d '{"backup_dir":"/proc/sd2nas-test","archive_rescan_at":"<the next minute>"}'`. At that minute SD2NAS runs its nightly sequence: the failing backup **and then an archive pass**. After the M5 backfill, that pass is a quick stat-only rescan. If the backfill hasn't run yet, this pass **is** the backfill (hours of array reads): let it run as the backfill, or Pause it from the Archive index page. Wait 2 minutes and run the User Scripts entry → an Alert `Nightly catalog backup failed: …`. Then restore `backup_dir` to `""` and `archive_rescan_at` to `03:00`.
   2. **§11:**
      - Replace the bash block with: ``The script is `deploy/unassigned-devices.sh` (README: install, `sd2nas.cfg`).``, followed by a bullet summary of Global Constraints' card-script behaviour: `SD2NAS_URL`; unmount only on 200; its own texts for no answer, timeout and a non-SD2NAS reply; `ERROR_MOUNT`; `ACTION=NOTIFY`; `--max-time 7260`.
      - Replace the **Fallback poller** paragraph with Decision 10's rules and the `SD2NAS_POLL_CARDS` switch.
@@ -1628,6 +1678,7 @@ Suggested implementer: sonnet (the image smoke run needs Docker).
        - Run it again → the message has `0 new, 2 already known` and ends `Card safe to format.`.
     4. **Backup-failure notice.**
        - `curl -s -X PUT -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' localhost:18080/api/settings -d '{"backup_dir":"/proc/sd2nas-test","archive_rescan_at":"<HH:MM of the next minute, America/Los_Angeles>"}'` → 200.
+       - This also starts an archive pass at that minute; the smoke `/photos` has no `Archive/`, so the pass is skipped at once.
        - Within 2 minutes, `GET /api/notifications` lists a `backup:` notice starting `Nightly catalog backup failed:`.
        - Run the script with `ACTION=NOTIFY` → `notify … -i alert` with that message, and a second `GET` shows `{"pending":[]}`.
     5. **Lock.**
