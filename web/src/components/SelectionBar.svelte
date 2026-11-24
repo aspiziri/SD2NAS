@@ -23,11 +23,15 @@
     background: var(--bg); padding: 10px 0; margin-bottom: 10px; border-bottom: 1px solid var(--accent); }
   .count { font-weight: 600; }
   .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* Phone: two rows (count, Select all, Clear / the actions, sharing the width),
+     so no action is ever scrolled out of sight. The bar is about 112 px tall;
+     app.css (body.selecting main) and Toast.svelte leave room for that. */
   @media (max-width: 760px) {
     .selbar { position: fixed; top: auto; left: 0; right: 0; bottom: calc(var(--tabbar) + env(safe-area-inset-bottom)); margin: 0;
       padding: 8px calc(12px + env(safe-area-inset-right)) 8px calc(12px + env(safe-area-inset-left));
-      background: var(--panel); border-top: 1px solid var(--accent); border-bottom: 0; flex-wrap: nowrap; overflow-x: auto; }
+      background: var(--panel); border-top: 1px solid var(--accent); border-bottom: 0; gap: 0 10px; }
     .spacer { display: none; }
-    .acts { flex-wrap: nowrap; }
+    .acts { flex: 1 0 100%; flex-wrap: nowrap; gap: 6px; }
+    .acts :global(.btn) { flex: 1 1 auto; min-width: 0; justify-content: center; padding-left: 8px; padding-right: 8px; }
   }
 </style>

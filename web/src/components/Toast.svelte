@@ -16,6 +16,6 @@
   .toast.warn { background: var(--warn); color: #1b1b1b; }
   .toast.bad { background: var(--bad); color: #fff; }
   @media (max-width: 760px) {
-    .toasts { bottom: calc(var(--tabbar) + 76px + env(safe-area-inset-bottom)); } /* above the tab bar and a selection bar */
+    .toasts { bottom: calc(var(--tabbar) + 116px + env(safe-area-inset-bottom)); } /* above the tab bar and a selection bar */
   }
 </style>

@@ -77,3 +77,15 @@ export function promoteSummary(job) {
   if (failed) return `${failed} of ${plural(n, 'folder', 'folders')} could not be promoted.`;
   return `Promoted ${plural(n, 'folder', 'folders')} (${plural(job.files_done, 'file', 'files')}) to the archive.`;
 }
+
+// The toast after a promote is enqueued. `before` is the queue as the page saw it
+// just before the request ({running, queued}); the response always says "queued"
+// (the worker has not started it yet), so only a job already running or waiting
+// ahead of it means a wait.
+export function promoteToast(job, before) {
+  const n = job.folders.length;
+  if (before?.running || before?.queued?.length) {
+    return `Queued: ${plural(n, 'folder waits', 'folders wait')} for the promote ahead of ${n === 1 ? 'it' : 'them'}.`;
+  }
+  return `Promoting ${plural(n, 'folder', 'folders')}…`;
+}

@@ -6,7 +6,7 @@
   import { formatBytes, formatCount, dateRange } from '../lib/format.js';
   import { clickAction, toggleKey, selectRange, prune, isTextEntry } from '../lib/selection.js';
   import { splitName, folderName, folderDate, earliestDate, checkTitle, promoteTarget, DEFAULT_PATTERN } from '../lib/naming.js';
-  import { describeError, rescanSummary, plural, promoteStates } from '../lib/messages.js';
+  import { describeError, rescanSummary, plural, promoteStates, promoteToast } from '../lib/messages.js';
   import { longPressSelect } from '../lib/press.js';
   import { toast } from '../lib/toast.svelte.js';
   import Thumb from '../components/Thumb.svelte';
@@ -253,10 +253,11 @@
   function doPromote() {
     const p = pattern.trim() || DEFAULT_PATTERN;
     run(async () => {
+      const before = live.promote; // the queue as it was, to tell whether anything is ahead
       const res = await api('/api/staging/promote', { method: 'POST', body: { ids: chosen.map((f) => f.id), pattern: p } });
       savePattern(p);
       clear();
-      if (res.job.state === 'queued') toast(`Queued: ${plural(res.job.folders.length, 'folder waits', 'folders wait')} for the promote ahead of ${res.job.folders.length === 1 ? 'it' : 'them'}.`);
+      toast(promoteToast(res.job, before));
       // Show the queue now; promote.progress events take over.
       live.promote = await api('/api/staging/promote');
     });

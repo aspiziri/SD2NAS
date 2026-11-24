@@ -20,6 +20,8 @@
   let busy = $state(false);
   let dialogError = $state('');
   let deleteFiles = $state(false); // Decision 10: starts unticked
+  // Deleting only means something while files are still in staging (the count can drop to 0 with the dialog open).
+  const del = $derived(deleteFiles && (forget?.staged ?? 0) > 0);
 
   // What forgetting would do; fetched after every successful load of a
   // finished import. A failure only hides the two actions: the page itself
@@ -51,11 +53,13 @@
 
   function doForget() {
     run(async () => {
-      const res = await api(`/api/ingest/${id}/forget`, { method: 'POST', body: { deleteFiles } });
+      const res = await api(`/api/ingest/${id}/forget`, { method: 'POST', body: { deleteFiles: del } });
       const r = res.result;
-      toast(deleteFiles
+      toast(del
         ? `Forgot this import and deleted ${plural(r.deleted_files, 'file', 'files')} from staging. The card imports them again next time.`
-        : `Forgot this import. Its files stay in staging untracked until the next import or rescan.`, 'ok', 7000);
+        : (forget?.staged ?? 0) > 0
+          ? `Forgot this import. Its files stay in staging untracked until the next import or rescan.`
+          : `Forgot this import. The card imports its culled files again next time.`, 'ok', 7000);
     });
   }
 
@@ -220,14 +224,16 @@
     {#if forget.staged}
       <label class="toggle"><input type="checkbox" bind:checked={deleteFiles} /> <span>Also delete the {plural(forget.staged, 'file', 'files')} still in staging</span></label>
     {/if}
-    <div class="note warn">{deleteFiles
+    <div class="note warn">{del
       ? 'The files are deleted from staging and SD2NAS forgets them. The next time this card goes in, they are imported again as new.'
-      : 'SD2NAS forgets these files. Their copies stay in staging, untracked, until the next import of this card or a rescan picks them up again.'}</div>
+      : forget.staged > 0
+        ? 'SD2NAS forgets these files. Their copies stay in staging, untracked, until the next import of this card or a rescan picks them up again.'
+        : 'Nothing of this import is left in staging. SD2NAS forgets its culled files, so the card brings them back the next time it goes in.'}</div>
   {/if}
   {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
   {#snippet actions()}
     <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
-    <button class="btn bad" onclick={doForget} disabled={busy}>{busy ? 'Forgetting…' : deleteFiles ? `Forget and delete ${plural(forget?.staged ?? 0, 'file', 'files')}` : 'Forget'}</button>
+    <button class="btn bad" onclick={doForget} disabled={busy}>{busy ? 'Forgetting…' : del ? `Forget and delete ${plural(forget?.staged ?? 0, 'file', 'files')}` : 'Forget'}</button>
   {/snippet}
 </Dialog>
 

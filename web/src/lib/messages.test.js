@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { plural, joinList, describeError, rescanSummary, promoteSummary, promoteStates } from './messages.js';
+import { plural, joinList, describeError, rescanSummary, promoteSummary, promoteToast, promoteStates } from './messages.js';
 import { ApiError } from './api.js';
 
 const scan = (o) => ({ adopted_folders: 0, added_files: 0, moved_files: 0, restored_files: 0, culled_files: 0, removed_folders: 0,
@@ -79,4 +79,13 @@ test('promoteStates marks the folders of the running job and the queue', () => {
   assert.deepEqual(m.get(11), { job: 1, state: 'moving', cancellable: false });
   assert.deepEqual(m.get(12), { job: 1, state: 'waiting', cancellable: false });
   assert.deepEqual(m.get(20), { job: 2, state: 'waiting', cancellable: true });
+});
+
+test('promoteToast', () => {
+  const one = { folders: [{}] };
+  const two = { folders: [{}, {}] };
+  assert.equal(promoteToast(one, { running: null, queued: [], last: null }), 'Promoting 1 folder…');
+  assert.equal(promoteToast(two, undefined), 'Promoting 2 folders…');
+  assert.equal(promoteToast(one, { running: { id: 1 }, queued: [] }), 'Queued: 1 folder waits for the promote ahead of it.');
+  assert.equal(promoteToast(two, { running: null, queued: [{ id: 1 }] }), 'Queued: 2 folders wait for the promote ahead of them.');
 });

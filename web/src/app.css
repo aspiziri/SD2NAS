@@ -76,5 +76,5 @@ label.f { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 12
 /* While the phone selection bar shows (SelectionBar), the page ends below it.
    This beats App.svelte's scoped main padding on specificity. */
 @media (max-width: 760px) {
-  body.selecting main { padding-bottom: calc(var(--tabbar) + 88px + env(safe-area-inset-bottom)); }
+  body.selecting main { padding-bottom: calc(var(--tabbar) + 128px + env(safe-area-inset-bottom)); }
 }
