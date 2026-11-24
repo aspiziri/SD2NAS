@@ -213,3 +213,79 @@ func TestLocksConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestNameHeld(t *testing.T) {
+	l := NewLocks()
+	const trip = "Archive/2025/05/2025-05-30 - Trip"
+	release, err := l.TryLockSet(HolderPromote, LockSet{IDs: []int64{7}, Names: []string{trip}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{
+		"archive/2025/05/2025-05-30 - TRIP",
+		trip + "/Capture/x.ARW",
+		trip,
+		"/" + trip + "/",
+	} {
+		if !l.NameHeld(rel) {
+			t.Errorf("NameHeld(%q) = false, want true", rel)
+		}
+	}
+	for _, rel := range []string{
+		"",
+		"Archive",
+		"Archive/2025/05",
+		"Archive/2025/05/2025-05-30 - Trip2",
+		"Staging/2025-05-30 - Trip",
+	} {
+		if l.NameHeld(rel) {
+			t.Errorf("NameHeld(%q) = true, want false", rel)
+		}
+	}
+	release()
+	if l.NameHeld(trip) {
+		t.Error("NameHeld after release = true, want false")
+	}
+
+	idsOnly, err := l.TryLockSet(HolderOperation, LockSet{IDs: []int64{9}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idsOnly()
+	for _, rel := range []string{trip, "Archive", "9", "Staging/9"} {
+		if l.NameHeld(rel) {
+			t.Errorf("NameHeld(%q) with only an id lock = true, want false", rel)
+		}
+	}
+}
+
+func TestNameHeldConcurrent(t *testing.T) {
+	l := NewLocks()
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			rel, err := l.TryLockSet(HolderPromote, LockSet{Names: []string{"Archive/2025/05/Trip"}})
+			if err != nil {
+				t.Error(err)
+				break
+			}
+			rel()
+		}
+		close(stop)
+	}()
+	for done := false; !done; {
+		select {
+		case <-stop:
+			done = true
+		default:
+			l.NameHeld("archive/2025/05/trip/Capture/x.ARW")
+		}
+	}
+	wg.Wait()
+	if l.NameHeld("Archive/2025/05/Trip") {
+		t.Error("still held after every release")
+	}
+}

@@ -183,3 +183,25 @@ func (l *Locks) Lock(ctx context.Context, h Holder, id int64) (func(), error) {
 		}
 	}
 }
+
+// NameHeld reports whether directory name rel (a slash path below the
+// photos root) or one of its parent directories is locked as a name, e.g.
+// by a promote writing into Archive/<target>; folder-id locks don't count.
+// Case is ignored, like TryLockSet's name keys. The archive indexer skips
+// such directories (M5 Decision 12).
+func (l *Locks) NameHeld(rel string) bool {
+	k := strings.ToLower(strings.Trim(rel, "/"))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for k != "" {
+		if _, ok := l.held[lockKey{name: k}]; ok {
+			return true
+		}
+		i := strings.LastIndex(k, "/")
+		if i < 0 {
+			return false
+		}
+		k = k[:i]
+	}
+	return false
+}
