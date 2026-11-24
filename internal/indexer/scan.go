@@ -42,7 +42,19 @@ func (s *Service) beginPass(trigger string, full bool) time.Time {
 func (s *Service) runPass(ctx context.Context, trigger string, full bool) (ScanResult, error) {
 	started := s.beginPass(trigger, full)
 	dbctx := context.WithoutCancel(ctx)
-	id, err := s.db.StartArchiveScan(dbctx, trigger, time.Time{}, started) // a re-index takes effect in Task 10
+	// An unfinished re-index is continued whatever the trigger; checked_at has
+	// millisecond precision, so the cut-off does too.
+	rereadBefore, err := s.db.PendingReread(dbctx)
+	var id int64
+	if err == nil {
+		switch {
+		case !rereadBefore.IsZero():
+			full = true
+		case full:
+			rereadBefore = started.Truncate(time.Millisecond)
+		}
+		id, err = s.db.StartArchiveScan(dbctx, trigger, rereadBefore, started)
+	}
 	if err != nil {
 		s.mu.Lock()
 		s.status.Running = nil
@@ -50,10 +62,10 @@ func (s *Service) runPass(ctx context.Context, trigger string, full bool) (ScanR
 		s.mu.Unlock()
 		return ScanResult{}, err
 	}
-	s.progress(true, func(p *Progress) { p.Phase = PhaseListing })
+	s.progress(true, func(p *Progress) { p.Phase, p.Full = PhaseListing, full })
 
 	r := ScanResult{Trigger: trigger, Full: full, StartedAt: started, Errors: []string{}}
-	err = s.scanArchive(ctx, &r)
+	err = s.scanArchive(ctx, &r, rereadBefore)
 	r.FinishedAt = s.now()
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil && errors.Is(err, cerr) {
@@ -73,7 +85,11 @@ func (s *Service) runPass(ctx context.Context, trigger string, full bool) (ScanR
 	if cerr := s.refreshCounts(dbctx); cerr != nil {
 		err = errors.Join(err, cerr)
 	}
+	if cerr := s.refreshPendingFull(dbctx); cerr != nil {
+		err = errors.Join(err, cerr)
+	}
 	s.mu.Lock()
+	s.userPaused = false
 	last := r
 	last.log = nil
 	s.status.Last = &last
@@ -90,7 +106,7 @@ func (s *Service) runPass(ctx context.Context, trigger string, full bool) (ScanR
 }
 
 // scanArchive reads the settings once, builds the scan and runs it.
-func (s *Service) scanArchive(ctx context.Context, r *ScanResult) error {
+func (s *Service) scanArchive(ctx context.Context, r *ScanResult, rereadBefore time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -102,6 +118,7 @@ func (s *Service) scanArchive(ctx context.Context, r *ScanResult) error {
 	if err != nil {
 		return err
 	}
+	sc.rereadBefore = rereadBefore
 	return sc.run()
 }
 
@@ -111,7 +128,9 @@ func (sc *scan) abs(rel string) string {
 
 // mustReread reports whether a file last read at checkedAt is due for a
 // re-read whatever its size and time say (a re-index).
-func (sc *scan) mustReread(checkedAt time.Time) bool { return false }
+func (sc *scan) mustReread(checkedAt time.Time) bool {
+	return !sc.rereadBefore.IsZero() && checkedAt.Before(sc.rereadBefore)
+}
 
 // reindex reports a re-index pass: a file never read before must be read
 // in full, so no move is taken on its fingerprint alone.
@@ -154,9 +173,6 @@ func (sc *scan) hasCopy(sha string) bool {
 	_, ok := sc.seenCopies[sha]
 	return ok
 }
-
-// wait blocks while an import or promote runs, and ends with the context.
-func (sc *scan) wait() error { return sc.ctx.Err() }
 
 // before runs the test hook ahead of touching a file, then checks for a stop.
 func (sc *scan) before(rel string) error {
@@ -578,6 +594,8 @@ func (sc *scan) resolve(f file) error {
 		if err == nil {
 			if _, had := sc.copies[f.rel]; !had {
 				sc.r.Copies++
+			} else {
+				sc.r.Unchanged++ // a known copy read again (a re-index)
 			}
 			sc.keepCopy[f.rel] = true
 			sc.seenCopies[a.SHA256] = c

@@ -94,13 +94,14 @@ func (r *ScanResult) finalError(msg string) {
 }
 
 // Status is the indexer.progress event data (Decision 19). Task 11 adds
-// LastBackup, BackingUp and NextScan; Task 10 adds PendingFull.
+// LastBackup, BackingUp and NextScan.
 type Status struct {
-	Version uint64      `json:"version"` // bumps after each pass, backup, accept and settings change
-	Running *Progress   `json:"running"` // nil when no pass runs
-	Last    *ScanResult `json:"last"`    // the last finished pass; nil before the first
-	Changed int         `json:"changed"` // "changed since indexed" entries
-	Missing int         `json:"missing"` // missing assets
+	Version     uint64      `json:"version"`      // bumps after each pass, backup, accept and settings change
+	Running     *Progress   `json:"running"`      // nil when no pass runs
+	Last        *ScanResult `json:"last"`         // the last finished pass; nil before the first
+	PendingFull bool        `json:"pending_full"` // a re-index didn't finish; the next pass continues it
+	Changed     int         `json:"changed"`      // "changed since indexed" entries
+	Missing     int         `json:"missing"`      // missing assets
 }
 
 // Progress is a running pass.
@@ -116,7 +117,7 @@ type Progress struct {
 	BytesHashed int64     `json:"bytes_hashed"`
 	Folder      string    `json:"folder"`    // the session folder being listed or read
 	Current     string    `json:"current"`   // the file being read; "" while listing or checking
-	PausedBy    string    `json:"paused_by"` // "" | "user" | "busy" (Task 10)
+	PausedBy    string    `json:"paused_by"` // "" | "user" (Pause) | "busy" (an import or promote runs)
 }
 
 // publishEvery is the shortest gap between unforced progress frames (<= 4/s).
@@ -150,11 +151,15 @@ type Service struct {
 
 	// mu guards closed and the status. notify runs under it and only
 	// publishes: never call a Service method from it.
-	mu      sync.Mutex
-	closed  bool
-	status  Status
-	notify  func(Status)
-	lastPub time.Time // real clock
+	mu         sync.Mutex
+	closed     bool
+	status     Status
+	notify     func(Status)
+	lastPub    time.Time // real clock
+	userPaused bool      // the owner paused the running pass; reset when a pass ends
+
+	wake      chan struct{} // Resume wakes a waiting pass (buffer 1)
+	idleEvery time.Duration // how often a waiting pass looks at busy again
 }
 
 // New builds the service. It starts nothing yet.
@@ -170,6 +175,8 @@ func New(cfg Config) (*Service, error) {
 		now: cfg.Now, log: cfg.Log, rules: media.DefaultRules(),
 		readDir:     os.ReadDir,
 		fingerprint: media.QuickFingerprint,
+		wake:        make(chan struct{}, 1),
+		idleEvery:   2 * time.Second,
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -221,7 +228,22 @@ func (s *Service) loadState(ctx context.Context) error {
 			s.status.Last = &r
 		}
 	}
+	if err := s.refreshPendingFull(ctx); err != nil {
+		return err
+	}
 	return s.refreshCounts(ctx)
+}
+
+// refreshPendingFull reloads PendingFull. Call it without s.mu.
+func (s *Service) refreshPendingFull(ctx context.Context) error {
+	t, err := s.db.PendingReread(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.status.PendingFull = !t.IsZero()
+	s.mu.Unlock()
+	return nil
 }
 
 // refreshCounts reloads Changed and Missing. Call it without s.mu.
@@ -289,7 +311,7 @@ func (s *Service) progress(force bool, fn func(*Progress)) {
 }
 
 // StartRescan starts a manual pass in the background. It is false when a
-// pass is running or the service is closed (full takes effect in Task 10).
+// pass is running or the service is closed. full asks for a re-index (Decision 22).
 func (s *Service) StartRescan(full bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -315,7 +337,7 @@ var ErrClosed = errors.New("indexer: shutting down")
 // Rescan runs one pass now and waits for it (tests); it waits for a pass
 // that is already running, stops when ctx or Close does, and is ErrClosed
 // after Close. err is non-nil only for catalog failures; cancellation sets
-// Stopped. full asks for a re-index; it has no effect until Task 10.
+// Stopped. full asks for a re-index (Decision 22).
 func (s *Service) Rescan(ctx context.Context, trigger string, full bool) (ScanResult, error) {
 	s.mu.Lock()
 	if s.closed {

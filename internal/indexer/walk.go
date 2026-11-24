@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/media"
@@ -116,7 +117,9 @@ type scan struct {
 	r       *ScanResult
 	skip    skipRules
 	skipped map[string]bool // rels the listing didn't read: held, unreadable
-	fresh   []file
+
+	rereadBefore time.Time // zero: a normal pass; else files read before it are read again (a re-index)
+	fresh        []file
 
 	dbctx      context.Context                 // context.WithoutCancel(ctx): what was read is recorded
 	byPath     map[string]catalog.ArchiveEntry // archived rows
@@ -156,6 +159,11 @@ func (sc *scan) walk(dir, rel string, depth int) error {
 	if depth > 0 {
 		if err := sc.ctx.Err(); err != nil {
 			return err
+		}
+		if depth == 1 {
+			if err := sc.wait(); err != nil { // pause between session folders
+				return err
+			}
 		}
 		if sc.s.held(rel) {
 			sc.skipped[rel] = true
