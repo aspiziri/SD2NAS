@@ -114,13 +114,13 @@ neither imports nor ignores, turn it into a warning instead.
   if the share would drop below a reserve (default 50 GB). The card stays
   mounted and a notification explains why.
 - Staging shows a warning banner, plus a daily notification, when a folder has
-  been in staging longer than 30 days. The threshold is a setting. It is `staging_warn_days` (default 30, 0 turns it off); the daily notification comes with M6's card script.
+  been in staging longer than 30 days. The threshold is a setting. It is `staging_warn_days` (default 30, 0 turns it off); SD2NAS queues a notice once a day after 09:00 (container time) listing the stale folders; the card script delivers it (§11).
 
 **Catalog backup:** the database is the only record of what you culled, and
 that can't be rebuilt from the archive. Nightly, just before the rescan (so a paused scan can't hold it up), SD2NAS writes
 `VACUUM INTO /photos/Management/SD2NAS/catalog-YYYY-MM-DD.db` and keeps the
 last 14, next to the existing `Management/immich`. It sits outside `Archive/`,
-so neither the indexer nor Capture One sees it. The folder is a setting. It is `backup_dir` (empty = `/photos/Management/SD2NAS`; never inside `Archive/` or `Staging/`); a failed backup is shown on the Archive index page and deletes nothing. This is
+so neither the indexer nor Capture One sees it. The folder is a setting. It is `backup_dir` (empty = `/photos/Management/SD2NAS`; never inside `Archive/` or `Staging/`); a failed backup is shown on the Archive index page and deletes nothing. A failed backup also queues an Unraid notification. This is
 on top of the Appdata Backup plugin.
 
 ---
@@ -268,7 +268,7 @@ identical first and last 64 KB is a safe match for camera files. A
 path, new hash), it stores the new hash and keeps the old one in `aliases` and
 the old fingerprint in `fingerprints`. The untouched original on the card still
 matches.
-Schema version 3 adds the `missing` ingest outcome (`ingests.missing`), `archive_copies` (other archive paths holding an asset's content), `archive_changes` ("changed since indexed"), `archive_scans` (the indexer's passes and backups), and `assets.checked_at` / `promoted_at`. A change in place moves the old fingerprints (their values are kept), aliases and ingest history to the new hash.
+Schema version 3 adds the `missing` ingest outcome (`ingests.missing`), `archive_copies` (other archive paths holding an asset's content), `archive_changes` ("changed since indexed"), `archive_scans` (the indexer's passes and backups), and `assets.checked_at` / `promoted_at`. A change in place moves the old fingerprints (their values are kept), aliases and ingest history to the new hash. Schema version 4 adds `notifications` (the notices queue: unique key, taken_at).
 
 **Culled stays remembered:** culling or discarding deletes the file and sets
 `state = culled`, `rel_path = NULL`. The row and fingerprint stay, so it's
@@ -469,6 +469,8 @@ POST   /api/archive/changed/accept
 
 GET    /api/settings
 PUT    /api/settings
+GET    /api/notifications                notices waiting for the card script (M6)
+POST   /api/notifications/take           hand them out once; ?format=text for the script
 GET    /healthz
 ```
 
@@ -495,44 +497,43 @@ Devices with **Automount: on**, **Read Only: on**, **Share: off** and **Run
 Device Script File in the background: Yes** (the script blocks until the import
 finishes, which can take a long time).
 
-```bash
-#!/bin/bash
-# Unassigned Devices passes ACTION, DEVICE, LABEL, SERIAL, MOUNTPOINT
-PORT=8080
-TOKEN=""   # set if SD2NAS_TOKEN is configured on the container
-case "$ACTION" in
-  ADD)
-    # SERIAL is the reader's serial, identical for every card, so identify the
-    # card by its filesystem UUID instead (changes when the card is formatted)
-    UUID=$(blkid -s UUID -o value "$DEVICE")
-    # format=text returns two lines: level (normal|warning) and message,
-    # so the script doesn't depend on jq being installed on the host
-    if RESULT=$(curl -fsS --max-time 7200 -X POST \
-        "http://localhost:$PORT/api/ingest?wait=1&format=text" \
-        -H "Content-Type: application/json" -H "X-SD2NAS: 1" \
-        ${TOKEN:+-H "Authorization: Bearer $TOKEN"} \
-        -d "{\"path\":\"/cards/$(basename "$MOUNTPOINT")\",\"label\":\"$LABEL\",\"uuid\":\"$UUID\"}"); then
-      LEVEL=$(echo "$RESULT" | sed -n 1p)
-      MSG=$(echo "$RESULT" | sed -n 2p)
-      /usr/local/sbin/rc.unassigned umount "$DEVICE"
-    else
-      # Container down, ingest refused or errored: leave the card mounted so it can be retried
-      LEVEL="alert"
-      MSG="Ingest of $LABEL failed. Card left mounted. Check SD2NAS."
-    fi
-    /usr/local/emhttp/webGui/scripts/notify -s "SD2NAS" -d "$MSG" -i "$LEVEL"
-    ;;
-esac
-```
+The script is `deploy/unassigned-devices.sh` (README: install, `sd2nas.cfg`).
+Unassigned Devices passes `ACTION`, `DEVICE`, `LABEL`, `SERIAL` and
+`MOUNTPOINT`. The card is identified by its filesystem UUID (`blkid`), because
+`SERIAL` is the reader's. What it does:
+
+- Settings come from `sd2nas.cfg` next to it (`SD2NAS_CONF`): `SD2NAS_URL`
+  (default `http://localhost:8080`), `SD2NAS_TOKEN`, `SD2NAS_NOTIFY`,
+  `SD2NAS_MAX_TIME`.
+- `ACTION=ADD` posts the card to `/api/ingest?wait=1&format=text` and unmounts
+  with `rc.unassigned umount` only when the reply is HTTP 200 with the two-line
+  text. It then delivers waiting notices.
+- No answer, a timeout (curl exit 28) and a reply that isn't SD2NAS's two lines
+  each get the script's own alert text, and the card stays mounted. If the
+  unmount fails, the notice gets a suffix telling you to unmount it by hand
+  (`normal` becomes `warning`).
+- `ACTION=ERROR_MOUNT` sends one alert; `ACTION=NOTIFY` only delivers notices
+  (for the hourly User Scripts entry); every other action does nothing. The
+  script always exits 0.
+- `--max-time 7260` sits 60 s past the server's own 2-hour wait, so the server's
+  reply wins.
 
 Unraid's built-in notifications are pushed to the phone by whatever agent is
 configured there (Pushover, ntfy, Telegram…), so SD2NAS doesn't need its own
 notification setup. Unmounting is done by the host script because a container
 can't unmount host drives without privileged mode.
 
-**Fallback poller** (setting, off by default): the container watches `/cards`
-for new mount points, for setups that don't want a host script. It can't
-unmount or notify through Unraid.
+**Fallback poller** (off by default; switched on with `SD2NAS_POLL_CARDS=true`
+or `--poll-cards`, not a catalog setting): for setups that don't want a host
+script. It can't unmount or notify through Unraid. It reads `/cards` every 5 s.
+- Entries present at its first read are never imported while they stay (`/cards`
+  is all of `/mnt/disks`, so permanently mounted disks sit next to cards).
+- A new entry is imported when it is a directory not starting with `.`, is a
+  mount point (a different device than `/cards`), has a top-level `DCIM` or
+  `PRIVATE` folder (any case), and has qualified for 10 s.
+- Each appearance is submitted once, whatever the result. An entry that
+  disappears and comes back counts as new, and so does one whose folder stays
+  but is definitely no longer a mount point. A failed mount check never re-arms.
 
 **Hardware test results** (M0, SanDisk PRO-READER dual SD/microSD):
 - The reader stays plugged in permanently. Inserting a card triggers `ADD`, and
@@ -626,13 +627,16 @@ runs SD2NAS as `PUID:PGID` (default `99:100`) using `su-exec`. It never chowns
 - No new share needed: SD2NAS creates `Staging/` and `Management/SD2NAS/`
   inside the existing `photos` share.
 - Template `deploy/unraid/sd2nas.xml`: repository, web UI link, port, the three
-  paths (with `/cards` as RW/Slave), `UMASK=000`, optional
-  `SD2NAS_TOKEN`, and `PUID`/`PGID` (the same convention as linuxserver.io
+  paths (with `/cards` as RW/Slave), `UMASK=000`, and `PUID`/`PGID` (the same convention as linuxserver.io
   images, so no manual folder setup). The binary applies `UMASK` itself at
   startup. Starting with `--user` also works: the entrypoint then skips the
   ownership fix, and `/config` must already be writable. Unraid passes `TZ` to every
   container automatically, so the template doesn't set it; `/healthz` shows the
   value and warns if it's missing.
+- The template has `--restart=unless-stopped` (Extra Parameters), an icon and
+  the Card poller variable (`SD2NAS_POLL_CARDS`, default `false`), and no token
+  variable until M7. The install steps are in `README.md`.
+- Startup takes `/config/sd2nas.lock`; a second instance exits with code 3.
 - Install by adding the repo's `deploy/unraid` URL under Docker → Template
   repositories, or by pasting the values into Add Container. Updates show up in
   the Docker tab like any CA app.
@@ -657,6 +661,7 @@ runs SD2NAS as `PUID:PGID` (default `99:100`) using `su-exec`. It never chowns
 | RAW previews | `exiftool` in the image |
 | Video thumbnails | `ffmpeg` in the image |
 | Frontend | Svelte 5 + Vite, single-page app with no SvelteKit. The UI is written from scratch, so there's no reason to start on the older version. |
+| Notifications | SD2NAS queues notices; the card script delivers them to Unraid's notify after each card and hourly from User Scripts (no bind mount of the host's notify, no webhook) |
 | Dependencies | Approved: `modernc.org/sqlite`. Carried over: `goexif`, `go-mp4`, `imaging` (with `golang.org/x/image` pinned to v0.36.0 for its TIFF fixes, kept indirect so `go 1.24.0` stays). Frontend: `svelte`, `vite`, and `@sveltejs/vite-plugin-svelte` (approved by the owner for M3). |
 
 No open questions remain. The M0 hardware checks have passed (§11).
@@ -853,19 +858,35 @@ gone from the archive with exactly its size and modified time is marked
 missing only once that file reads.
 
 ### M6: Unraid integration
-- [ ] `unassigned-devices.sh`: ingest, unmount, notify
-- [ ] Template finalized; install doc in README
+- [x] `unassigned-devices.sh`: ingest, unmount, notify
+- [x] Template finalized; install doc in README
 - [ ] End-to-end test on the NAS with a real card, twice (second run imports 0)
-- [ ] Recover from a panic in the ingest worker (fail the job, keep serving); `catalog.tx` must roll back in a defer first so a panic can't leak the single connection
-- [ ] Take an exclusive lock on `/config` at startup so a second instance can't fail the live job or delete its partials
-- [ ] The fallback poller must register its jobs with the API's ingest feed (`watch`), as `POST /api/ingest` does, so short imports still send `ingest.finished`
-- [ ] Daily notification for folders in staging longer than `staging_warn_days`
-- [ ] Notify when the nightly catalog backup fails or the nightly rescan finds missing files
+- [ ] Real-card check of the ignore list (the owner's): after an import, look at the import page's "not imported" list; anything harmless (e.g. a new sidecar type) goes on the ignore list (§7)
+- [x] Recover from a panic in the ingest worker (fail the job, keep serving); `catalog.tx` must roll back in a defer first so a panic can't leak the single connection
+- [x] Take an exclusive lock on `/config` at startup so a second instance can't fail the live job or delete its partials
+- [x] The fallback poller must register its jobs with the API's ingest feed (`watch`), as `POST /api/ingest` does, so short imports still send `ingest.finished`
+- [x] Daily notification for folders in staging longer than `staging_warn_days`
+- [x] Notify when the nightly catalog backup fails or the nightly rescan finds missing files
+
+Implementation plan: `docs/plans/m6-unraid-integration.md`.
+
+**What M6 delivers.** SD2NAS queues notices in the catalog (schema version 4) and the card script delivers them to Unraid's `notify`: after every card (`ACTION=ADD`) and hourly from a User Scripts entry (`ACTION=NOTIFY`). Taking notices is at-most-once (one transaction), so two script runs can't both deliver one notice (Decision 1). The stale-staging check runs once a day at the first 30 s check at or after 09:00 container time, a constant, and waits for the startup staging reconcile (Decision 4). The fallback poller is switched on by `SD2NAS_POLL_CARDS` / `--poll-cards`, not a setting (Decision 9). It reads `/cards` every 5 s and imports only entries that appeared after startup, are mount points, hold a `DCIM/` or `PRIVATE/` folder and have settled for 10 s, once per appearance (Decision 10); it re-arms a handled card when its folder disappears or a check shows it is definitely no longer a mount point (a failed mount check never re-arms). Panics are recovered in the ingest worker, its classify goroutines and the two third-party file parsers; nothing else (Decision 12). `/config/sd2nas.lock` stops a second instance, which exits with code 3; on a filesystem without locks SD2NAS warns on `/healthz` and starts anyway (Decision 14). The owner approved every plan decision as written.
+
+**On the NAS (the owner's).** These can't be done from the repository:
+1. Update the container. Edit it → Advanced View → Extra Parameters `--restart=unless-stopped`; set Card poller `false`. Check whether Docker → Template repositories with `https://github.com/aspiziri/SD2NAS` finds the template; if not, remove that method from the README.
+2. Install the script and `sd2nas.cfg` (`SD2NAS_URL=http://localhost:4040`) as the README says.
+3. Set both reader slots in Unassigned Devices: Automount on, Read Only on, Share off, script `/boot/config/plugins/unassigned.devices/sd2nas.sh`, run in the background. Check that the option names match the README.
+4. Notification Settings: Agents ticked for Notices, Warnings and Alerts.
+5. User Scripts: `SD2NAS notices`, Hourly, `ACTION=NOTIFY bash /boot/config/plugins/unassigned.devices/sd2nas.sh`. Run it once by hand; `grep sd2nas /var/log/syslog` shows no `could not fetch notices` line.
+6. Insert a real card → a Notice `<card>: N new, … Card safe to format.`, and the card is unmounted in Unassigned Devices. Reinsert it → `0 new, N already known. … Card safe to format.` Tick the end-to-end item with the date and counts.
+7. On that import's page, check the "not imported" list (`Thumbs.db`, `desktop.ini`, `.DSC`, `.SRT`, anything else) and tick the ignore-list item, noting the result.
+8. Optional: `curl -s -X PUT -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' http://localhost:4040/api/settings -d '{"backup_dir":"/proc/sd2nas-test","archive_rescan_at":"<the next minute>"}'`. At that minute SD2NAS runs its nightly sequence: the failing backup **and then an archive pass**. After the M5 backfill, that pass is a quick stat-only rescan. If the backfill hasn't run yet, this pass **is** the backfill (hours of array reads): let it run as the backfill, or Pause it from the Archive index page. Wait 2 minutes and run the User Scripts entry → an Alert `Nightly catalog backup failed: …`. Then restore `backup_dir` to `""` and `archive_rescan_at` to `03:00`.
 
 ### M7: Polish
 - [ ] Extra staging views (timeline, list)
 - [ ] "Shift times" tool for wrong camera clocks
-- [ ] Optional token auth
+- [ ] Optional token auth (add `SD2NAS_TOKEN` back to the template; the card script already sends it)
+- [ ] Setting for the time of the daily stale-staging notice (fixed at 09:00 in M6)
 - [ ] Settings page: `staging_warn_days`, the default promote pattern (now remembered per device), `day_starts_at`, `archive_rescan_at`, `backup_dir`, `archive_skip`
 - [ ] Offer to re-import files whose archive copy is missing (imports now list them and refuse safe to format)
 - [ ] Cache thumbnail render failures per file so a corrupt file isn't re-rendered on every view
