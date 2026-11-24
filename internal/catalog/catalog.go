@@ -40,7 +40,7 @@ func (e *WrongStateError) Error() string {
 func (e *WrongStateError) Is(target error) bool { return target == ErrWrongState }
 
 // SchemaVersion is the schema version this build creates and understands.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 const dsnParams = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" +
 	"&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
@@ -112,16 +112,22 @@ func (d *DB) Version(ctx context.Context) (int, error) {
 }
 
 // tx runs fn in a transaction: commit if fn succeeds, else roll back and
-// return fn's error joined with any rollback failure.
-func (d *DB) tx(ctx context.Context, fn func(*sql.Tx) error) error {
+// return fn's error joined with any rollback failure. The rollback is
+// deferred before fn runs, so a panic in fn (or in Commit) still rolls
+// back and gives the single connection back before the panic goes on
+// (§16 M6). After a successful Commit the deferred Rollback is
+// sql.ErrTxDone, which is ignored.
+func (d *DB) tx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if err := fn(tx); err != nil {
+	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			return errors.Join(err, rbErr)
+			err = errors.Join(err, rbErr)
 		}
+	}()
+	if err := fn(tx); err != nil {
 		return err
 	}
 	return tx.Commit()

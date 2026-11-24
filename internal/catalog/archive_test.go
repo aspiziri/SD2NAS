@@ -759,7 +759,7 @@ func TestBackupVacuumInto(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	if v, err := b.Version(ctx); err != nil || v != 3 {
+	if v, err := b.Version(ctx); err != nil || v != SchemaVersion {
 		t.Errorf("version = %d, %v", v, err)
 	}
 	if a, err := b.AssetBySHA(ctx, sha); err != nil || a.RelPath != "Archive/s/a.JPG" {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -130,6 +131,7 @@ func (r *Runner) Run(ctx context.Context, in catalog.Ingest, p *Progress) (catal
 		in.Status, in.FinishedAt, in.Error = catalog.StatusFailed, now, text
 		return in, fmt.Errorf("start ingest %d: %w", in.ID, errors.Join(err, finishErr))
 	}
+	defer j.releaseFolders() // a panic in the pipeline must not leave staging folders locked
 	status, errText := j.pipeline()
 	j.releaseFolders()
 	return j.finish(status, errText)
@@ -287,7 +289,7 @@ func (j *ingestRun) classifyAll(files []CardFile) []classified {
 					results[i] = classified{CardFile: files[i], skipped: true}
 					continue
 				}
-				results[i] = j.classifyOne(files[i])
+				results[i] = j.classifyRecovered(files[i])
 				j.p.update(func(s *ProgressSnapshot) { s.FilesDone++ })
 			}
 		}()
@@ -330,6 +332,19 @@ func knownOutcome(s catalog.AssetState) (catalog.Outcome, error) {
 		return catalog.OutcomeMissing, nil
 	}
 	return "", fmt.Errorf("catalog asset has unknown state %q", s)
+}
+
+// classifyRecovered is classifyOne with a panic turned into a failed file:
+// a panic on a classify goroutine can't reach the worker's recover and
+// would end the process (Decision 12).
+func (j *ingestRun) classifyRecovered(f CardFile) (c classified) {
+	defer func() {
+		if p := recover(); p != nil {
+			j.log.Error("classifying a file panicked", "file", f.Rel, "panic", p, "stack", string(debug.Stack()))
+			c = classified{CardFile: f, outcome: catalog.OutcomeFailed, err: fmt.Errorf("internal error: %v", p)}
+		}
+	}()
+	return j.classifyOne(f)
 }
 
 func (j *ingestRun) classifyOne(f CardFile) classified {

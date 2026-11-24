@@ -17,6 +17,8 @@ type Config struct {
 	Photos string // the photos share: Archive/, Staging/, Management/
 	Data   string // database, thumbnail cache (/config in the container)
 	Umask  *int   // applied at startup when set (UMASK env, octal)
+
+	PollCards bool // import cards that appear under Cards without the host script
 }
 
 // Load reads configuration from env first, then lets flags override it.
@@ -29,12 +31,22 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		Data:   envOr(getenv, "SD2NAS_CONFIG", "/config"),
 	}
 
+	// Parsed before the flags so that --poll-cards overrides it.
+	if s := getenv("SD2NAS_POLL_CARDS"); s != "" {
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("SD2NAS_POLL_CARDS %q is not true or false", s)
+		}
+		c.PollCards = b
+	}
+
 	fs := flag.NewFlagSet("sd2nas", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr) // usage and parse errors
 	fs.StringVar(&c.Addr, "addr", c.Addr, "listen address (env SD2NAS_ADDR)")
 	fs.StringVar(&c.Cards, "cards", c.Cards, "card mount root (env SD2NAS_CARDS)")
 	fs.StringVar(&c.Photos, "photos", c.Photos, "photos share root (env SD2NAS_PHOTOS)")
 	fs.StringVar(&c.Data, "config", c.Data, "database and cache directory (env SD2NAS_CONFIG)")
+	fs.BoolVar(&c.PollCards, "poll-cards", c.PollCards, "import cards that appear under the cards folder without the host script (env SD2NAS_POLL_CARDS)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}

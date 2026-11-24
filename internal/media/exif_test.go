@@ -3,11 +3,15 @@ package media
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rwcarlsen/goexif/exif"
 
 	mt "github.com/aspiziri/SD2NAS/internal/media/mediatest"
 )
@@ -266,5 +270,45 @@ func TestReadExifOffsetTimeNotStringIsWarning(t *testing.T) {
 	}
 	if d.Camera != "SONY ILCE-7M4" || d.DateTime.IsZero() {
 		t.Errorf("Camera = %q, DateTime = %v", d.Camera, d.DateTime)
+	}
+}
+
+// panicDecoder replaces decodeExif with one that panics, restoring it on cleanup.
+func panicDecoder(t *testing.T) {
+	t.Helper()
+	orig := decodeExif
+	decodeExif = func(io.Reader) (*exif.Exif, error) { panic("bad ifd") }
+	t.Cleanup(func() { decodeExif = orig })
+}
+
+func TestReadExifPanic(t *testing.T) {
+	panicDecoder(t)
+	b, err := os.ReadFile(fixture(t, mt.SonyJPEG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := writeBytes(t, t.TempDir(), "x.jpg", b)
+	d, err := ReadExif(path)
+	if d != nil {
+		t.Errorf("ExifData = %+v, want nil", d)
+	}
+	want := "exif " + path + ": the decoder panicked: bad ifd"
+	if err == nil || err.Error() != want {
+		t.Errorf("err = %v, want %q", err, want)
+	}
+	// An open handle would make Remove fail on Windows.
+	if err := os.Remove(path); err != nil {
+		t.Errorf("file was left open: %v", err)
+	}
+}
+
+func TestCaptureTimeSurvivesParserPanic(t *testing.T) {
+	panicDecoder(t)
+	c, err := CaptureTime(fixture(t, mt.SonyJPEG), KindImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Source != SourceMtime || c.Fallback == nil {
+		t.Errorf("got %+v", c)
 	}
 }

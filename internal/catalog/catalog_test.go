@@ -3,6 +3,7 @@ package catalog
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -38,7 +39,7 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"aliases", "archive_changes", "archive_copies", "archive_scans", "assets", "clock_warnings", "fingerprints", "ingest_files", "ingests", "settings", "staging_folders"}
+	want := []string{"aliases", "archive_changes", "archive_copies", "archive_scans", "assets", "clock_warnings", "fingerprints", "ingest_files", "ingests", "notifications", "settings", "staging_folders"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("tables = %v, want %v", got, want)
 	}
@@ -173,5 +174,61 @@ func TestHexBlob(t *testing.T) {
 		if _, err := hexToBlob(bad); !errors.Is(err, ErrBadHash) {
 			t.Errorf("hexToBlob(%q) error = %v, want ErrBadHash", bad, err)
 		}
+	}
+}
+
+func TestTxRollsBackOnPanic(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	func() {
+		defer func() {
+			if r := recover(); r != "boom" {
+				t.Fatalf("recovered %v, want boom", r)
+			}
+		}()
+		_ = d.tx(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, "INSERT INTO settings(key, value) VALUES ('x','y')"); err != nil {
+				t.Fatal(err)
+			}
+			panic("boom")
+		})
+		t.Fatal("tx returned instead of panicking")
+	}()
+
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var n int
+	if err := d.db.QueryRowContext(qctx, "SELECT count(*) FROM settings WHERE key = 'x'").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("row survived the panic: count = %d", n)
+	}
+	if err := d.SetSetting(ctx, KeyStagingWarnDays, "7"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTxErrorStillRollsBack(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	sentinel := errors.New("no")
+
+	err := d.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO settings(key, value) VALUES ('x','y')"); err != nil {
+			t.Fatal(err)
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want %v", err, sentinel)
+	}
+	var n int
+	if err := d.db.QueryRowContext(ctx, "SELECT count(*) FROM settings WHERE key = 'x'").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("row survived the error: count = %d", n)
 	}
 }

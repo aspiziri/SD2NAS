@@ -59,6 +59,42 @@ func TestLoadUmask(t *testing.T) {
 	}
 }
 
+func TestPollCards(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  map[string]string
+		want bool
+		err  string
+	}{
+		{name: "unset", want: false},
+		{name: "true", env: map[string]string{"SD2NAS_POLL_CARDS": "true"}, want: true},
+		{name: "one", env: map[string]string{"SD2NAS_POLL_CARDS": "1"}, want: true},
+		{name: "false", env: map[string]string{"SD2NAS_POLL_CARDS": "false"}, want: false},
+		{name: "zero", env: map[string]string{"SD2NAS_POLL_CARDS": "0"}, want: false},
+		{name: "empty", env: map[string]string{"SD2NAS_POLL_CARDS": ""}, want: false},
+		{name: "bad", env: map[string]string{"SD2NAS_POLL_CARDS": "maybe"}, err: `SD2NAS_POLL_CARDS "maybe" is not true or false`},
+		{name: "flag beats env false", args: []string{"--poll-cards"}, env: map[string]string{"SD2NAS_POLL_CARDS": "false"}, want: true},
+		{name: "flag false beats env true", args: []string{"--poll-cards=false"}, env: map[string]string{"SD2NAS_POLL_CARDS": "true"}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Load(tc.args, env(tc.env))
+			if tc.err != "" {
+				if err == nil || err.Error() != tc.err {
+					t.Fatalf("err = %v, want %q", err, tc.err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.PollCards != tc.want {
+				t.Errorf("PollCards = %v, want %v", c.PollCards, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadBadFlag(t *testing.T) {
 	if _, err := Load([]string{"--nope"}, env(nil)); err == nil {
 		t.Error("expected an error for an unknown flag")

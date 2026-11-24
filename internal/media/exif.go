@@ -28,6 +28,9 @@ type ExifData struct {
 	Warning error
 }
 
+// decodeExif is exif.Decode; only tests replace it.
+var decodeExif = exif.Decode
+
 // ReadExif decodes the EXIF block of the file at path.
 func ReadExif(path string) (_ *ExifData, err error) {
 	f, err := os.Open(path)
@@ -39,7 +42,12 @@ func ReadExif(path string) (_ *ExifData, err error) {
 			err = errors.Join(err, cerr)
 		}
 	}()
-	x, err := exif.Decode(f)
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("exif %s: the decoder panicked: %v", path, p)
+		}
+	}()
+	x, err := decodeExif(f)
 	if err != nil && (x == nil || exif.IsCriticalError(err)) {
 		return nil, fmt.Errorf("exif %s: %w", path, err)
 	}

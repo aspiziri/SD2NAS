@@ -3,9 +3,13 @@ package media
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/abema/go-mp4"
 
 	mt "github.com/aspiziri/SD2NAS/internal/media/mediatest"
 )
@@ -257,5 +261,29 @@ func TestReadVideoMetaZeroTimescale(t *testing.T) {
 	}
 	if m.Duration != 0 {
 		t.Errorf("Duration = %v, want 0", m.Duration)
+	}
+}
+
+func TestReadVideoMetaPanic(t *testing.T) {
+	orig := readBoxStructure
+	readBoxStructure = func(io.ReadSeeker, mp4.ReadHandler, ...interface{}) ([]interface{}, error) {
+		panic("bad box")
+	}
+	t.Cleanup(func() { readBoxStructure = orig })
+	b, err := os.ReadFile(fixture(t, mt.GoProMP4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := writeBytes(t, t.TempDir(), "x.MP4", b)
+	m, err := ReadVideoMeta(path)
+	if m != nil {
+		t.Errorf("VideoMeta = %+v, want nil", m)
+	}
+	want := "video " + path + ": the parser panicked: bad box"
+	if err == nil || err.Error() != want {
+		t.Errorf("err = %v, want %q", err, want)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Errorf("file was left open: %v", err)
 	}
 }

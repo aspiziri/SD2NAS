@@ -2,7 +2,7 @@ package catalog
 
 // migrations[i] upgrades a database from user_version i to i+1. Append only;
 // never edit a migration that has shipped.
-var migrations = []string{schemaV1, schemaV2, schemaV3}
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4}
 
 const schemaV1 = `
 CREATE TABLE ingests (
@@ -175,4 +175,20 @@ CREATE TABLE archive_scans (
   complete      INTEGER NOT NULL DEFAULT 0,   -- ran to the end; an incomplete re-index is continued by the next pass
   result        TEXT NOT NULL DEFAULT ''
 );
+`
+
+// schemaV4 (M6): notices for the Unraid host — a stale staging folder, a
+// failed catalog backup, files missing from the archive. The card script
+// takes them (POST /api/notifications/take) and hands them to Unraid's
+// notify. key is unique, so a restart never queues the same event twice.
+const schemaV4 = `
+CREATE TABLE notifications (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  key        TEXT NOT NULL UNIQUE,
+  level      TEXT NOT NULL CHECK (level IN ('normal','warning','alert')),
+  message    TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  taken_at   TEXT              -- NULL = waiting for the card script
+);
+CREATE INDEX notifications_pending ON notifications(taken_at, id);
 `

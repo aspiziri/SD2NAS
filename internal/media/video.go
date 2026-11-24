@@ -35,6 +35,9 @@ var (
 	boxFirm = mp4.StrToBoxType("FIRM")
 )
 
+// readBoxStructure is mp4.ReadBoxStructure; only tests replace it.
+var readBoxStructure = mp4.ReadBoxStructure
+
 // ReadVideoMeta reads duration, first-video-track size and frame rate, the
 // mvhd creation time, and udta make/model/firmware from an MP4/MOV.
 //
@@ -60,6 +63,11 @@ func ReadVideoMeta(path string) (_ *VideoMeta, err error) {
 			err = errors.Join(err, cerr)
 		}
 	}()
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("video %s: the parser panicked: %v", path, p)
+		}
+	}()
 	info, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat video file: %w", err)
@@ -70,7 +78,7 @@ func ReadVideoMeta(path string) (_ *VideoMeta, err error) {
 	var videoTimeScale, currentMediaTimeScale uint32
 	var currentTrackIsVideo bool
 
-	_, err = mp4.ReadBoxStructure(file, func(h *mp4.ReadHandle) (interface{}, error) {
+	_, err = readBoxStructure(file, func(h *mp4.ReadHandle) (interface{}, error) {
 		switch h.BoxInfo.Type.String() {
 		case "udta": // not expanded: see readUdta
 			return nil, readUdta(file, h.BoxInfo, info.Size(), meta)
