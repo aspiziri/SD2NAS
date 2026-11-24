@@ -1286,48 +1286,106 @@ func TestHeldAfterListingNotMissing(t *testing.T) {
 	wantAsset(t, db, "alpha", catalog.StateArchived, "Archive/S2/a.JPG")
 }
 
-// A copy whose folder a promote holds once it was listed keeps its row, and
-// its primary, gone meanwhile, is not marked missing (T8-m3).
-func TestHeldCopyKeepsRowAndPrimary(t *testing.T) {
-	s, db, photos := setup(t)
-	locks := newFakeLocks()
-	s.locks = locks
-	put(t, photos, "Archive/S1/a.JPG", "dup", t0)
-	put(t, photos, "Archive/S3/a.JPG", "dup", t0)
-	rescan(t, s)
-	remove(t, photos, "Archive/S1/a.JPG")
-	put(t, photos, "Archive/S3/a.JPG", "dup", t0.Add(time.Hour)) // touched: read again
+// holdAfterListing makes a promote hold Archive/<name> right after the listing reads it.
+func holdAfterListing(s *Service, locks *fakeLocks, name string) (restore func()) {
 	realReadDir := s.readDir
 	s.readDir = func(p string) ([]os.DirEntry, error) {
 		e, err := realReadDir(p)
-		if filepath.Base(p) == "S3" {
-			locks.hold("Archive/S3")
+		if filepath.Base(p) == name {
+			locks.hold("Archive/" + name)
 		}
 		return e, err
 	}
-	r := rescan(t, s)
-	wantCounts(t, r, ScanResult{Listed: 1, BusyFolders: 1})
-	noErrors(t, r)
-	wantAsset(t, db, "dup", catalog.StateArchived, "Archive/S1/a.JPG")
-	if c := copyRows(t, db); len(c) != 1 || c[0].RelPath != "Archive/S3/a.JPG" {
-		t.Errorf("copy rows = %+v; want the held copy kept", c)
-	}
-
-	s.readDir = realReadDir
-	locks.release("Archive/S3")
-	r = rescan(t, s)
-	wantCounts(t, r, ScanResult{Listed: 1, Moved: 1})
-	noErrors(t, r)
-	wantAsset(t, db, "dup", catalog.StateArchived, "Archive/S3/a.JPG")
-	if c := copyRows(t, db); len(c) != 0 {
-		t.Errorf("copy rows after the move = %+v", c)
+	return func() {
+		s.readDir = realReadDir
+		locks.release("Archive/" + name)
 	}
 }
 
+// A copy whose folder a promote holds once it was listed keeps its row (T8-m3).
+// Its primary, gone meanwhile, is left alone while the copy still has the
+// primary's size and time; a touched copy no longer matches, so the primary
+// shows as missing for one pass (the safe direction) and is back the next.
+func TestHeldCopyKeepsRowAndPrimary(t *testing.T) {
+	t.Run("untouched copy, re-index", func(t *testing.T) {
+		s, db, photos := setup(t)
+		locks := newFakeLocks()
+		s.locks = locks
+		put(t, photos, "Archive/S1/a.JPG", "dup", t0)
+		put(t, photos, "Archive/S3/a.JPG", "dup", t0)
+		rescan(t, s)
+		remove(t, photos, "Archive/S1/a.JPG")
+		release := holdAfterListing(s, locks, "S3")
+		r := fullRescan(t, s) // reads the copy again, so it meets the held folder
+		wantCounts(t, r, ScanResult{Listed: 1, BusyFolders: 1})
+		noErrors(t, r)
+		wantAsset(t, db, "dup", catalog.StateArchived, "Archive/S1/a.JPG")
+		if c := copyRows(t, db); len(c) != 1 || c[0].RelPath != "Archive/S3/a.JPG" {
+			t.Errorf("copy rows = %+v; want the held copy kept", c)
+		}
+
+		release()
+		r = rescan(t, s)
+		wantCounts(t, r, ScanResult{Listed: 1, Unchanged: 1, Moved: 1})
+		noErrors(t, r)
+		wantAsset(t, db, "dup", catalog.StateArchived, "Archive/S3/a.JPG")
+		if c := copyRows(t, db); len(c) != 0 {
+			t.Errorf("copy rows after the move = %+v", c)
+		}
+	})
+	t.Run("touched copy", func(t *testing.T) {
+		s, db, photos := setup(t)
+		locks := newFakeLocks()
+		s.locks = locks
+		put(t, photos, "Archive/S1/a.JPG", "dup", t0)
+		put(t, photos, "Archive/S3/a.JPG", "dup", t0)
+		rescan(t, s)
+		remove(t, photos, "Archive/S1/a.JPG")
+		put(t, photos, "Archive/S3/a.JPG", "dup", t0.Add(time.Hour)) // touched: read again
+		release := holdAfterListing(s, locks, "S3")
+		r := rescan(t, s)
+		wantCounts(t, r, ScanResult{Listed: 1, Missing: 1, BusyFolders: 1})
+		noErrors(t, r)
+		wantAsset(t, db, "dup", catalog.StateMissing, "Archive/S1/a.JPG")
+		if c := copyRows(t, db); len(c) != 1 || c[0].RelPath != "Archive/S3/a.JPG" {
+			t.Errorf("copy rows = %+v; want the held copy kept", c)
+		}
+
+		release()
+		r = rescan(t, s)
+		wantCounts(t, r, ScanResult{Listed: 1, Reappeared: 1})
+		noErrors(t, r)
+		wantAsset(t, db, "dup", catalog.StateArchived, "Archive/S3/a.JPG")
+		if c := copyRows(t, db); len(c) != 0 {
+			t.Errorf("copy rows after it is back = %+v", c)
+		}
+	})
+}
+
+// A file that can't be read pass after pass does not keep a gone file of the
+// same size from being marked missing when their modified times differ.
+func TestPersistentUnreadDoesNotShieldGone(t *testing.T) {
+	s, db, photos := setup(t)
+	put(t, photos, "Archive/S1/a.JPG", "alpha1", t0)
+	put(t, photos, "Archive/S1/b.JPG", "bravo", t0)
+	rescan(t, s)
+	remove(t, photos, "Archive/S1/a.JPG")
+	put(t, photos, "Archive/S2/x.JPG", "omega1", t0.Add(time.Minute)) // unrelated, same size
+	restore := failFingerprint(s, photos, "Archive/S2")
+	defer restore()
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 1, Missing: 1})
+	if len(r.Errors) != 1 {
+		t.Errorf("errors = %q; want the read failure", r.Errors)
+	}
+	wantAsset(t, db, "alpha1", catalog.StateMissing, "Archive/S1/a.JPG")
+}
+
 // Two rows at one path (a pass stopped between a move onto it and its check)
-// and a failed read there: the content at the path is not marked missing,
-// whichever row the pass keeps for the path (T8-m4). The next readable pass
-// settles it.
+// and a failed read there: the content at the path, which kept its size and
+// time through the move, is not marked missing, whichever row the pass keeps
+// for the path (T8-m4; only the order that keeps the other row reads the
+// path). The next readable pass settles it.
 func TestTwoRowsAtPathReadFails(t *testing.T) {
 	for _, tc := range []struct{ from, to, moved, gone string }{
 		{"b.JPG", "a.JPG", "bbbbbbbb", "aaaa"},
@@ -1357,12 +1415,10 @@ func TestTwoRowsAtPathReadFails(t *testing.T) {
 			}
 			s.beforeRead = nil
 
-			// Touched, so the path is read whichever row the pass keeps for it.
-			put(t, photos, "Archive/T/"+tc.to, tc.moved, t0.Add(2*time.Hour))
 			restore := failFingerprint(s, photos, "Archive/T")
 			r = rescan(t, s)
 			if len(r.Errors) == 0 {
-				t.Fatalf("result = %+v; want the read failure", r)
+				t.Fatalf("result = %+v; want the read failures", r)
 			}
 			if a := asset(t, db, tc.moved); a.State != catalog.StateArchived {
 				t.Errorf("content at the unread path = %s; want archived (result %+v)", a.State, r)

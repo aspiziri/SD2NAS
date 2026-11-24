@@ -176,10 +176,12 @@ func (sc *scan) replaced(e catalog.ArchiveEntry) bool {
 // unresolved records a listed file the pass left unresolved though it is
 // still there (held, unreadable, changing while read, its catalog entry
 // moving on): an archived row not seen this pass may have moved to it, and a
-// move keeps the size, so check leaves rows of that size, and a copy row at
-// that path, for the next pass.
+// move keeps the size and modified time, so check leaves rows with both the
+// same, and a copy row at that path, for the next pass. Matching the time
+// too keeps an unrelated file that can't be read from shielding a gone
+// file of the same size night after night.
 func (sc *scan) unresolved(f *file) {
-	sc.unread[f.size] = true
+	sc.unread[sizeTime{f.size, f.mtime}] = true
 	sc.unreadAt[f.rel] = true
 }
 
@@ -306,7 +308,7 @@ func (sc *scan) check() error {
 			delete(sc.seenCopies, e.SHA256)
 			continue
 		}
-		if sc.unread[e.Size] || s.held(e.RelPath) {
+		if sc.unread[sizeTime{e.Size, e.Mtime}] || s.held(e.RelPath) {
 			continue // it may be a file this pass could not read: the next pass looks again
 		}
 		if h := s.beforeMissing; h != nil {

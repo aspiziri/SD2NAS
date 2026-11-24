@@ -844,11 +844,13 @@ Archive index → Rescan now; the page shows progress, and the container log
 has an `archive scan` line when it finishes. Tick the "Backfill run against
 the real archive" item with the file count and how long it took; it stays
 open until then.
-Known limitations: a file moved into a folder a pass could not list (a
-promote held it, or it was unreadable) can show as missing for one pass and
-heals on the next; while a listed file can't be read (or its folder became
-held after the listing), a file gone from the archive with exactly its size
-is marked missing a pass later.
+Known limitations: a moved file that a pass can't read keeps its entry only
+when the pass listed it with the entry's size and modified time; otherwise
+(its folder couldn't be listed because a promote held it or it was
+unreadable, or the file was touched) the old entry can show as missing for
+that pass and heals on the next. While a listed file can't be read, a file
+gone from the archive with exactly its size and modified time is marked
+missing only once that file reads.
 
 ### M6: Unraid integration
 - [ ] `unassigned-devices.sh`: ingest, unmount, notify
