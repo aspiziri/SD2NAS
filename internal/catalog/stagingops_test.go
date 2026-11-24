@@ -286,3 +286,42 @@ func TestChangeAssetWrongState(t *testing.T) {
 		t.Errorf("unknown hash: err = %v, want ErrNotFound only", err)
 	}
 }
+
+func TestArchiveFolderSetsPromotedAt(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	id := insertFolder(t, d, "2025-05-30", `["2025-05-30"]`)
+	a := stagedAt(t, d, 1, "Staging/2025-05-30/a.JPG")
+	b := stagedAt(t, d, 2, "Staging/2025-05-30/Capture/a.ARW")
+	if _, err := d.ArchiveFolder(ctx, id, "Staging/2025-05-30/", "Archive/2025-05-30/", t2); err != nil {
+		t.Fatal(err)
+	}
+	for _, sha := range []string{a, b} {
+		if _, p := rawCols(t, d, sha); !p.Equal(t2) {
+			t.Errorf("promoted_at of %s = %v, want %v", sha[:4], p, t2)
+		}
+	}
+}
+
+func TestArchiveAssetSetsPromotedAt(t *testing.T) {
+	d := openTest(t)
+	sha := stagedAt(t, d, 1, "Staging/2025-05-30/a.JPG")
+	if err := d.ArchiveAsset(t.Context(), sha, "Archive/2025/a.JPG", t2); err != nil {
+		t.Fatal(err)
+	}
+	if _, p := rawCols(t, d, sha); !p.Equal(t2) {
+		t.Errorf("promoted_at = %v, want %v", p, t2)
+	}
+}
+
+func TestRenameStagingFolderLeavesPromotedAt(t *testing.T) {
+	d := openTest(t)
+	id := insertFolder(t, d, "2025-05-30", `["2025-05-30"]`)
+	sha := stagedAt(t, d, 1, "Staging/2025-05-30/a.JPG")
+	if err := d.RenameStagingFolder(t.Context(), id, "New", "Staging/2025-05-30/", "Staging/New/", t2); err != nil {
+		t.Fatal(err)
+	}
+	if _, p := rawCols(t, d, sha); !p.IsZero() {
+		t.Errorf("promoted_at = %v, want NULL", p)
+	}
+}
