@@ -16,6 +16,11 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" /></svg>
     <span class="label">Staging</span>
   </a>
+  <a href="/archive" class="tab" class:active={tab === 'archive'} aria-current={tab === 'archive' ? 'page' : undefined}>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="4" rx="1" /><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" /><path d="M10 12h4" /></svg>
+    <span class="label">Archive index</span>
+    {#if live.indexer.changed}<span class="pill warn">{live.indexer.changed}</span>{/if}
+  </a>
   <div class="foot">
     {live.connected ? 'Live updates on' : 'Reconnecting…'}
     {#if version}<br />Version <span class="mono">{version}</span>{/if}
