@@ -204,3 +204,37 @@ func (d *DB) ClockWarningsUnder(ctx context.Context, prefix string, state AssetS
 	}
 	return out, nil
 }
+
+// ArchivedCopiesUnder returns, for the staged assets under prefix whose
+// content the archive indexer also found in Archive/, the first such
+// archive path, by hash.
+func (d *DB) ArchivedCopiesUnder(ctx context.Context, prefix string) (map[string]string, error) {
+	lo, hi, err := prefixRange(prefix)
+	if err != nil {
+		return nil, fmt.Errorf("archive copies under %s: %w", prefix, err)
+	}
+	rows, err := d.db.QueryContext(ctx, `SELECT a.sha256, MIN(c.rel_path)
+		FROM archive_copies c JOIN assets a ON a.sha256 = c.sha256
+		WHERE a.state = 'staged' AND a.rel_path >= ? AND a.rel_path < ? GROUP BY a.sha256`, lo, hi)
+	if err != nil {
+		return nil, fmt.Errorf("archive copies under %s: %w", prefix, err)
+	}
+	out := map[string]string{}
+	for rows.Next() {
+		var (
+			sha []byte
+			rel string
+		)
+		if err := rows.Scan(&sha, &rel); err != nil {
+			return nil, errors.Join(fmt.Errorf("archive copies under %s: %w", prefix, err), rows.Close())
+		}
+		out[blobToHex(sha)] = rel
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.Join(fmt.Errorf("archive copies under %s: %w", prefix, err), rows.Close())
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("archive copies under %s: %w", prefix, err)
+	}
+	return out, nil
+}

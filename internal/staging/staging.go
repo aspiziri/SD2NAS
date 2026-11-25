@@ -216,6 +216,7 @@ type Folder struct {
 	LastCapture   string     `json:"last_capture,omitempty"`
 	Samples       []Sample   `json:"samples"`
 	ClockWarnings int        `json:"clock_warnings"` // files with at least one clock warning
+	InArchive     int        `json:"in_archive"`     // files whose content the archive indexer found in Archive/
 	AgeDays       int        `json:"age_days"`       // whole days since created_at
 	Stale         bool       `json:"stale"`          // AgeDays >= staging_warn_days (and that setting isn't 0)
 	Warnings      []string   `json:"warnings"`
@@ -238,6 +239,7 @@ type File struct {
 	CaptureTime   string   `json:"capture_time,omitempty"`
 	TZOffset      string   `json:"tz_offset,omitempty"`
 	ClockWarnings []string `json:"clock_warnings,omitempty"`
+	InArchive     string   `json:"in_archive,omitempty"` // an Archive/ path holding the same content
 }
 
 type FolderFiles struct {
@@ -304,6 +306,10 @@ func (s *Service) List(ctx context.Context) (Listing, error) {
 	if err != nil {
 		return Listing{}, err
 	}
+	archived, err := s.db.ArchivedCopiesUnder(ctx, Dir+"/")
+	if err != nil {
+		return Listing{}, err
+	}
 	onDisk, err := s.diskFolders()
 	if err != nil {
 		return Listing{}, err
@@ -323,7 +329,7 @@ func (s *Service) List(ctx context.Context) (Listing, error) {
 	known := map[string]bool{}
 	for _, row := range rows {
 		known[row.Name] = true
-		f := summarize(row, sortFiles(byFolder[row.Name]), warned, onDisk[row.Name], age)
+		f := summarize(row, sortFiles(byFolder[row.Name]), warned, archived, onDisk[row.Name], age)
 		if f.Stale {
 			out.Stale++
 		}
@@ -369,7 +375,8 @@ func sortFiles(assets []catalog.Asset) []catalog.Asset {
 	return out
 }
 
-func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[string][]string, onDisk bool, age ageRule) Folder {
+// archived maps a hash to an Archive/ path with the same content.
+func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[string][]string, archived map[string]string, onDisk bool, age ageRule) Folder {
 	date, title := SplitName(row.Name)
 	f := Folder{
 		ID: row.ID, Name: row.Name, Date: date, Title: title,
@@ -401,6 +408,9 @@ func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[str
 		if len(warned[a.SHA256]) > 0 {
 			f.ClockWarnings++
 		}
+		if archived[a.SHA256] != "" {
+			f.InArchive++
+		}
 	}
 	if !first.IsZero() {
 		f.FirstCapture = first.Format(catalog.CaptureLayout)
@@ -414,6 +424,12 @@ func summarize(row catalog.StagingFolder, sorted []catalog.Asset, warned map[str
 		f.Warnings = append(f.Warnings, "1 file has a suspicious capture time")
 	case n > 1:
 		f.Warnings = append(f.Warnings, fmt.Sprintf("%d files have a suspicious capture time", n))
+	}
+	switch n := f.InArchive; {
+	case n == 1:
+		f.Warnings = append(f.Warnings, "1 file is already in the archive")
+	case n > 1:
+		f.Warnings = append(f.Warnings, fmt.Sprintf("%d files are already in the archive", n))
 	}
 	f.AgeDays = max(0, int(age.now.Sub(row.CreatedAt)/(24*time.Hour)))
 	if age.warnDays > 0 && f.AgeDays >= age.warnDays {
@@ -498,6 +514,10 @@ func (s *Service) Files(ctx context.Context, id int64, kind string) (FolderFiles
 	if err != nil {
 		return FolderFiles{}, err
 	}
+	archived, err := s.db.ArchivedCopiesUnder(ctx, prefix)
+	if err != nil {
+		return FolderFiles{}, err
+	}
 	onDisk := true
 	if _, err := os.Stat(filepath.Join(s.photosRoot, Dir, row.Name)); errors.Is(err, fs.ErrNotExist) {
 		onDisk = false
@@ -506,7 +526,7 @@ func (s *Service) Files(ctx context.Context, id int64, kind string) (FolderFiles
 	}
 	sorted := sortFiles(assets)
 	warned := warnedFiles(ws)
-	out := FolderFiles{Version: version, Folder: summarize(row, sorted, warned, onDisk, age), Files: []File{}}
+	out := FolderFiles{Version: version, Folder: summarize(row, sorted, warned, archived, onDisk, age), Files: []File{}}
 	for _, a := range sorted {
 		if kind != "" && KindName(a.Kind) != kind {
 			continue
@@ -514,6 +534,7 @@ func (s *Service) Files(ctx context.Context, id int64, kind string) (FolderFiles
 		f := File{
 			SHA256: a.SHA256, Name: path.Base(a.RelPath), Path: strings.TrimPrefix(a.RelPath, prefix),
 			Kind: KindName(a.Kind), Size: a.Size, TZOffset: a.TZOffset, ClockWarnings: warned[a.SHA256],
+			InArchive: archived[a.SHA256],
 		}
 		if !a.CaptureTime.IsZero() {
 			f.CaptureTime = a.CaptureTime.Format(catalog.CaptureLayout)

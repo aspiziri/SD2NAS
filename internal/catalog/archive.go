@@ -458,7 +458,8 @@ func (d *DB) ArchiveCounts(ctx context.Context) (ArchiveCounts, error) {
 		{&c.Bytes, "SELECT COALESCE(SUM(size), 0) FROM assets WHERE state = 'archived' AND rel_path >= ? AND rel_path < ?", []any{lo, hi}},
 		{&c.Missing, "SELECT COUNT(*) FROM assets WHERE state = 'missing' AND rel_path >= ? AND rel_path < ?", []any{lo, hi}},
 		{&c.Changed, "SELECT COUNT(*) FROM archive_changes", nil},
-		{&c.Copies, "SELECT COUNT(*) FROM archive_copies", nil},
+		// duplicates of archived content only: a staged file's copy is shown in Staging
+		{&c.Copies, "SELECT COUNT(*) FROM archive_copies c JOIN assets a ON a.sha256 = c.sha256 WHERE a.state = 'archived'", nil},
 		{&c.Imported, "SELECT COUNT(*) FROM assets WHERE first_ingest IS NOT NULL", nil},
 	} {
 		if err := d.db.QueryRowContext(ctx, q.sql, q.args...).Scan(q.dst); err != nil {
