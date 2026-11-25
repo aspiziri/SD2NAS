@@ -371,10 +371,15 @@ func (sc *scan) found(f file) {
 		return
 	}
 	if c, ok := sc.copies[f.rel]; ok && c.Size == f.size && c.Mtime == f.mtime && !sc.mustReread(c.CheckedAt) {
-		if c.AssetState == catalog.StateArchived {
+		switch c.AssetState {
+		case catalog.StateArchived:
 			sc.keepCopy[f.rel] = true
 			sc.seenCopies[c.SHA256] = c
 			sc.r.Unchanged++
+			return
+		case catalog.StateStaged: // still staged, and already here: Staging shows it as in the archive
+			sc.keepCopy[f.rel] = true
+			sc.r.InStaging++
 			return
 		}
 		f.sha = c.SHA256 // known content whose asset left the archive: resolved again without a full read (still fingerprinted)
@@ -635,8 +640,17 @@ func (sc *scan) resolve(f file) error {
 			sc.r.Recovered++
 		}
 	case a.State == catalog.StateStaged:
-		sc.r.InStaging++ // a promote is moving it, or a copy of a staging file: the staging side settles it
-		return nil
+		// A staged file whose content is already here (imported before the
+		// index knew this file), or a promote that stopped before its catalog
+		// write; held folders never get here. The copy row lets Staging show
+		// the file as in the archive. A cull, promote or forget changes the
+		// asset's state, and the next pass settles the row from there.
+		c := catalog.ArchiveCopy{RelPath: f.rel, SHA256: a.SHA256, Size: f.size, Mtime: f.mtime, CheckedAt: now, AssetState: a.State}
+		err = db.PutArchiveCopy(sc.dbctx, c)
+		if err == nil {
+			sc.r.InStaging++
+			sc.keepCopy[f.rel] = true
+		}
 	}
 	if sc.entryChanged(f.rel, err) {
 		sc.unresolved(&f)

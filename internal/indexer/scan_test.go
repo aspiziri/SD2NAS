@@ -343,19 +343,112 @@ func TestArchiveMissingChangesNothing(t *testing.T) {
 	}
 }
 
-func TestStagedContentLeftAlone(t *testing.T) {
-	s, db, photos := setup(t)
+// stagedInArchive stages content at Staging/T/a.JPG while the same content
+// sits at Archive/X/a.JPG (imported before the index knew it), and runs the
+// pass that finds it.
+func stagedInArchive(t *testing.T, s *Service, db *catalog.DB, photos string) catalog.StagingFolder {
+	t.Helper()
+	f, err := db.CreateStagingFolder(t.Context(), "T", nil, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	put(t, photos, "Archive/X/a.JPG", "staged-content", t0)
-	err := db.InsertAsset(t.Context(), catalog.Asset{SHA256: sum("staged-content"), Size: 14, Kind: media.KindImage,
-		State: catalog.StateStaged, RelPath: "Staging/X/a.JPG", Mtime: 7, UpdatedAt: t0}, "")
+	err = db.InsertAsset(t.Context(), catalog.Asset{SHA256: sum("staged-content"), Size: 14, Kind: media.KindImage,
+		State: catalog.StateStaged, RelPath: "Staging/T/a.JPG", Mtime: t0.UnixNano(), UpdatedAt: t0}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := rescan(t, s)
 	wantCounts(t, r, ScanResult{Listed: 1, InStaging: 1})
-	if a := asset(t, db, "staged-content"); a.State != catalog.StateStaged || a.RelPath != "Staging/X/a.JPG" {
-		t.Errorf("asset = %+v", a)
+	noErrors(t, r)
+	return f
+}
+
+func archiveCopies(t *testing.T, db *catalog.DB) int {
+	t.Helper()
+	c, err := db.ArchiveCounts(t.Context())
+	if err != nil {
+		t.Fatal(err)
 	}
+	return c.Copies
+}
+
+func TestStagedContentRecordedAsCopy(t *testing.T) {
+	s, db, photos := setup(t)
+	stagedInArchive(t, s, db, photos)
+	wantAsset(t, db, "staged-content", catalog.StateStaged, "Staging/T/a.JPG")
+	c := copyRows(t, db)
+	if len(c) != 1 || c[0].RelPath != "Archive/X/a.JPG" || c[0].SHA256 != sum("staged-content") || c[0].AssetState != catalog.StateStaged {
+		t.Fatalf("copy rows = %v", c)
+	}
+	got, err := db.ArchivedCopiesUnder(t.Context(), "Staging/T/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{sum("staged-content"): "Archive/X/a.JPG"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ArchivedCopiesUnder = %v; want %v", got, want)
+	}
+	if n := archiveCopies(t, db); n != 0 {
+		t.Errorf("archive duplicates = %d; want 0 (a staged file's copy isn't one)", n)
+	}
+
+	// The next pass keeps the row without reading the file again.
+	n, fp := countHashes(s), countFingerprints(s)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, InStaging: 1})
+	if n.Load() != 0 || fp.Load() != 0 {
+		t.Errorf("reads = %d full, %d quick; want none", n.Load(), fp.Load())
+	}
+	if c := copyRows(t, db); len(c) != 1 {
+		t.Errorf("copy rows = %v", c)
+	}
+}
+
+func TestStagedCopyCulledIsRecovered(t *testing.T) {
+	s, db, photos := setup(t)
+	stagedInArchive(t, s, db, photos)
+	if err := db.CullAsset(t.Context(), sum("staged-content"), t0); err != nil {
+		t.Fatal(err)
+	}
+	n := countHashes(s)
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Recovered: 1})
+	if n.Load() != 0 {
+		t.Errorf("hash calls = %d; want 0", n.Load())
+	}
+	wantAsset(t, db, "staged-content", catalog.StateArchived, "Archive/X/a.JPG")
+	if c := copyRows(t, db); len(c) != 0 {
+		t.Errorf("copy rows = %v", c)
+	}
+}
+
+func TestStagedCopyPromotedIsDuplicate(t *testing.T) {
+	s, db, photos := setup(t)
+	f := stagedInArchive(t, s, db, photos)
+	put(t, photos, "Archive/T/a.JPG", "staged-content", t0) // the promote went ahead anyway
+	if _, err := db.ArchiveFolder(t.Context(), f.ID, "Staging/T/", "Archive/T/", t0); err != nil {
+		t.Fatal(err)
+	}
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 2, Unchanged: 2})
+	wantAsset(t, db, "staged-content", catalog.StateArchived, "Archive/T/a.JPG")
+	if c := copyRows(t, db); len(c) != 1 || c[0].RelPath != "Archive/X/a.JPG" || c[0].AssetState != catalog.StateArchived {
+		t.Errorf("copy rows = %v", c)
+	}
+	if n := archiveCopies(t, db); n != 1 {
+		t.Errorf("archive duplicates = %d; want 1", n)
+	}
+}
+
+func TestStagedCopyForgottenIsIndexed(t *testing.T) {
+	s, db, photos := setup(t)
+	stagedInArchive(t, s, db, photos)
+	if _, err := db.ForgetAssets(t.Context(), []string{sum("staged-content")}, []catalog.AssetState{catalog.StateStaged}); err != nil {
+		t.Fatal(err)
+	}
+	r := rescan(t, s)
+	wantCounts(t, r, ScanResult{Listed: 1, Added: 1})
+	wantAsset(t, db, "staged-content", catalog.StateArchived, "Archive/X/a.JPG")
 	if c := copyRows(t, db); len(c) != 0 {
 		t.Errorf("copy rows = %v", c)
 	}

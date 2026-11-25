@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -241,6 +242,48 @@ func TestFiles(t *testing.T) {
 	}
 	if empty.Files == nil || len(empty.Files) != 0 {
 		t.Errorf("empty = %#v", empty.Files)
+	}
+}
+
+func TestInArchive(t *testing.T) {
+	fx := setup(t)
+	ctx := t.Context()
+	for _, c := range []catalog.ArchiveCopy{
+		{RelPath: "Archive/S/b.JPG", SHA256: sha(1)},
+		{RelPath: "Archive/S/z.ARW", SHA256: sha(2)},
+		{RelPath: "Archive/R/a.ARW", SHA256: sha(2)},   // the first path is shown
+		{RelPath: "Archive/S/old.JPG", SHA256: sha(5)}, // archived content: a duplicate, not a staged file's copy
+	} {
+		c.Size, c.Mtime, c.CheckedAt = 1, 1, now
+		if err := fx.db.PutArchiveCopy(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l, err := fx.svc.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := l.Folders[0]
+	if f.InArchive != 2 || !slices.Contains(f.Warnings, "2 files are already in the archive") {
+		t.Errorf("folder = %+v", f)
+	}
+	if f2 := l.Folders[1]; f2.InArchive != 0 {
+		t.Errorf("f2 = %+v", f2)
+	}
+	ff, err := fx.svc.Files(ctx, fx.f1.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, file := range ff.Files {
+		got[file.SHA256] = file.InArchive
+	}
+	want := map[string]string{sha(1): "Archive/S/b.JPG", sha(2): "Archive/R/a.ARW", sha(3): "", sha(4): ""}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("in_archive = %v; want %v", got, want)
+	}
+	if !reflect.DeepEqual(ff.Folder, f) {
+		t.Errorf("folder = %+v, list has %+v", ff.Folder, f)
 	}
 }
 
