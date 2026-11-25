@@ -828,8 +828,13 @@ listed under "changed since indexed" until accepted (accepting only clears
 the list); an original found again in `Archive/` whose hash is an alias
 becomes its own asset again. Only a pass that ran to the end marks files
 `missing`, each after re-checking that it and `Archive/` are still there;
-folders a promote holds are skipped and picked up next time; staged content
-found in the archive is left alone and culled content becomes archived.
+folders a promote holds are skipped and picked up next time; culled content
+found in the archive becomes archived. Staged content found in the archive
+(imported before the index knew it) stays staged; the pass records the
+archive path as a copy, and Staging marks the file "In archive", counts it
+on the folder ("N files are already in the archive") and offers "Select N in
+archive". Culling those is the clean-up: the next pass records the archive
+copy as archived. Promoting them anyway makes the archive copy a duplicate.
 "Re-index everything" re-reads every indexed file without emptying the index
 (cards keep matching while it runs); a stopped re-index is continued by the
 next pass. Imports give files whose archive copy is missing the outcome

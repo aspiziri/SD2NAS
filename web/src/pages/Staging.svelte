@@ -52,21 +52,25 @@
 
   // Load on mount, when an import finishes, when the stream comes back after
   // a real drop, and when staging.changed carries a version other than the
-  // one on screen (Decision 14).
+  // one on screen (Decision 14). Also when an archive scan finishes: it may
+  // have found staged files already in the archive.
   let started = false;
   let wasConnected = false;
   let wasConnectedEver = false;
   let finishedSeen = 0;
+  let scanSeen;
   $effect(() => {
     const connected = live.connected;
     const finishedCount = live.finishedCount;
     const version = live.staging.version;
+    const scan = live.indexer.last?.finished_at ?? null;
     untrack(() => {
       const reconnected = connected && !wasConnected && wasConnectedEver;
       if (connected) wasConnectedEver = true;
       wasConnected = connected;
-      const finished = finishedCount !== finishedSeen;
+      const finished = finishedCount !== finishedSeen || (scanSeen !== undefined && scan !== scanSeen);
       finishedSeen = finishedCount;
+      scanSeen = scan;
       const stale = data !== null && version !== data.version;
       if (!started || reconnected || finished || stale) {
         started = true;

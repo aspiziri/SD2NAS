@@ -72,17 +72,20 @@
   let wasConnected = false;
   let wasConnectedEver = false;
   let finishedSeen = 0;
+  let scanSeen; // finished_at of the last archive scan; a new one may mark files as in the archive
   $effect(() => {
     const k = kind;
     const connected = live.connected;
     const finishedCount = live.finishedCount;
     const version = live.staging.version;
+    const scan = live.indexer.last?.finished_at ?? null;
     untrack(() => {
       const reconnected = connected && !wasConnected && wasConnectedEver;
       if (connected) wasConnectedEver = true;
       wasConnected = connected;
-      const finished = finishedCount !== finishedSeen;
+      const finished = finishedCount !== finishedSeen || (scanSeen !== undefined && scan !== scanSeen);
       finishedSeen = finishedCount;
+      scanSeen = scan;
       const changed = k !== lastKind;
       lastKind = k;
       const stale = data !== null && version !== data.version;
@@ -114,6 +117,8 @@
   const files = $derived(data?.files ?? []);
   const order = $derived(files.map((f) => f.sha256));
   const selecting = $derived(selected.size > 0);
+  const inArchive = $derived(files.filter((f) => f.in_archive).map((f) => f.sha256));
+  const selectedInArchive = $derived(inArchive.filter((sha) => selected.has(sha)).length);
 
   function toggle(key) {
     selected = toggleKey(selected, key);
@@ -125,6 +130,10 @@
   }
   function selectAll() {
     selected = new Set(order);
+  }
+  function selectInArchive() {
+    selected = new Set(inArchive);
+    anchor = null;
   }
 
   function onTileClick(e, i) {
@@ -260,7 +269,9 @@
       {/each}
     </div>
     <span class="spacer"></span>
-    {#if !selecting}
+    {#if inArchive.length && !selecting}
+      <button class="btn" onclick={selectInArchive}>Select {inArchive.length} in archive</button>
+    {:else if !selecting}
       <span class="muted small only-desktop">Ctrl-click or tick files to select them</span>
       <span class="muted small only-phone">Long-press to select; drag to select more</span>
     {/if}
@@ -275,6 +286,7 @@
           <button class="tile" onclick={(e) => onTileClick(e, i)} aria-label={selecting ? `${on ? 'Unselect' : 'Select'} ${file.name}` : `Show ${file.name}`}>
             <Thumb sha={file.sha256} kind={file.kind} label={extLabel(file)} />
             <span class="fn">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠ </span>{/if}{file.name}</span>
+            {#if file.in_archive}<span class="inarch" title="Already in the archive: {file.in_archive}">In archive</span>{/if}
           </button>
           <button class="pick" class:on onclick={() => toggle(file.sha256)} aria-pressed={on} aria-label="{on ? 'Unselect' : 'Select'} {file.name}"><span>✓</span></button>
         </div>
@@ -317,6 +329,9 @@
   <Dialog open={dialog === 'cull'} title="Cull {plural(selected.size, 'file', 'files')}?" onclose={() => !busy && (dialog = '')} {busy} danger>
     <p class="muted">They are deleted from staging.</p>
     <div class="note">They stay in the ingest history, so they won't be re-imported the next time this card goes in.</div>
+    {#if selectedInArchive}
+      <div class="note">{selectedInArchive === selected.size ? (selected.size === 1 ? 'It is' : 'They are') : `${selectedInArchive} of them are`} already in the archive. Those archive copies stay, and the next archive scan records them as archived.</div>
+    {/if}
     {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
     {#snippet actions()}
       <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
@@ -334,6 +349,9 @@
   .cell.sel .tile :global(img) { opacity: .8; }
   .fn { display: block; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 3px; }
   .warn { color: var(--warn); }
+  /* "In archive": top-right on the thumbnail (the tick is top-left); taps go through to the tile. */
+  .inarch { position: absolute; top: 4px; right: 4px; pointer-events: none; font-size: 10px; font-weight: 600; line-height: 1;
+    padding: 3px 6px; border-radius: 999px; background: rgba(0,0,0,.6); color: #fff; border: 1px solid var(--ok); }
   /* The tick: a 44 px hit area with a 24 px circle, top-left on the thumbnail.
      Shown on hover with a mouse, and always while selecting. */
   .pick { position: absolute; top: 0; left: 0; width: 44px; height: 44px; padding: 0; border: 0; background: none; cursor: pointer;
