@@ -97,6 +97,35 @@ func TestRenameKeepsDatePrefix(t *testing.T) {
 	e.nameKeyFree(t, got.Name)
 }
 
+func TestRenameAsChangesTheDate(t *testing.T) {
+	e := newOpsEnv(t)
+	f := e.folder(t, "2025-05-30 - Trip", "2025-05-30")
+	s1 := e.stage(t, f, "a.JPG", "jpg", opsNow)
+	v := e.version()
+	got, err := e.svc.RenameAs(t.Context(), f.ID, " 2025-06-02 - Hike ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "2025-06-02 - Hike" {
+		t.Fatalf("folder = %q", got.Name)
+	}
+	if p := e.relPath(t, s1); p != "Staging/2025-06-02 - Hike/a.JPG" {
+		t.Errorf("rel_path = %q", p)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30 - Trip")
+	e.bumped(t, v)
+	e.lockFree(t, f.ID)
+	e.nameKeyFree(t, got.Name)
+
+	if got, err := e.svc.RenameAs(t.Context(), f.ID, "2025-06-02 - "); err != nil || got.Name != "2025-06-02" {
+		t.Errorf("dangling separator: %q, %v", got.Name, err)
+	}
+	if _, err := e.svc.RenameAs(t.Context(), f.ID, "  "); !errors.Is(err, ErrBadTitle) {
+		t.Errorf("empty name: err = %v, want ErrBadTitle", err)
+	}
+	e.lockFree(t, f.ID)
+}
+
 func TestRenameEmptyTitleKeepsDate(t *testing.T) {
 	e := newOpsEnv(t)
 	f := e.folder(t, "2025-05-30 - Trip", "2025-05-30")
@@ -455,6 +484,47 @@ func TestMergePicksFolderWithFinalName(t *testing.T) {
 	e.nameKeyFree(t, got.Name)
 }
 
+func TestMergeAsUsesTheWholeName(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMergeFixture(t, e)
+	got, err := e.svc.MergeAs(t.Context(), []int64{m.a.ID, m.b.ID}, "2025-05-31 - Trip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The earliest-dated folder is still the one kept, renamed to the later date.
+	if got.ID != m.a.ID || got.Name != "2025-05-31 - Trip" || got.Files != 4 {
+		t.Fatalf("result = %d %q %d files", got.ID, got.Name, got.Files)
+	}
+	if p := e.relPath(t, m.bMP4); p != "Staging/2025-05-31 - Trip/Videos/v.MP4" {
+		t.Errorf("rel_path = %q", p)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30", "Staging/2025-05-31")
+	e.lockFree(t, m.a.ID, m.b.ID)
+	e.nameKeyFree(t, got.Name)
+}
+
+func TestMergeAsKeepsFolderWithThatName(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMergeFixture(t, e)
+	got, err := e.svc.MergeAs(t.Context(), []int64{m.a.ID, m.b.ID}, "2025-05-31 - ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != m.b.ID || got.Name != "2025-05-31" {
+		t.Fatalf("result = %d %q", got.ID, got.Name)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30")
+}
+
+func TestMergeAsBadName(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMergeFixture(t, e)
+	if _, err := e.svc.MergeAs(t.Context(), []int64{m.a.ID, m.b.ID}, "a/b"); !errors.Is(err, ErrBadTitle) {
+		t.Fatalf("err = %v, want ErrBadTitle", err)
+	}
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
 func TestMergeIdenticalFile(t *testing.T) {
 	e := newOpsEnv(t)
 	a := e.folder(t, "2025-05-30", "2025-05-30")
@@ -786,6 +856,25 @@ func TestMoveToNewFolder(t *testing.T) {
 	e.nameKeyFree(t, "2025-05-30 - Picks")
 }
 
+func TestMoveToNewFolderNamed(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	v := e.version()
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.bJPG}, NewName: " 2025-06-02 - Picks "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Folder.Name != "2025-06-02 - Picks" || res.Moved != 1 {
+		t.Fatalf("result = %+v", res)
+	}
+	if p := e.relPath(t, m.bJPG); p != "Staging/2025-06-02 - Picks/b.JPG" {
+		t.Errorf("rel_path = %q", p)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID, res.Folder.ID)
+	e.nameKeyFree(t, res.Folder.Name)
+}
+
 func TestMoveNewFolderRules(t *testing.T) {
 	e := newOpsEnv(t)
 	m := newMoveEnv(t, e)
@@ -801,6 +890,10 @@ func TestMoveNewFolderRules(t *testing.T) {
 		{"bad character", MoveRequest{SHAs: sha, NewTitle: "a/b"}, ErrBadTitle},
 		{"too long once dated", MoveRequest{SHAs: sha, NewTitle: strings.Repeat("x", 195)}, ErrBadTitle},
 		{"both", MoveRequest{SHAs: sha, ToID: m.b.ID, NewTitle: "Picks"}, ErrBadRequest},
+		{"title and name", MoveRequest{SHAs: sha, NewTitle: "Picks", NewName: "2025-06-01 - Picks"}, ErrBadRequest},
+		{"bad name", MoveRequest{SHAs: sha, NewName: "2025-06-01 - a/b"}, ErrBadTitle},
+		{"blank name", MoveRequest{SHAs: sha, NewName: "  "}, ErrBadTitle},
+		{"whole name exists", MoveRequest{SHAs: sha, NewName: "2025-05-30 - Picks"}, catalog.ErrNameTaken},
 		{"neither", MoveRequest{SHAs: sha}, ErrBadRequest},
 		{"name exists", MoveRequest{SHAs: sha, NewTitle: "Picks"}, catalog.ErrNameTaken},
 		{"unknown folder", MoveRequest{SHAs: sha, ToID: 999}, catalog.ErrNotFound},

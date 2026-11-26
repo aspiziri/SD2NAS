@@ -67,8 +67,6 @@ details ul { margin: 8px 0 0; padding-left: 18px; color: var(--muted); }
 input[type=text], select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 9px 10px; font: inherit; width: 100%; min-height: 44px; }
 input[type=checkbox], input[type=radio] { accent-color: var(--accent); width: 18px; height: 18px; margin: 0; }
 label.f { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 12px; }
-.prefixed { display: flex; gap: 6px; align-items: center; }
-.prefixed .mono { white-space: nowrap; color: var(--muted); }
 .preview { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; margin-top: 8px; max-height: 160px; overflow: auto; }
 .field-error { color: var(--bad); font-size: 12px; margin-top: 4px; }
 /* Long-press selects on touch: no text selection, callout or image drag. */

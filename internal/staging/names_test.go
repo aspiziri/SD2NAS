@@ -23,6 +23,23 @@ func TestCleanTitle(t *testing.T) {
 	}
 }
 
+func TestCleanName(t *testing.T) {
+	for in, want := range map[string]string{
+		" 2025-06-02 - Trip ": "2025-06-02 - Trip", "2025-06-02 - ": "2025-06-02", "2025-06-02 -": "2025-06-02",
+		"Trip": "Trip", "2025-06-02 - A-": "2025-06-02 - A-",
+	} {
+		got, err := CleanName(in)
+		if err != nil || got != want {
+			t.Errorf("CleanName(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "  ", "a/b", ".hidden", "trailing.", strings.Repeat("é", 101)} {
+		if _, err := CleanName(in); !errors.Is(err, ErrBadTitle) {
+			t.Errorf("CleanName(%q) err = %v, want ErrBadTitle", in, err)
+		}
+	}
+}
+
 func TestFolderName(t *testing.T) {
 	for _, c := range [][3]string{{"2025-05-30", "Trip", "2025-05-30 - Trip"}, {"2025-05-30", "", "2025-05-30"}, {"", "Trip", "Trip"}} {
 		if got := FolderName(c[0], c[1]); got != c[2] {

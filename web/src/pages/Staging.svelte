@@ -1,11 +1,11 @@
 <script>
-  import { untrack } from 'svelte';
+  import { untrack, tick } from 'svelte';
   import { api } from '../lib/api.js';
   import { live } from '../lib/live.svelte.js';
   import { navigate } from '../lib/router.svelte.js';
   import { formatBytes, formatCount, dateRange } from '../lib/format.js';
   import { clickAction, toggleKey, selectRange, prune, isTextEntry } from '../lib/selection.js';
-  import { splitName, folderName, folderDate, earliestDate, checkTitle, promoteTarget, DEFAULT_PATTERN } from '../lib/naming.js';
+  import { splitName, folderName, folderDate, earliestDate, checkFolderName, promoteTarget, DEFAULT_PATTERN } from '../lib/naming.js';
   import { describeError, rescanSummary, plural, promoteStates, promoteToast } from '../lib/messages.js';
   import { longPressSelect } from '../lib/press.js';
   import { toast } from '../lib/toast.svelte.js';
@@ -27,7 +27,9 @@
   let dialog = $state(''); // '' | 'rename' | 'merge' | 'discard' | 'promote'
   let busy = $state(false);
   let dialogError = $state('');
-  let title = $state('');
+  let nameRaw = $state(''); // the rename or merge dialog's whole folder name, as typed
+  let renameInput = $state(null);
+  let mergeInput = $state(null);
   let pattern = $state(DEFAULT_PATTERN);
   let dismissedJob = $state(0); // the last finished job the user dismissed
   let cancelling = $state(0); // the queued job being cancelled
@@ -169,15 +171,26 @@
 
   function openDialog(kind) {
     dialogError = '';
+    // Rename and merge edit one whole name: the date, then the title (or an
+    // empty title after " - "), with the caret at the end to type it.
+    const titleOf = (f) => (splitName(f.name).date ? splitName(f.name).title : f.name);
+    const editable = (date, t) => (date ? `${date} - ${t}` : t);
     if (kind === 'rename') {
-      const n = splitName(chosen[0].name);
-      title = n.date ? n.title : chosen[0].name;
+      nameRaw = editable(folderDate(chosen[0]), titleOf(chosen[0]));
     } else if (kind === 'merge') {
-      title = mergeSorted.map((f) => (splitName(f.name).date ? splitName(f.name).title : f.name)).find(Boolean) ?? '';
+      nameRaw = editable(earliestDate(chosen), mergeSorted.map(titleOf).find(Boolean) ?? '');
     } else if (kind === 'promote') {
       pattern = loadPattern();
     }
     dialog = kind;
+    if (kind === 'rename' || kind === 'merge') {
+      tick().then(() => {
+        const el = kind === 'rename' ? renameInput : mergeInput;
+        if (dialog !== kind || !el) return;
+        el.focus();
+        el.setSelectionRange(nameRaw.length, nameRaw.length);
+      });
+    }
   }
   function closeDialog() {
     if (!busy) dialog = '';
@@ -199,16 +212,16 @@
     }
   }
 
-  // The whole "date - title" name is checked against the byte limit.
-  const titleCheck = $derived(checkTitle(title, dialog === 'merge' ? earliestDate(chosen) : dialog === 'rename' && chosen[0] ? folderDate(chosen[0]) : ''));
+  // The rename or merge dialog's name, cleaned and checked as the server does.
+  const nameCheck = $derived(checkFolderName(nameRaw));
 
   // Rename
   const renaming = $derived(chosen.length === 1 ? chosen[0] : null);
-  const renameName = $derived(renaming ? folderName(folderDate(renaming), titleCheck.title) : '');
+  const canRename = $derived(!!renaming && !nameCheck.error && !!nameCheck.name && nameCheck.name !== renaming.name);
   function doRename() {
     const f = renaming;
     run(async () => {
-      const res = await api(`/api/staging/${f.id}`, { method: 'PATCH', body: { title: titleCheck.title } });
+      const res = await api(`/api/staging/${f.id}`, { method: 'PATCH', body: { name: nameCheck.name } });
       toast(`Renamed to “${res.folder.name}”`);
       clear();
     });
@@ -216,11 +229,10 @@
 
   // Merge
   const mergeSorted = $derived([...chosen].sort((a, b) => (folderDate(a) || '9999').localeCompare(folderDate(b) || '9999') || a.id - b.id));
-  const mergeName = $derived(folderName(earliestDate(chosen), titleCheck.title));
   const mergeFiles = $derived(chosen.reduce((s, f) => s + f.files, 0));
   function doMerge() {
     run(async () => {
-      const res = await api('/api/staging/merge', { method: 'POST', body: { ids: chosen.map((f) => f.id), title: titleCheck.title } });
+      const res = await api('/api/staging/merge', { method: 'POST', body: { ids: chosen.map((f) => f.id), name: nameCheck.name } });
       toast(`Merged into “${res.folder.name}”`);
       selected = new Set([String(res.folder.id)]);
       anchor = null;
@@ -403,21 +415,17 @@
 
 <Dialog open={dialog === 'rename'} title="Rename folder" onclose={closeDialog} {busy}>
   {#if renaming}
-    <label class="f" for="rename-title">Folder title</label>
-    <div class="prefixed">
-      {#if folderDate(renaming)}<span class="mono">{folderDate(renaming)} -</span>{/if}
-      <!-- svelte-ignore a11y_autofocus -->
-      <input id="rename-title" type="text" bind:value={title} placeholder="e.g. Yosemite" autofocus
-        onkeydown={(e) => e.key === 'Enter' && !busy && !titleCheck.error && renameName && renameName !== renaming.name && doRename()} />
-    </div>
-    {#if titleCheck.error}<div class="field-error">{titleCheck.error}</div>{/if}
-    <p class="muted small">The date stays at the front so the archive stays sorted, e.g. <span class="mono">2007-11-10 - SMU Homecoming</span>.</p>
-    {#if renameName}<p class="small">New name: <span class="mono">{renameName}</span></p>{/if}
+    <label class="f" for="rename-name">Folder name</label>
+    <input id="rename-name" type="text" bind:this={renameInput} bind:value={nameRaw} placeholder={folderName(folderDate(renaming), 'Yosemite')}
+      onkeydown={(e) => e.key === 'Enter' && !busy && canRename && doRename()} />
+    {#if nameCheck.error}<div class="field-error">{nameCheck.error}</div>{/if}
+    <p class="muted small">Keep the date at the front so the archive stays sorted, e.g. <span class="mono">2007-11-10 - SMU Homecoming</span>.</p>
+    {#if nameCheck.name && nameCheck.name !== nameRaw.trim()}<p class="small">New name: <span class="mono">{nameCheck.name}</span></p>{/if}
   {/if}
   {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
   {#snippet actions()}
     <button class="btn" onclick={closeDialog} disabled={busy}>Cancel</button>
-    <button class="btn primary" onclick={doRename} disabled={busy || !!titleCheck.error || !renameName || renameName === renaming?.name}>{busy ? 'Renaming…' : 'Rename'}</button>
+    <button class="btn primary" onclick={doRename} disabled={busy || !canRename}>{busy ? 'Renaming…' : 'Rename'}</button>
   {/snippet}
 </Dialog>
 
@@ -425,18 +433,17 @@
   <ul class="muted list">
     {#each mergeSorted as f (f.id)}<li>{f.name} <span class="small">({plural(f.files, 'file', 'files')})</span></li>{/each}
   </ul>
-  <label class="f" for="merge-title">Folder title</label>
-  <div class="prefixed">
-    {#if earliestDate(chosen)}<span class="mono">{earliestDate(chosen)} -</span>{/if}
-    <input id="merge-title" type="text" bind:value={title} placeholder="e.g. Yosemite" />
-  </div>
-  {#if titleCheck.error}<div class="field-error">{titleCheck.error}</div>{/if}
-  {#if mergeName}<p class="small">Merged folder: <span class="mono">{mergeName}</span></p>{/if}
+  <label class="f" for="merge-name">Folder name</label>
+  <input id="merge-name" type="text" bind:this={mergeInput} bind:value={nameRaw} placeholder={folderName(earliestDate(chosen), 'Yosemite')}
+    onkeydown={(e) => e.key === 'Enter' && !busy && !nameCheck.error && nameCheck.name && doMerge()} />
+  {#if nameCheck.error}<div class="field-error">{nameCheck.error}</div>{/if}
+  <p class="muted small">Starts with the earliest date so the archive stays sorted; change it if this set belongs to another day.</p>
+  {#if nameCheck.name && nameCheck.name !== nameRaw.trim()}<p class="small">Merged folder: <span class="mono">{nameCheck.name}</span></p>{/if}
   <div class="note">{plural(mergeFiles, 'file ends', 'files end')} up in one folder, still sorted into <span class="mono">Capture/</span> and <span class="mono">Videos/</span>. Filenames keep their timestamps; if two names clash, the second gets a -1 suffix.</div>
   {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
   {#snippet actions()}
     <button class="btn" onclick={closeDialog} disabled={busy}>Cancel</button>
-    <button class="btn primary" onclick={doMerge} disabled={busy || !!titleCheck.error || !mergeName}>{busy ? 'Merging…' : 'Merge'}</button>
+    <button class="btn primary" onclick={doMerge} disabled={busy || !!nameCheck.error || !nameCheck.name}>{busy ? 'Merging…' : 'Merge'}</button>
   {/snippet}
 </Dialog>
 

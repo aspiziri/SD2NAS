@@ -175,18 +175,40 @@ func (s *Service) Rename(ctx context.Context, id int64, title string) (Folder, e
 	if err != nil {
 		return Folder{}, err
 	}
+	return s.renameTo(ctx, id, func(row catalog.StagingFolder) (string, error) {
+		name := FolderName(folderDate(row), t)
+		if name == "" {
+			return "", fmt.Errorf("%w: the folder has no date, so it needs a title", ErrBadTitle)
+		}
+		if err := checkName(name); err != nil {
+			return "", fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+		}
+		return name, nil
+	})
+}
+
+// RenameAs gives folder id the whole name the user typed (CleanName), so
+// its date can change too.
+func (s *Service) RenameAs(ctx context.Context, id int64, name string) (Folder, error) {
+	n, err := CleanName(name)
+	if err != nil {
+		return Folder{}, err
+	}
+	return s.renameTo(ctx, id, func(catalog.StagingFolder) (string, error) { return n, nil })
+}
+
+// renameTo is Rename and RenameAs once the folder is locked; nameOf picks
+// its new name.
+func (s *Service) renameTo(ctx context.Context, id int64, nameOf func(catalog.StagingFolder) (string, error)) (Folder, error) {
 	rows, release, err := s.lockFolders(ctx, []int64{id})
 	if err != nil {
 		return Folder{}, err
 	}
 	defer release()
 	row := rows[0]
-	name := FolderName(folderDate(row), t)
-	if name == "" {
-		return Folder{}, fmt.Errorf("%w: the folder has no date, so it needs a title", ErrBadTitle)
-	}
-	if err := checkName(name); err != nil {
-		return Folder{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+	name, err := nameOf(row)
+	if err != nil {
+		return Folder{}, err
 	}
 	if name != row.Name {
 		releaseName, err := s.lockName(name)
@@ -265,25 +287,47 @@ func mergeTarget(rows []catalog.StagingFolder, name string) catalog.StagingFolde
 // earliest date among them and title, then removes the emptied sources
 // (§8). Files keep their path inside the folder; clashes get -1, -2.
 func (s *Service) Merge(ctx context.Context, ids []int64, title string) (Folder, error) {
-	ids = uniqueIDs(ids)
-	if len(ids) < 2 {
-		return Folder{}, fmt.Errorf("%w: merging needs at least two folders", ErrBadRequest)
-	}
 	t, err := CleanTitle(title)
 	if err != nil {
 		return Folder{}, err
+	}
+	return s.merge(ctx, ids, func(rows []catalog.StagingFolder) (string, error) {
+		name := FolderName(earliestDate(rows), t)
+		if name == "" {
+			return "", fmt.Errorf("%w: these folders have no date, so the merged folder needs a title", ErrBadTitle)
+		}
+		if err := checkName(name); err != nil {
+			return "", fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+		}
+		return name, nil
+	})
+}
+
+// MergeAs is Merge into a folder with the whole name the user typed
+// (CleanName), so its date need not be the earliest one.
+func (s *Service) MergeAs(ctx context.Context, ids []int64, name string) (Folder, error) {
+	n, err := CleanName(name)
+	if err != nil {
+		return Folder{}, err
+	}
+	return s.merge(ctx, ids, func([]catalog.StagingFolder) (string, error) { return n, nil })
+}
+
+// merge is Merge and MergeAs once the folders are locked; nameOf picks the
+// merged folder's name from them.
+func (s *Service) merge(ctx context.Context, ids []int64, nameOf func([]catalog.StagingFolder) (string, error)) (Folder, error) {
+	ids = uniqueIDs(ids)
+	if len(ids) < 2 {
+		return Folder{}, fmt.Errorf("%w: merging needs at least two folders", ErrBadRequest)
 	}
 	rows, release, err := s.lockFolders(ctx, ids)
 	if err != nil {
 		return Folder{}, err
 	}
 	defer release()
-	name := FolderName(earliestDate(rows), t)
-	if name == "" {
-		return Folder{}, fmt.Errorf("%w: these folders have no date, so the merged folder needs a title", ErrBadTitle)
-	}
-	if err := checkName(name); err != nil {
-		return Folder{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+	name, err := nameOf(rows)
+	if err != nil {
+		return Folder{}, err
 	}
 	releaseName, err := s.lockName(name)
 	if err != nil {
@@ -433,11 +477,12 @@ const MaxFiles = 20000
 var ErrChanged = errors.New("staging: files moved while the request was being made; reload and try again")
 
 // MoveRequest names the files to move and exactly one destination: an
-// existing folder, or the title of a new one.
+// existing folder, or the title or whole name of a new one.
 type MoveRequest struct {
 	SHAs     []string
 	ToID     int64  // an existing folder…
-	NewTitle string // …or a new folder "<earliest source date> - NewTitle" (exactly one of the two)
+	NewTitle string // …or a new folder "<earliest source date> - NewTitle"…
+	NewName  string // …or a new folder with this whole name (CleanName) (exactly one of the three)
 }
 
 // MoveResult is what Move did.
@@ -589,9 +634,20 @@ func (s *Service) Move(ctx context.Context, req MoveRequest) (MoveResult, error)
 		return MoveResult{}, err
 	}
 	title := strings.TrimSpace(req.NewTitle)
+	var newName string
+	given := 0
+	for _, b := range []bool{req.ToID > 0, req.NewTitle != "", req.NewName != ""} {
+		if b {
+			given++
+		}
+	}
 	switch {
-	case req.ToID > 0 && req.NewTitle != "", req.ToID <= 0 && req.NewTitle == "":
-		return MoveResult{}, fmt.Errorf("%w: give either a destination folder or a new folder's title", ErrBadRequest)
+	case given != 1:
+		return MoveResult{}, fmt.Errorf("%w: give either a destination folder or a new folder's title or name", ErrBadRequest)
+	case req.NewName != "":
+		if newName, err = CleanName(req.NewName); err != nil {
+			return MoveResult{}, err
+		}
 	case req.ToID <= 0:
 		if title, err = CleanTitle(title); err != nil {
 			return MoveResult{}, err
@@ -623,9 +679,12 @@ func (s *Service) Move(ctx context.Context, req MoveRequest) (MoveResult, error)
 
 	dest, ok := locked[req.ToID]
 	if !ok { // a new folder
-		name := FolderName(earliestDate(sources), title)
-		if err := checkName(name); err != nil {
-			return MoveResult{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+		name := newName
+		if name == "" {
+			name = FolderName(earliestDate(sources), title)
+			if err := checkName(name); err != nil {
+				return MoveResult{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+			}
 		}
 		releaseName, err := s.lockName(name)
 		if err != nil {
