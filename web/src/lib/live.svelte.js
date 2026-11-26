@@ -14,8 +14,10 @@ export const live = $state({
 
 let source = null;
 let retry = 0;
+let stopped = false;
 
 export function connectEvents() {
+  stopped = false;
   if (source) return;
   source = new EventSource('/api/events');
   source.onopen = () => {
@@ -28,7 +30,7 @@ export function connectEvents() {
     if (source.readyState === EventSource.CLOSED) {
       source = null;
       clearTimeout(retry);
-      retry = setTimeout(connectEvents, 5000);
+      if (!stopped) retry = setTimeout(connectEvents, 5000);
     }
   };
   source.addEventListener('ingest.current', (e) => {
@@ -49,7 +51,18 @@ export function connectEvents() {
   });
 }
 
+// disconnectEvents closes the stream and stops every reconnect (the Login
+// screen must not loop 401s) until connectEvents is called again.
+export function disconnectEvents() {
+  stopped = true;
+  clearTimeout(retry);
+  retry = 0;
+  source?.close();
+  source = null;
+  live.connected = false;
+}
+
 // Phones kill background connections; reconnect when the app is shown again.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && !source) connectEvents();
+  if (document.visibilityState === 'visible' && !source && !stopped) connectEvents();
 });

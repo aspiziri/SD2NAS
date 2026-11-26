@@ -1,6 +1,6 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { api, getHealth, ApiError } from './api.js';
+import { api, getHealth, ApiError, setUnauthorizedHandler } from './api.js';
 
 let calls;
 function respond(body, init) {
@@ -82,4 +82,26 @@ test('getHealth reports a network failure as "not reachable", which the banner s
 test('getHealth returns the report for 503 too', async () => {
   respond('{"status":"degraded","problems":["catalog: boom"]}', { status: 503 });
   assert.deepEqual(await getHealth(), { status: 'degraded', problems: ['catalog: boom'] });
+});
+
+test('a 401 token_required calls the unauthorized handler once and still throws', async () => {
+  let n = 0;
+  setUnauthorizedHandler(() => { n += 1; });
+  respond('{"error":"This SD2NAS needs its password.","code":"token_required"}', { status: 401 });
+  await assert.rejects(api('/api/x'), (err) => err instanceof ApiError && err.status === 401 && err.data.code === 'token_required');
+  assert.equal(n, 1);
+  setUnauthorizedHandler(null);
+});
+
+test('a bad_token 401 and other errors do not call the unauthorized handler', async () => {
+  let n = 0;
+  setUnauthorizedHandler(() => { n += 1; });
+  respond('{"error":"That password is not right.","code":"bad_token"}', { status: 401 });
+  await assert.rejects(api('/api/login', { method: 'POST', body: { token: 'x' } }), { status: 401 });
+  respond('{"error":"nope","code":"token_required"}', { status: 403 });
+  await assert.rejects(api('/api/x'), { status: 403 });
+  respond('oops', { status: 401 });
+  await assert.rejects(api('/api/x'), { status: 401 });
+  assert.equal(n, 0);
+  setUnauthorizedHandler(null);
 });

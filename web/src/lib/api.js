@@ -18,6 +18,14 @@ function parseJSON(text) {
   }
 }
 
+let onUnauthorized = null;
+
+// setUnauthorizedHandler registers fn to run when the server answers 401
+// token_required (the cookie expired or the password changed).
+export function setUnauthorizedHandler(fn) {
+  onUnauthorized = fn;
+}
+
 async function send(path, init) {
   try {
     return await fetch(path, init);
@@ -37,6 +45,7 @@ export async function api(path, { method = 'GET', body, signal } = {}) {
     const parsed = parseJSON(text);
     const data = parsed.ok && parsed.value && typeof parsed.value === 'object' ? parsed.value : null;
     const msg = data && typeof data.error === 'string' ? data.error : `${res.status} ${res.statusText}`;
+    if (res.status === 401 && data?.code === 'token_required') onUnauthorized?.();
     throw new ApiError(res.status, msg, data);
   }
   // 204, or an endpoint that answers success with no body.
