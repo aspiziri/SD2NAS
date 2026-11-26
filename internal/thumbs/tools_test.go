@@ -154,6 +154,15 @@ func fakeAnswer(mode string, args []string, stdout, stderr io.Writer) (code int,
 		fmt.Fprintln(stderr, "Error: File format error - x")
 	case "notfound":
 		fmt.Fprintln(stderr, "Error: File not found - x")
+	case "unreadable":
+		// Unreadable while <path>.locked exists (a permission fault the
+		// owner can fix), then the normal preview.
+		if _, err := os.Stat(args[len(args)-1] + ".locked"); err == nil {
+			fmt.Fprint(stdout, `[{"SourceFile":"x"}]`)
+			fmt.Fprintln(stderr, "Error: Error opening file - x")
+			break
+		}
+		fmt.Fprintf(stdout, `[{"SourceFile":"x","Orientation":6,"PreviewImage":"%s"}]`, b64(jpg))
 	case "foreign":
 		fmt.Fprint(stdout, "{ready0}\n")
 		fmt.Fprintf(stdout, `[{"SourceFile":"x","Orientation":6,"PreviewImage":"%s"}]`, b64(jpg))

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -34,14 +35,22 @@ type exifServer struct {
 	onStart    func(*exifProc) // tests: runs after each start
 }
 
+// pipeDrain bounds the wait, after a kill, for a request's readers to see
+// the end of exiftool's output; past it the pipes are closed under them
+// (only a child of exiftool still holding them open would need that).
+const pipeDrain = 5 * time.Second
+
 // exifProc is one running exiftool.
 type exifProc struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  *bufio.Reader
-	stderr  *bufio.Reader
-	exited  chan struct{} // closed once Wait has returned
-	waitErr error         // Wait's result; read it after exited is closed
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdoutPipe io.ReadCloser
+	stderrPipe io.ReadCloser
+	stdout     *bufio.Reader
+	stderr     *bufio.Reader
+	reaping    bool          // reap has started Wait; guarded by the server's lock
+	exited     chan struct{} // closed once Wait has returned
+	waitErr    error         // Wait's result; read it after exited is closed
 }
 
 // exifReply is what one reader goroutine of a request got.
@@ -63,6 +72,11 @@ func (e *exifServer) run(ctx context.Context, args []string) (stdout []byte, std
 	select {
 	case e.lock <- struct{}{}:
 	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// The render's whole budget went on waiting behind other files.
+			e.log.Warn("RAW preview timed out waiting for exiftool, busy with other files")
+			return nil, "", fmt.Errorf("exiftool busy with other files: %w", ctx.Err())
+		}
 		return nil, "", ctx.Err()
 	}
 	defer func() { <-e.lock }()
@@ -91,9 +105,7 @@ func (e *exifServer) run(ctx context.Context, args []string) (stdout []byte, std
 	defer func() {
 		if !clean {
 			e.kill(p)
-			for ; pending > 0; pending-- {
-				<-replies
-			}
+			e.finish(p, replies, &pending, nil)
 		}
 	}()
 
@@ -142,14 +154,15 @@ func (e *exifServer) run(ctx context.Context, args []string) (stdout []byte, std
 }
 
 // failure kills p after a reader failed with err, waits for the other
-// reader, and describes the failure with what exiftool wrote to stderr.
+// reader and for p to be reaped, and describes the failure with what
+// exiftool wrote to stderr and its exit status.
 func (e *exifServer) failure(p *exifProc, err error, replies <-chan exifReply, pending *int, errOut []byte) error {
 	e.kill(p)
-	for ; *pending > 0; *pending-- {
-		if r := <-replies; r.stderr {
+	e.finish(p, replies, pending, func(r exifReply) {
+		if r.stderr {
 			errOut = r.data
 		}
-	}
+	})
 	err = fmt.Errorf("exiftool: %w", err)
 	if errors.Is(err, errStopped) && p.waitErr != nil {
 		err = fmt.Errorf("%w (%v)", err, p.waitErr)
@@ -162,8 +175,10 @@ func (e *exifServer) failure(p *exifProc, err error, replies <-chan exifReply, p
 
 // start launches the process. Called with the lock held.
 func (e *exifServer) start() error {
+	// No WaitDelay: with all three pipes from Std*Pipe there are no copying
+	// goroutines for it to bound, and Wait (run only once the readers are
+	// done, see reap) returns as soon as exiftool has exited.
 	cmd := exec.Command(e.cmd, "-stay_open", "True", "-@", "-")
-	cmd.WaitDelay = 5 * time.Second // don't hang on pipes held open by a killed tool's children
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("exiftool: %w", err)
@@ -179,12 +194,9 @@ func (e *exifServer) start() error {
 	if err := cmd.Start(); err != nil { // closes the pipes when it fails
 		return fmt.Errorf("exiftool: %w", err)
 	}
-	p := &exifProc{cmd: cmd, stdin: stdin, stdout: bufio.NewReaderSize(stdout, 64<<10),
-		stderr: bufio.NewReader(stderr), exited: make(chan struct{})}
-	go func() {
-		p.waitErr = cmd.Wait()
-		close(p.exited)
-	}()
+	p := &exifProc{cmd: cmd, stdin: stdin, stdoutPipe: stdout, stderrPipe: stderr,
+		stdout: bufio.NewReaderSize(stdout, 64<<10), stderr: bufio.NewReader(stderr),
+		exited: make(chan struct{})}
 	e.proc = p
 	e.starts++
 	if e.onStart != nil {
@@ -193,18 +205,64 @@ func (e *exifServer) start() error {
 	return nil
 }
 
-// kill stops p and waits until it has been reaped. Called with the lock
-// held; killing a process that is already gone is harmless.
+// kill stops p and forgets it; finish then waits for its readers and
+// reaps it. Called with the lock held; killing a process that is already
+// gone is harmless.
 func (e *exifServer) kill(p *exifProc) {
-	// Neither error matters once exited is closed below: Kill fails only for
-	// a process that has already exited, and closing stdin only lets a
-	// process that ignored the kill see EOF.
-	_ = p.cmd.Process.Kill()
-	_ = p.stdin.Close()
-	<-p.exited // Wait returns at most WaitDelay after the process exits
+	// Kill fails for a process that has already exited (on Windows also
+	// before it is reaped), and closing stdin can only fail for a pipe
+	// already broken: neither stops the process from going.
+	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		e.log.Debug("kill exiftool", "err", err)
+	}
+	if err := p.stdin.Close(); err != nil {
+		e.log.Debug("close exiftool's stdin", "err", err)
+	}
 	if e.proc == p {
 		e.proc = nil
 	}
+}
+
+// finish waits for a request's pending readers of p (passing each reply to
+// got, when not nil) and then reaps p. Wait closes the read ends of the
+// pipes, so it runs only once the readers are done: a tool dying mid-request
+// keeps its last words on stderr. Called with the lock held, after kill.
+func (e *exifServer) finish(p *exifProc, replies <-chan exifReply, pending *int, got func(exifReply)) {
+	if *pending > 0 {
+		timer := time.NewTimer(pipeDrain)
+		defer timer.Stop()
+		for *pending > 0 {
+			select {
+			case r := <-replies:
+				*pending--
+				if got != nil {
+					got(r)
+				}
+			case <-timer.C:
+				e.log.Warn("exiftool's output stayed open after it was killed: closing it")
+				for _, c := range []io.Closer{p.stdoutPipe, p.stderrPipe} {
+					if err := c.Close(); err != nil {
+						e.log.Debug("close exiftool's output", "err", err)
+					}
+				}
+			}
+		}
+	}
+	e.reap(p)
+	<-p.exited
+}
+
+// reap starts Wait for p, once. Called with the lock held, when no reader
+// of p is running.
+func (e *exifServer) reap(p *exifProc) {
+	if p.reaping {
+		return
+	}
+	p.reaping = true
+	go func() {
+		p.waitErr = p.cmd.Wait()
+		close(p.exited)
+	}()
 }
 
 // close asks the process to exit, waits at most 1 s, and kills it if it
@@ -228,8 +286,11 @@ func (e *exifServer) close() {
 	if err != nil {
 		e.log.Warn("stop exiftool: killing it", "err", err)
 		e.kill(p)
+		e.reap(p)
+		<-p.exited
 		return
 	}
+	e.reap(p) // no request is running, so nothing reads its pipes
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	select {
@@ -243,6 +304,7 @@ func (e *exifServer) close() {
 	case <-timer.C:
 		e.log.Warn("exiftool did not stop within 1 s: killing it")
 		e.kill(p)
+		<-p.exited
 	}
 }
 

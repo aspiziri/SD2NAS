@@ -137,8 +137,10 @@ func TestExifServerDies(t *testing.T) {
 	if err == nil || errors.Is(err, ErrUndecodable) {
 		t.Fatalf("err = %v, want an error that is not ErrUndecodable", err)
 	}
-	if !strings.Contains(err.Error(), "fake tool: dying") {
-		t.Errorf("err = %v, want one carrying exiftool's stderr", err)
+	// Wait (which closes the pipes) runs only after the readers are done,
+	// so the dying tool's last stderr line is always there.
+	if !strings.Contains(err.Error(), "fake tool: dying") || !strings.Contains(err.Error(), "exit status 3") {
+		t.Fatalf("err = %v, want one carrying exiftool's stderr and exit status", err)
 	}
 	wantGone(t, onlyProc(t, procs))
 	t.Setenv("SD2NAS_FAKE_TOOL", "preview")
@@ -171,6 +173,23 @@ func TestExifServerFileError(t *testing.T) {
 	}
 	if n := fakeStarts(t); n != 1 {
 		t.Fatalf("%d exiftool starts, want 1 (a file error leaves the process running)", n)
+	}
+}
+
+func TestExifServerUnreadable(t *testing.T) {
+	c, _ := fakeCache(t, "unreadable", Config{})
+	src := fakeSource(t, 446, media.KindRaw)
+	lock := writeSource(t, filepath.Dir(src.Path), filepath.Base(src.Path)+".locked", nil)
+	_, err := c.Get(context.Background(), src, ThumbSize)
+	if !errors.Is(err, fs.ErrPermission) || errors.Is(err, ErrUndecodable) || !strings.Contains(err.Error(), "Error opening file") {
+		t.Fatalf("err = %v, want fs.ErrPermission carrying Error opening file, not ErrUndecodable", err)
+	}
+	if err := os.Remove(lock); err != nil { // the owner fixes the permissions
+		t.Fatal(err)
+	}
+	wantPreview(t, c, src) // not remembered: rendered again
+	if n := fakeStarts(t); n != 1 {
+		t.Fatalf("%d exiftool starts, want 1 (an unreadable file leaves the process running)", n)
 	}
 }
 
@@ -237,6 +256,25 @@ func TestExifServerCancelWhileQueued(t *testing.T) {
 			t.Errorf("seq = %d, starts = %d, want 1 and 1", e.seq, e.starts)
 		}
 	})
+}
+
+func TestExifServerTimeoutWhileQueued(t *testing.T) {
+	var logBuf bytes.Buffer
+	e := newExifServer(os.Args[0], slog.New(slog.NewTextHandler(&logBuf, nil)))
+	e.lock <- struct{}{} // another request holds exiftool
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, _, err := e.run(ctx, exifArgs("PreviewImage", "/a.ARW"))
+	<-e.lock
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("err = %v, want DeadlineExceeded saying exiftool was busy", err)
+	}
+	if got := logBuf.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "timed out waiting for exiftool") {
+		t.Fatalf("log = %q, want a WARN about the wait", got)
+	}
+	if e.starts != 0 {
+		t.Fatalf("%d starts, want 0", e.starts)
+	}
 }
 
 func TestExifServerPanicKills(t *testing.T) {

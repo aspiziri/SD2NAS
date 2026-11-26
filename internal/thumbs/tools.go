@@ -159,6 +159,11 @@ func (c *Cache) exiftool(ctx context.Context, path string, opts ...string) ([]by
 			// so not to be remembered.
 			return nil, fmt.Errorf("exiftool: %w: %s", fs.ErrNotExist, msg)
 		}
+		if strings.Contains(msg, "Error: Error opening file") {
+			// Unreadable (permissions, I/O): a fault the owner can fix, as
+			// os.Open's EACCES is for a JPEG, so not to be remembered.
+			return nil, fmt.Errorf("exiftool: %w: %s", fs.ErrPermission, msg)
+		}
 		if len(bytes.TrimSpace(out)) == 0 || hasErrorLine(msg) {
 			return nil, fmt.Errorf("exiftool: %w: %s", ErrUndecodable, msg)
 		}
