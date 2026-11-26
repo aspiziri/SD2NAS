@@ -73,10 +73,11 @@ Then give the container the same value: Docker → SD2NAS → Edit. A new instal
 
 ## Settings
 
-Open the web UI's Settings page to change the day cutoff, verification, free-space reserve, staging warning, archive scan time, backup folder and skip list, and the time of the daily stale-staging notice. It replaces the terminal `curl`, which still works as a fallback (add `-H "Authorization: Bearer $SD2NAS_TOKEN"` if you set a password):
+Open the web UI's Settings page to change the day cutoff, verification, free-space reserve, staging warning, archive scan time, backup folder and skip list, and the time of the daily stale-staging notice. It replaces the terminal `curl`, which still works as a fallback (the `Authorization` header is needed only if you set a password):
 
 ```
-curl -s -X PUT -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' http://localhost:4040/api/settings -d '{"archive_skip":"Output/, CaptureOne/, *.cosessiondb, Exports/"}'
+. /boot/config/plugins/unassigned.devices/sd2nas.cfg
+curl -s -X PUT -H "Authorization: Bearer $SD2NAS_TOKEN" -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' "$SD2NAS_URL/api/settings" -d '{"archive_skip":"Output/, CaptureOne/, *.cosessiondb, Exports/"}'
 ```
 
 ## Notifications
