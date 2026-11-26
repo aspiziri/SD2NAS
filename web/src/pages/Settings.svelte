@@ -34,17 +34,26 @@
     saveError = '';
   }
 
+  let ctl = null; // the load in flight; a newer one aborts it
   async function load() {
+    ctl?.abort();
+    const mine = (ctl = new AbortController());
     try {
-      adopt(await api('/api/settings'));
+      const res = await api('/api/settings', { signal: mine.signal });
+      if (mine.signal.aborted) return;
+      adopt(res);
       loadError = '';
     } catch (err) {
-      loadError = describeError(err);
+      if (err.name === 'AbortError' || mine.signal.aborted) return;
+      loadError = describeError(err); // the last good data stays on screen
     }
   }
 
   onMount(() => {
     load();
+    return () => ctl?.abort();
+  });
+  onMount(() => {
     api('/api/auth').then((a) => { authRequired = !!a?.required; }).catch(() => { authRequired = false; });
   });
 
@@ -57,7 +66,8 @@
 
   function edit(key) {
     if (serverErrors[key]) {
-      const { [key]: _gone, ...rest } = serverErrors;
+      const rest = { ...serverErrors };
+      delete rest[key];
       serverErrors = rest;
     }
   }
@@ -112,15 +122,17 @@
 
 {#snippet hint(key)}
   {@const msg = problem(key)}
-  <div class="muted small">{FIELDS[key].help} Default {defaults[key] === '' ? 'none' : defaults[key]}.</div>
+  <div class="muted small">{FIELDS[key].help} Default {defaults[key]}.</div>
   {#if msg}<div class="field-error" role="alert">{msg}</div>{/if}
 {/snippet}
 
 {#if loadError}
-  <div class="note bad" role="alert">{loadError} <button class="btn" onclick={load}>Retry</button></div>
-{:else if !loaded}
-  <p class="muted">Loading…</p>
+  <div class="note bad" role="alert">{loaded ? "Could not refresh the settings: " : ""}{loadError} <button class="btn" onclick={load}>Retry</button></div>
+{/if}
+{#if !loaded}
+  {#if !loadError}<p class="muted">Loading…</p>{/if}
 {:else}
+  <fieldset class="plain" disabled={saving}>
   <div class="card">
     <h2>Imports</h2>
     <div class="form2">
@@ -187,6 +199,7 @@
   </div>
 
   {#if saveError}<div class="note bad" role="alert">{saveError}</div>{/if}
+  </fieldset>
   <div class="row savebar">
     <button class="btn primary" onclick={save} disabled={!dirty || saving}>{saving ? 'Saving…' : 'Save changes'}</button>
     <button class="btn" onclick={discard} disabled={!dirty || saving}>Discard</button>
@@ -214,6 +227,7 @@
 
 <style>
   .form2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
+  .plain { border: 0; padding: 0; margin: 0; min-width: 0; }
   .wide { grid-column: 1 / -1; }
   .nowrap { flex-wrap: nowrap; }
   .nowrap input { flex: 1; min-width: 0; }

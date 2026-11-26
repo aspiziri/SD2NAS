@@ -32,7 +32,7 @@ export function checkField(key, value) {
     case 'staging_warn_days':
       return /^\d+$/.test(value) && Number(value) <= 3650 ? '' : 'Use 0 (off) to 3650 days.';
     case 'backup_dir':
-      return value === '' || value.startsWith('/') || /^[A-Za-z]:/.test(value) && value[2] === BACKSLASH ? '' : 'Use an absolute path, or Use default.';
+      return value === '' || value.startsWith('/') || (/^[A-Za-z]:/.test(value) && value[2] === BACKSLASH) ? '' : 'Use an absolute path, or Use default.';
     case 'archive_skip': {
       const entries = value.split(',').map((e) => e.trim()).filter(Boolean);
       const bad = value.length > 2048 || [...value].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127) || entries.length > 50

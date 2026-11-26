@@ -50,3 +50,9 @@ test('checkField agrees with the shared rules table', () => {
     assert.equal(checkField(c.key, c.value) === '', c.ok, `${c.key} = ${JSON.stringify(c.value)}`);
   }
 });
+
+test('checkField: backup_dir drive letters need a backslash; archive_skip rejects slashes inside a name', () => {
+  assert.notEqual(checkField('backup_dir', 'C:x'), '');
+  assert.equal(checkField('archive_skip', 'Output/, *.xmp'), '');
+  assert.notEqual(checkField('archive_skip', 'a/b'), '');
+});
