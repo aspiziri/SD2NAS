@@ -66,6 +66,13 @@ export function wholeFolderName(name, dates) {
   return folderName([...dates].sort()[0], title);
 }
 
+// isWholeShift is the server's rule (planShift): the shift covers every staged
+// file of the folder. The button for "all times" says so; a selection does when
+// no kind filter hides files and it holds as many as the folder has.
+export function isWholeShift({ button, kind, selected, folderFiles }) {
+  return button || (kind === '' && selected === folderFiles);
+}
+
 // previewShift works out, for the files that have a capture time, what a shift
 // by `seconds` would do. files: [{name, capture_time}]; folder: {name, dates};
 // whole: the shift covers every staged file of the folder.
@@ -74,6 +81,13 @@ export function previewShift(files, seconds, { dayStartsAt, folder, whole }) {
   const skipped = files.length - timed.length;
   const shift = (f) => shiftedName(f.name, f.capture_time, seconds);
   const out = { skipped, count: timed.length, first: null, last: null, moved: null, folderName: null };
+  for (const f of timed) {
+    const y = Number(shiftWall(f.capture_time, seconds).slice(0, 4));
+    if (y < 1970 || y > 2099) {
+      out.error = `Shifting by that much would put ${f.name} outside 1970–2099.`;
+      return out;
+    }
+  }
   if (timed.length) {
     out.first = { from: timed[0].name, to: shift(timed[0]), capture: shiftWall(timed[0].capture_time, seconds) };
     const l = timed[timed.length - 1];

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { parseAmount, secondsBetween, shiftWall, shiftedName, folderDateOf, wholeFolderName, previewShift } from './shift.js';
+import { parseAmount, secondsBetween, shiftWall, shiftedName, folderDateOf, wholeFolderName, previewShift, isWholeShift } from './shift.js';
 
 // The table the Go test (TestShiftRuleCases) reads too: Decision 27.
 const cases = JSON.parse(readFileSync(new URL('./testdata/rules-cases.json', import.meta.url), 'utf8'));
@@ -82,4 +82,18 @@ test('previewShift', () => {
   assert.equal(part.folderName, null);
   assert.equal(previewShift(files, 5 * 3600, { dayStartsAt: '04:00', folder, whole: false }).moved, 1);
   assert.equal(previewShift(files, 3600, { dayStartsAt: '', folder, whole: false }).moved, null);
+});
+
+test('isWholeShift matches the server rule', () => {
+  assert.equal(isWholeShift({ button: true, kind: 'raw', selected: 3, folderFiles: 10 }), true);
+  assert.equal(isWholeShift({ button: false, kind: '', selected: 10, folderFiles: 10 }), true);
+  assert.equal(isWholeShift({ button: false, kind: '', selected: 9, folderFiles: 10 }), false);
+  assert.equal(isWholeShift({ button: false, kind: 'raw', selected: 10, folderFiles: 10 }), false);
+});
+
+test('previewShift reports a result outside 1970-2099', () => {
+  const folder = { name: 'x', dates: [] };
+  const files = [{ name: 'a.JPG', capture_time: '2099-12-31T23:00:00' }];
+  assert.equal(previewShift(files, 7200, { dayStartsAt: '', folder, whole: false }).error, 'Shifting by that much would put a.JPG outside 1970–2099.');
+  assert.equal(previewShift(files, 60, { dayStartsAt: '', folder, whole: false }).error, undefined);
 });

@@ -10,7 +10,7 @@
   import { clickAction, toggleKey, selectRange, dragSelection, prune } from '../lib/selection.js';
   import { folderDate, folderName, checkFolderName } from '../lib/naming.js';
   import { describeError, plural } from '../lib/messages.js';
-  import { parseAmount, secondsBetween, previewShift, MAX_SHIFT, MAX_SHIFT_FILES } from '../lib/shift.js';
+  import { parseAmount, secondsBetween, previewShift, isWholeShift, MAX_SHIFT, MAX_SHIFT_FILES } from '../lib/shift.js';
   import { longPressSelect } from '../lib/press.js';
   import { toast } from '../lib/toast.svelte.js';
   import Thumb from '../components/Thumb.svelte';
@@ -265,6 +265,7 @@
   let shiftSign = $state('+');
   let shiftFields = $state({ days: '', hours: '', minutes: '', seconds: '' });
   let shiftTarget = $state('');
+  let shiftTouched = $state(false); // the user changed something: only then is a "not yet" error shown
   let dayStartsAt = $state('');
   let previewNote = $state('');
 
@@ -287,7 +288,8 @@
   async function openShift(whole) {
     dialogError = '';
     previewNote = '';
-    shiftWhole = whole;
+    shiftWhole = isWholeShift({ button: whole, kind: shownKind, selected: selected.size, folderFiles: data.folder.files });
+    shiftTouched = false;
     shiftMode = 'amount';
     shiftSign = '+';
     shiftFields = { days: '', hours: '', minutes: '', seconds: '' };
@@ -314,25 +316,38 @@
     }
     await Promise.all(jobs);
     shiftLoading = false;
-    shiftTarget = shiftFirst?.capture_time.slice(0, 19) ?? '';
+    if (!shiftTarget) shiftTarget = shiftFirst?.capture_time.slice(0, 19) ?? '';
   }
 
-  function doShift() {
+  // A 4xx answer means nothing was shifted, so the dialog stays for a retry.
+  // Any other failure may have shifted some files already (a 500 "shifted N of
+  // M files: ..."): the dialog's file list is then stale, so close it, say what
+  // the server said, and reload; a second submit from it must never happen.
+  async function doShift() {
     const seconds = shiftAmount.seconds;
     const shas = shiftFiles.map((x) => x.sha256);
-    run(async () => {
+    busy = true;
+    dialogError = '';
+    try {
       const res = await api('/api/staging/shift', { method: 'POST', body: { fileShas: shas, seconds } });
       let msg = `Shifted ${plural(res.shifted, 'file', 'files')}`;
       if (res.moved) msg += `; ${plural(res.moved, 'file', 'files')} moved to other folders`;
       if (res.skipped) msg += `; ${plural(res.skipped, 'file', 'files')} had no capture time`;
-      toast(res.wanted_name ? `${msg}. Kept the name ${res.folder.name}: ${res.wanted_name} is taken. Merge them if they belong together.` : msg);
+      toast(res.wanted_name ? `${msg}. The folder kept its name ${res.folder.name}; it wanted ${res.wanted_name}. Merge them if they belong together.` : msg);
+      dialog = '';
       clear();
-      if (res.removed) {
-        navigate('/staging', { replace: true });
-        return true;
+      if (res.removed) navigate('/staging', { replace: true });
+      else load(shownKind);
+    } catch (err) {
+      if (err.status >= 400 && err.status < 500) dialogError = describeError(err);
+      else {
+        dialog = '';
+        toast(describeError(err), 'bad', 10000);
       }
-      return false;
-    });
+      load(shownKind);
+    } finally {
+      busy = false;
+    }
   }
 
   function doCull() {
@@ -473,12 +488,12 @@
       {#if shiftMode === 'amount'}
         <div class="amount">
           <div class="sign" role="group" aria-label="Direction">
-            <button class="btn" class:primary={shiftSign === '+'} aria-pressed={shiftSign === '+'} onclick={() => (shiftSign = '+')} aria-label="Later">+</button>
-            <button class="btn" class:primary={shiftSign === '-'} aria-pressed={shiftSign === '-'} onclick={() => (shiftSign = '-')} aria-label="Earlier">−</button>
+            <button class="btn" class:primary={shiftSign === '+'} aria-pressed={shiftSign === '+'} onclick={() => { shiftSign = '+'; shiftTouched = true; }} aria-label="+ (later)">+</button>
+            <button class="btn" class:primary={shiftSign === '-'} aria-pressed={shiftSign === '-'} onclick={() => { shiftSign = '-'; shiftTouched = true; }} aria-label="− (earlier)">−</button>
           </div>
           {#each [['days', 'Days'], ['hours', 'Hours'], ['minutes', 'Minutes'], ['seconds', 'Seconds']] as [key, label] (key)}
             <label class="num"><span class="muted small">{label}</span>
-              <input type="text" inputmode="numeric" placeholder="0" bind:value={shiftFields[key]} /></label>
+              <input type="text" inputmode="numeric" placeholder="0" bind:value={shiftFields[key]} oninput={() => (shiftTouched = true)} /></label>
           {/each}
         </div>
       {/if}
@@ -486,14 +501,16 @@
       {#if shiftMode === 'target' && shiftFirst}
         <div class="amount target">
           <p class="small" style="margin:0"><span class="mono">{shiftFirst.name}</span> now reads <span class="mono">{formatCapture(shiftFirst.capture_time)}</span>. It should read:</p>
-          <input class="dt" type="datetime-local" step="1" bind:value={shiftTarget} aria-label="Correct time for {shiftFirst.name}" />
+          <input class="dt" type="datetime-local" step="1" bind:value={shiftTarget} oninput={() => (shiftTouched = true)} aria-label="Correct time for {shiftFirst.name}" />
         </div>
       {/if}
     </div>
     {#if shiftLoading}
       <p class="muted small">Loading files…</p>
     {:else if shiftAmount.error}
-      <div class="field-error">{shiftAmount.error}</div>
+      {#if shiftTouched || shiftAmount.error !== 'Shift by at least one second.'}<div class="field-error">{shiftAmount.error}</div>{/if}
+    {:else if shiftPreview?.error}
+      <div class="field-error">{shiftPreview.error}</div>
     {:else if shiftPreview}
       <div class="note preview">
         {#if shiftPreview.first}
@@ -513,7 +530,7 @@
     {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
     {#snippet actions()}
       <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
-      <button class="btn primary" onclick={doShift} disabled={busy || shiftLoading || shiftAmount.seconds === undefined}>{busy ? 'Shifting…' : 'Shift'}</button>
+      <button class="btn primary" onclick={doShift} disabled={busy || shiftLoading || shiftFiles.length === 0 || shiftAmount.seconds === undefined || !!shiftPreview?.error}>{busy ? 'Shifting…' : 'Shift'}</button>
     {/snippet}
   </Dialog>
 
