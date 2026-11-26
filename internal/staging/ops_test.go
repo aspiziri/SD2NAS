@@ -97,6 +97,35 @@ func TestRenameKeepsDatePrefix(t *testing.T) {
 	e.nameKeyFree(t, got.Name)
 }
 
+func TestRenameAsChangesTheDate(t *testing.T) {
+	e := newOpsEnv(t)
+	f := e.folder(t, "2025-05-30 - Trip", "2025-05-30")
+	s1 := e.stage(t, f, "a.JPG", "jpg", opsNow)
+	v := e.version()
+	got, err := e.svc.RenameAs(t.Context(), f.ID, " 2025-06-02 - Hike ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "2025-06-02 - Hike" {
+		t.Fatalf("folder = %q", got.Name)
+	}
+	if p := e.relPath(t, s1); p != "Staging/2025-06-02 - Hike/a.JPG" {
+		t.Errorf("rel_path = %q", p)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30 - Trip")
+	e.bumped(t, v)
+	e.lockFree(t, f.ID)
+	e.nameKeyFree(t, got.Name)
+
+	if got, err := e.svc.RenameAs(t.Context(), f.ID, "2025-06-02 - "); err != nil || got.Name != "2025-06-02" {
+		t.Errorf("dangling separator: %q, %v", got.Name, err)
+	}
+	if _, err := e.svc.RenameAs(t.Context(), f.ID, "  "); !errors.Is(err, ErrBadTitle) {
+		t.Errorf("empty name: err = %v, want ErrBadTitle", err)
+	}
+	e.lockFree(t, f.ID)
+}
+
 func TestRenameEmptyTitleKeepsDate(t *testing.T) {
 	e := newOpsEnv(t)
 	f := e.folder(t, "2025-05-30 - Trip", "2025-05-30")

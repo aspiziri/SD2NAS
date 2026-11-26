@@ -447,7 +447,7 @@ GET    /api/ingests/{id}                 summary + skipped-file breakdown + cloc
 
 GET    /api/staging                      folders with counts, sizes, sample thumbs, warnings
 GET    /api/staging/{id}/files           ?kind=raw|jpg|video
-PATCH  /api/staging/{id}                 {title}
+PATCH  /api/staging/{id}                 {name | title}  (name: the whole folder name; title: keeps the date)
 POST   /api/staging/merge                {ids[], name | title}  (name: the whole folder name; title: earliest date + title)
 POST   /api/staging/move                 {fileShas[], toId | newTitle}
 POST   /api/staging/cull                 {fileShas[]}

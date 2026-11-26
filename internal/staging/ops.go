@@ -175,18 +175,40 @@ func (s *Service) Rename(ctx context.Context, id int64, title string) (Folder, e
 	if err != nil {
 		return Folder{}, err
 	}
+	return s.renameTo(ctx, id, func(row catalog.StagingFolder) (string, error) {
+		name := FolderName(folderDate(row), t)
+		if name == "" {
+			return "", fmt.Errorf("%w: the folder has no date, so it needs a title", ErrBadTitle)
+		}
+		if err := checkName(name); err != nil {
+			return "", fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+		}
+		return name, nil
+	})
+}
+
+// RenameAs gives folder id the whole name the user typed (CleanName), so
+// its date can change too.
+func (s *Service) RenameAs(ctx context.Context, id int64, name string) (Folder, error) {
+	n, err := CleanName(name)
+	if err != nil {
+		return Folder{}, err
+	}
+	return s.renameTo(ctx, id, func(catalog.StagingFolder) (string, error) { return n, nil })
+}
+
+// renameTo is Rename and RenameAs once the folder is locked; nameOf picks
+// its new name.
+func (s *Service) renameTo(ctx context.Context, id int64, nameOf func(catalog.StagingFolder) (string, error)) (Folder, error) {
 	rows, release, err := s.lockFolders(ctx, []int64{id})
 	if err != nil {
 		return Folder{}, err
 	}
 	defer release()
 	row := rows[0]
-	name := FolderName(folderDate(row), t)
-	if name == "" {
-		return Folder{}, fmt.Errorf("%w: the folder has no date, so it needs a title", ErrBadTitle)
-	}
-	if err := checkName(name); err != nil {
-		return Folder{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+	name, err := nameOf(row)
+	if err != nil {
+		return Folder{}, err
 	}
 	if name != row.Name {
 		releaseName, err := s.lockName(name)

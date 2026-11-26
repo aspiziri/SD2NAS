@@ -161,6 +161,16 @@ func TestStagingRenameAPI(t *testing.T) {
 			t.Errorf("%s: error has a Go prefix: %q", body, e.Error)
 		}
 	}
+	rec = send(t, f.s, http.MethodPatch, url, `{"title":"ignored","name":"2025-06-02 - Hike"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("name: status %d, body %s", rec.Code, rec.Body)
+	}
+	if got := folderIn(t, rec); got.Name != "2025-06-02 - Hike" {
+		t.Errorf("name: folder %+v", got)
+	}
+	if e := wantCode(t, send(t, f.s, http.MethodPatch, url, `{"name":"a/b"}`), http.StatusBadRequest, ""); !strings.HasPrefix(e.Error, "The folder name contains") {
+		t.Errorf("bad-name error %q", e.Error)
+	}
 	e := wantCode(t, send(t, f.s, http.MethodPatch, url, `{"title":"a/b"}`), http.StatusBadRequest, "")
 	if !strings.HasPrefix(e.Error, "The title contains") {
 		t.Errorf("bad-title error %q", e.Error)
@@ -372,7 +382,7 @@ func TestStagingBadRequestSentences(t *testing.T) {
 		{http.MethodPatch, "/api/staging/abc", `{"title":"x"}`, "The folder id must be a positive whole number."},
 		{http.MethodPatch, "/api/staging/1", `{`, "The request body is not valid JSON."},
 		{http.MethodPatch, "/api/staging/1", `{"title":"x","extra":1}`, "The request has a field this server does not know."},
-		{http.MethodPatch, "/api/staging/1", `{}`, "Give a title (an empty one removes it)."},
+		{http.MethodPatch, "/api/staging/1", `{}`, "Give a name, or a title (an empty one removes it)."},
 		{http.MethodPost, "/api/staging/cull", `{"fileShas":["` + strings.Repeat("a", 5<<20) + `"]}`, "The request is too large."},
 		{http.MethodPost, "/api/staging/move", `{"fileShas":[]}`, "Give exactly one of toId and newTitle."},
 		{http.MethodPost, "/api/staging/move", `{"fileShas":[],"toId":0}`, "The destination folder id must be a positive whole number."},

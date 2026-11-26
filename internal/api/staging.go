@@ -178,16 +178,23 @@ func (h *stagingHandlers) rename(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Title *string `json:"title"`
+		Name  *string `json:"name"` // the whole name; wins over title
 	}
 	if err := decodeBody(w, r, &body, smallBody); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.Title == nil {
-		writeError(w, http.StatusBadRequest, "Give a title (an empty one removes it).")
+	var f staging.Folder
+	var err error
+	switch {
+	case body.Name != nil:
+		f, err = h.svc.RenameAs(opContext(r), id, *body.Name)
+	case body.Title != nil:
+		f, err = h.svc.Rename(opContext(r), id, *body.Title)
+	default:
+		writeError(w, http.StatusBadRequest, "Give a name, or a title (an empty one removes it).")
 		return
 	}
-	f, err := h.svc.Rename(opContext(r), id, *body.Title)
 	if err != nil {
 		writeOpError(w, h.log, "folder", "rename staging folder", err)
 		return
