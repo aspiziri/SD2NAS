@@ -55,13 +55,20 @@ func (a auth) authorized(r *http.Request) bool {
 	return err == nil && subtle.ConstantTimeCompare([]byte(c.Value), []byte(a.session)) == 1
 }
 
-// openPath: what answers without the token. The path is judged as the mux
-// will route it, after cleaning.
+// openPath: what answers without the token. A request is open only when both
+// its decoded path and its escaped path (the one the mux routes on, segment by
+// segment) are, each after cleaning: /api/thumbs/%2e%2e%2f%2e%2e decodes and
+// cleans to /, but the mux still hands it to an /api/ route.
 func openPath(r *http.Request) bool {
-	p := path.Clean("/" + r.URL.Path)
+	return openPathAs(r.Method, path.Clean("/"+r.URL.Path)) &&
+		openPathAs(r.Method, path.Clean("/"+r.URL.EscapedPath()))
+}
+
+// openPathAs judges one cleaned path.
+func openPathAs(method, p string) bool {
 	switch {
-	case p == "/api/auth" && (r.Method == http.MethodGet || r.Method == http.MethodHead),
-		(p == "/api/login" || p == "/api/logout") && r.Method == http.MethodPost:
+	case p == "/api/auth" && (method == http.MethodGet || method == http.MethodHead),
+		(p == "/api/login" || p == "/api/logout") && method == http.MethodPost:
 		return true
 	case p == "/api" || strings.HasPrefix(p, "/api/"):
 		return false
@@ -70,7 +77,9 @@ func openPath(r *http.Request) bool {
 }
 
 // requireToken refuses every /api/ request but the open ones unless it
-// carries the token. It runs before the mux, so no route can be missed.
+// carries the token. It runs before the mux and judges both the decoded and
+// the escaped path (see openPath), so a request the mux would route to an
+// /api/ handler cannot pass as open.
 func (s *Server) requireToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if openPath(r) || s.auth.authorized(r) {

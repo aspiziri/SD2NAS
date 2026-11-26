@@ -4,11 +4,14 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aspiziri/SD2NAS/internal/notices"
 )
 
 const testToken = "0123456789abcdef"
@@ -115,6 +118,8 @@ func TestTokenRequired(t *testing.T) {
 				if rec.Code != http.StatusUnauthorized {
 					t.Errorf("status %d", rec.Code)
 				}
+				wantHeader(t, rec, "WWW-Authenticate", `Bearer realm="SD2NAS"`)
+				wantHeader(t, rec, "Cache-Control", "no-store")
 				return
 			}
 			wantTokenRequired(t, rec)
@@ -154,6 +159,28 @@ func TestTokenBearer(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Errorf("POST with the Bearer: %d %s", rec.Code, rec.Body)
 	}
+}
+
+// TestTokenCardScript sends what the card script sends with a token set:
+// X-SD2NAS: 1, the Bearer, no Origin. Both requests get their normal answer.
+func TestTokenCardScript(t *testing.T) {
+	f := authServer(t, testToken)
+	n, err := notices.New(notices.Config{DB: f.db, Log: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s.MountNotifications(n) // f.s.Close closes n
+	bearer := "Bearer " + testToken
+
+	rec := do(t, f.s, http.MethodPost, "/api/ingest?wait=1&format=text", cardBody(f.card), "X-SD2NAS", "1", "Authorization", bearer)
+	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Body.String(), "normal\nSONY_A7IV: 2 new") {
+		t.Errorf("ingest: %d %q", rec.Code, rec.Body)
+	}
+	rec = do(t, f.s, http.MethodPost, "/api/notifications/take?format=text", "", "X-SD2NAS", "1", "Authorization", bearer)
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "refused") {
+		t.Errorf("notifications/take: %d %q", rec.Code, rec.Body)
+	}
+	wantHeader(t, rec, "Content-Type", "text/plain; charset=utf-8")
 }
 
 func TestTokenTextRefusal(t *testing.T) {
@@ -275,10 +302,22 @@ func TestCookieOfOtherToken(t *testing.T) {
 
 func TestTokenCleanedPath(t *testing.T) {
 	f := authServer(t, testToken)
-	for _, p := range []string{"/x/../api/settings", "/api/./settings", "/api/auth/../settings"} {
+	for _, p := range []string{"/x/../api/settings", "/api/./settings", "/api/auth/../settings",
+		// Encoded slashes: the decoded path cleans to outside /api/, but the
+		// mux routes on the escaped one, segment by segment.
+		"/api/staging/%2e%2e%2f%2e%2e/files", "/api/thumbs/%2e%2e%2f%2e%2e%2fhealthz",
+		"/api%2fsettings", "/api/auth%2f..%2fsettings"} {
 		t.Run(p, func(t *testing.T) {
 			wantTokenRequired(t, do(t, f.s, http.MethodGet, p, ""))
 		})
+	}
+	t.Run("POST /api/ingest/%2e%2e%2f%2e%2e/forget", func(t *testing.T) {
+		wantTokenRequired(t, do(t, f.s, http.MethodPost, "/api/ingest/%2e%2e%2f%2e%2e/forget", "{}", "X-SD2NAS", "1"))
+	})
+	for _, p := range []string{"/api/auth", "/healthz", "/"} {
+		if rec := do(t, f.s, http.MethodGet, p, ""); rec.Code != http.StatusOK {
+			t.Errorf("GET %s: %d %s, want 200", p, rec.Code, rec.Body)
+		}
 	}
 }
 

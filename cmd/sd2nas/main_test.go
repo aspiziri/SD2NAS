@@ -40,7 +40,7 @@ func TestExitCode(t *testing.T) {
 		// failed listen, inside temp folders.
 		dir := t.TempDir()
 		cmd.Env = append(os.Environ(), "SD2NAS_TEST_RUN_MAIN=1", "SD2NAS_TOKEN=a b",
-			"SD2NAS_ADDR=127.0.0.1:bad", "SD2NAS_CARDS="+dir, "SD2NAS_PHOTOS="+dir, "SD2NAS_CONFIG="+dir)
+			"SD2NAS_ADDR=127.0.0.1:99999", "SD2NAS_CARDS="+dir, "SD2NAS_PHOTOS="+dir, "SD2NAS_CONFIG="+dir)
 		out, err := cmd.CombinedOutput()
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) || ee.ExitCode() != 1 {
