@@ -16,7 +16,9 @@
   const MAX = 200; // longest file list shown
 
   let forget = $state(null); // GET /api/ingest/{id}/forget, for finished imports
-  let dialog = $state(''); // '' | 'forget' | 'reimport'
+  let dialog = $state(''); // '' | 'forget' | 'reimport' | 'reimportMissing'
+  // Missing files not yet asked for: what the re-import button would request.
+  const toRequest = $derived(Math.max(0, (forget?.restorable ?? 0) - (forget?.restore_requested ?? 0)));
   let busy = $state(false);
   let dialogError = $state('');
   let deleteFiles = $state(false); // Decision 10: starts unticked
@@ -200,8 +202,8 @@
       {#if forget && forget.restore_requested > 0}
         <p class="small" style="margin:8px 0">{plural(forget.restore_requested, 'file', 'files')} will be imported again the next time you insert the card.</p>
       {/if}
-      {#if forget && forget.restorable > forget.restore_requested}
-        <button class="btn" disabled={importing} onclick={() => { dialogError = ''; dialog = 'reimportMissing'; }}>Re-import {plural(forget.restorable, 'missing file', 'missing files')}…</button>
+      {#if forget && toRequest > 0}
+        <button class="btn" disabled={importing} onclick={() => { dialogError = ''; dialog = 'reimportMissing'; }}>Re-import {plural(toRequest, 'missing file', 'missing files')}…</button>
         {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
       {/if}
       {@render fileList(missing, missingRow)}
@@ -271,9 +273,9 @@
   {/snippet}
 </Dialog>
 
-<Dialog open={dialog === 'reimportMissing'} title="Re-import {plural(forget?.restorable ?? 0, 'missing file', 'missing files')}?" onclose={() => !busy && (dialog = '')} {busy}>
+<Dialog open={dialog === 'reimportMissing'} title="Re-import {plural(toRequest, 'missing file', 'missing files')}?" onclose={() => !busy && (dialog = '')} {busy}>
   <p class="muted">SD2NAS copies these files from the card into Staging again. If an array disk dropped out, fix that first: its files come back by themselves at the next archive scan.</p>
-  <p class="muted">The copying happens the next time the card is inserted; if its import is already running, this request waits for the next insert.</p>
+  <p class="muted">If the card is still in the reader, this starts right away; otherwise the files are copied the next time it is inserted.</p>
   {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
   {#snippet actions()}
     <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
