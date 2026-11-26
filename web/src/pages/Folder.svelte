@@ -1,12 +1,12 @@
 <script>
-  import { onMount, untrack } from 'svelte';
+  import { onMount, untrack, tick } from 'svelte';
   import { api } from '../lib/api.js';
   import { live } from '../lib/live.svelte.js';
   import { navigate } from '../lib/router.svelte.js';
   import { isId } from '../lib/paths.js';
   import { formatBytes, dateRange, kindChips, extLabel } from '../lib/format.js';
   import { clickAction, toggleKey, selectRange, dragSelection, prune } from '../lib/selection.js';
-  import { folderDate, folderName, checkTitle } from '../lib/naming.js';
+  import { folderDate, folderName, checkFolderName } from '../lib/naming.js';
   import { describeError, plural } from '../lib/messages.js';
   import { longPressSelect } from '../lib/press.js';
   import { toast } from '../lib/toast.svelte.js';
@@ -33,7 +33,8 @@
   let dialogError = $state('');
   let others = $state(null); // the other staging folders, for "Move to…"
   let dest = $state('new'); // 'new' or a folder id as a string
-  let title = $state('');
+  let nameRaw = $state(''); // the new folder's whole name, as typed
+  let nameInput = $state(null);
 
   async function load(k) {
     if (!isId(id)) {
@@ -187,16 +188,28 @@
   }
 
   const prefix = $derived(data ? folderDate(data.folder) : '');
-  const titleCheck = $derived(checkTitle(title, prefix));
-  const newName = $derived(folderName(prefix, titleCheck.title));
-  const moveReady = $derived(dest === 'new' ? !!titleCheck.title && !titleCheck.error : dest !== '');
+  const nameCheck = $derived(checkFolderName(nameRaw));
+  // The prefill alone ("date - ") would make a date-only folder by accident,
+  // so Move waits for an edit. A new folder can't take this folder's own
+  // name either (the server would say it's taken).
+  const untouched = $derived(nameRaw.trim() === (prefix ? `${prefix} -` : ''));
+  const moveReady = $derived(dest === 'new' ? !untouched && !!nameCheck.name && !nameCheck.error && nameCheck.name !== data?.folder.name : dest !== '');
+
+  // The new folder's name starts as "date - " with the caret at the end.
+  async function focusName() {
+    await tick();
+    if (dialog !== 'move' || dest !== 'new' || !nameInput) return;
+    nameInput.focus();
+    nameInput.setSelectionRange(nameRaw.length, nameRaw.length);
+  }
 
   async function openMove() {
     dialogError = '';
-    title = '';
+    nameRaw = prefix ? `${prefix} - ` : '';
     dest = 'new';
     others = null;
     dialog = 'move';
+    focusName();
     try {
       const res = await api('/api/staging');
       others = res.folders.filter((f) => f.id !== data.folder.id);
@@ -209,7 +222,7 @@
   function doMove() {
     const shas = [...selected];
     const fid = data.folder.id; // a refetch may clear data while the request runs (pre-flight D13)
-    const body = dest === 'new' ? { fileShas: shas, newTitle: titleCheck.title } : { fileShas: shas, toId: Number(dest) };
+    const body = dest === 'new' ? { fileShas: shas, newName: nameCheck.name } : { fileShas: shas, toId: Number(dest) };
     run(async () => {
       const res = await api('/api/staging/move', { method: 'POST', body });
       toast(`Moved ${plural(res.moved, 'file', 'files')} to “${res.folder.name}”`);
@@ -302,12 +315,10 @@
       <label class="dest"><input type="radio" bind:group={dest} value="new" /> <span>New folder…</span></label>
       {#if dest === 'new'}
         <div class="newfolder">
-          <div class="prefixed">
-            {#if prefix}<span class="mono">{prefix} -</span>{/if}
-            <input type="text" bind:value={title} placeholder="Title, e.g. Picks" aria-label="New folder title" />
-          </div>
-          {#if titleCheck.error}<div class="field-error">{titleCheck.error}</div>{/if}
-          {#if titleCheck.title && !titleCheck.error}<p class="small" style="margin:6px 0 0">New folder: <span class="mono">{newName}</span></p>{/if}
+          <input type="text" bind:this={nameInput} bind:value={nameRaw} placeholder={folderName(prefix, 'Picks')} aria-label="New folder name"
+            onkeydown={(e) => e.key === 'Enter' && !busy && moveReady && doMove()} />
+          {#if nameCheck.error}<div class="field-error">{nameCheck.error}</div>{/if}
+          {#if !untouched && nameCheck.name && nameCheck.name !== nameRaw.trim()}<p class="small" style="margin:6px 0 0">New folder: <span class="mono">{nameCheck.name}</span></p>{/if}
         </div>
       {/if}
       {#if others === null}

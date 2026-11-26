@@ -47,18 +47,6 @@ export function nameProblem(s) {
   return '';
 }
 
-// date is optional: when given, the whole "date - title" name must fit the
-// byte limit too, as the server checks it.
-export function checkTitle(raw, date = '') {
-  const title = raw.trim();
-  if (title === '') return { title, error: '' };
-  const p = nameProblem(title);
-  if (p) return { title, error: `The title ${p}.` };
-  const whole = nameProblem(folderName(date, title));
-  if (whole) return { title, error: `The folder name ${whole}.` };
-  return { title, error: '' };
-}
-
 // A whole folder name as typed, cleaned as CleanName in names.go does: a
 // dangling " -" (the separator left when the title is cleared) is dropped.
 export function checkFolderName(raw) {
