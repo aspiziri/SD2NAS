@@ -4,7 +4,9 @@
   import { live } from '../lib/live.svelte.js';
   import { navigate } from '../lib/router.svelte.js';
   import { isId } from '../lib/paths.js';
-  import { formatBytes, dateRange, kindChips, extLabel } from '../lib/format.js';
+  import { formatBytes, dateRange, kindChips, extLabel, formatCapture } from '../lib/format.js';
+  import { needsReload } from '../lib/views.js';
+  import { loadPref, savePref, FOLDER_VIEW_KEY } from '../lib/prefs.js';
   import { clickAction, toggleKey, selectRange, dragSelection, prune } from '../lib/selection.js';
   import { folderDate, folderName, checkFolderName } from '../lib/naming.js';
   import { describeError, plural } from '../lib/messages.js';
@@ -14,6 +16,7 @@
   import Lightbox from '../components/Lightbox.svelte';
   import Dialog from '../components/Dialog.svelte';
   import SelectionBar from '../components/SelectionBar.svelte';
+  import ViewSwitch from '../components/ViewSwitch.svelte';
 
   let { id } = $props();
   let kind = $state(''); // the chip asked for; '' = all
@@ -23,6 +26,14 @@
   let gone = $state(false); // the folder no longer exists (merged, promoted, discarded)
   let open = $state(-1); // index into data.files shown full screen; -1 = none
   let ctl = null;
+  let reloadedOnce = false; // F10: one extra load when a load returns a version other than the live one
+
+  const VIEWS = [{ value: 'grid', label: 'Grid' }, { value: 'list', label: 'List' }];
+  let view = $state(loadPref(FOLDER_VIEW_KEY, VIEWS.map((v) => v.value), 'grid'));
+  function setView(v) {
+    view = v;
+    savePref(FOLDER_VIEW_KEY, v);
+  }
 
   let selected = $state(new Set()); // file hashes
   let anchor = null;
@@ -56,6 +67,14 @@
         if (j >= 0) open = j;
         else hide();
       }
+      // The event that announced this version may have arrived while the
+      // request ran: if the stream is ahead of what we got, load once more.
+      if (needsReload(res.version, live.staging.version, live.connected)) {
+        if (!reloadedOnce) {
+          reloadedOnce = true;
+          load(k);
+        }
+      } else reloadedOnce = false;
     } catch (err) {
       if (err.name === 'AbortError' || mine.signal.aborted) return;
       if (err.status === 404) {
@@ -282,6 +301,7 @@
       {/each}
     </div>
     <span class="spacer"></span>
+    <ViewSwitch label="View" options={VIEWS} value={view} onchange={setView} />
     {#if inArchive.length && !selecting}
       <button class="btn" onclick={selectInArchive}>Select {inArchive.length} in archive</button>
     {:else if !selecting}
@@ -292,6 +312,31 @@
   {#if files.length === 0}
     <p class="muted">No files here.</p>
   {:else}
+    {#if view === 'list'}
+      <div class="rows selectable" class:selecting use:longPressSelect={press}>
+        {#each files as file, i (file.sha256)}
+          {@const on = selected.has(file.sha256)}
+          <div class="lrow" class:sel={on} data-key={file.sha256}>
+            <button class="lpick" onclick={() => toggle(file.sha256)} aria-pressed={on} aria-label="{on ? 'Unselect' : 'Select'} {file.name}">
+              <span class="box" class:on>✓</span>
+            </button>
+            <button class="lbody" onclick={(e) => onTileClick(e, i)} aria-label={selecting ? `${on ? 'Unselect' : 'Select'} ${file.name}` : `Show ${file.name}`}>
+              <span class="lthumb"><Thumb sha={file.sha256} kind={file.kind} label={extLabel(file)} /></span>
+              <span class="linfo">
+                <span class="lname">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠ </span>{/if}{file.name}</span>
+                <span class="lmeta small muted">
+                  {#if file.capture_time}<span>{formatCapture(file.capture_time)}</span>{/if}
+                  <span>{file.kind === 'raw' ? 'RAW' : file.kind === 'video' ? 'Video' : 'JPG'}</span>
+                  <span>{formatBytes(file.size)}</span>
+                  {#if file.clock_warnings?.length}<span class="warn">Check the clock</span>{/if}
+                  {#if file.in_archive}<span class="pill ok" title="Already in the archive: {file.in_archive}">In archive</span>{/if}
+                </span>
+              </span>
+            </button>
+          </div>
+        {/each}
+      </div>
+    {:else}
     <div class="grid selectable" class:selecting use:longPressSelect={press}>
       {#each files as file, i (file.sha256)}
         {@const on = selected.has(file.sha256)}
@@ -305,6 +350,7 @@
         </div>
       {/each}
     </div>
+    {/if}
   {/if}
   {#if open >= 0 && open < files.length}
     <Lightbox files={data.files} bind:index={open} onclose={hide} />
@@ -374,6 +420,20 @@
   @media (hover: hover) { .cell:hover .pick { opacity: 1; } }
   /* On touch the invisible tick must not swallow taps meant for the tile. */
   @media (hover: none) { .grid:not(.selecting) .pick { pointer-events: none; } }
+  /* List view: a 56 px thumbnail, then the name and details. The tick is its own 44 px target. */
+  .rows { display: flex; flex-direction: column; gap: 4px; }
+  .lrow { display: flex; align-items: center; min-height: 56px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  .lrow.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .lpick { flex: none; width: 44px; align-self: stretch; min-height: 56px; padding: 0; border: 0; background: none; cursor: pointer; display: grid; place-items: center; }
+  .box { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700; border: 2px solid var(--muted); color: transparent; }
+  .box.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .lbody { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; background: none; border: 0; padding: 0 10px 0 0; color: inherit; font: inherit; text-align: left; cursor: pointer; min-height: 56px; }
+  .lbody:hover .lname { color: var(--accent); }
+  .lthumb { flex: none; width: 84px; padding: 0; }
+  .linfo { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
+  .lname { overflow-wrap: anywhere; }
+  .lmeta { display: flex; flex-wrap: wrap; gap: 0 10px; align-items: center; }
+  .rows.selecting .lbody { cursor: pointer; }
   .dests { display: grid; gap: 2px; max-height: 50dvh; overflow: auto; margin: 0 -4px; padding: 0 4px; }
   .dest { display: flex; gap: 10px; align-items: center; min-height: 44px; cursor: pointer; overflow-wrap: anywhere; }
   .newfolder { margin: 0 0 8px 28px; }
