@@ -777,6 +777,36 @@ func TestMissingOlderThanADay(t *testing.T) {
 	}
 }
 
+// TestMissingFloorEveryQuery: the MaxAge floor applies to each query, not
+// only the first. A pass that runs longer than a day marks rows early on;
+// when it finishes, the rows older than MaxAge are not notified.
+func TestMissingFloorEveryQuery(t *testing.T) {
+	ctx := context.Background()
+	db := newDB(t)
+	c := newClock(t, "2026-11-23 03:00")
+	start := c.now()
+	st := indexer.Status{Last: &indexer.ScanResult{FinishedAt: start.Add(-time.Hour)}}
+	s := newService(t, Config{DB: db, Archive: archiveStatus(&st), Now: c.now})
+	s.check(ctx) // nothing missing; the watermark is now start - MaxAge
+	if s.missingQueries != 1 || s.adds != 0 {
+		t.Fatalf("first check: %d queries, %d adds", s.missingQueries, s.adds)
+	}
+
+	st = indexer.Status{Running: &indexer.Progress{StartedAt: start}}
+	markMissing(t, db, 2, start.Add(time.Hour)) // early in a 30 h pass
+	late := start.Add(29 * time.Hour)
+	markMissing(t, db, 1, late)
+	c.set(t, "2026-11-24 09:00") // start + 30 h
+	st = indexer.Status{Last: &indexer.ScanResult{FinishedAt: c.now(), Missing: 3}, Missing: 3}
+	s.check(ctx)
+	ns := pending(t, db)
+	if len(ns) != 1 {
+		t.Fatalf("pending = %+v, want one", ns)
+	}
+	wantNotice(t, ns[0], missingKey(late), catalog.NoticeAlert,
+		"The archive scan marked 1 file missing from Archive/. See the Archive index page.")
+}
+
 func TestMissingWaitsForPass(t *testing.T) {
 	ctx := context.Background()
 	db := newDB(t)

@@ -251,9 +251,11 @@ func (s *Service) checkMissing(ctx context.Context, st indexer.Status, now time.
 			return
 		}
 		s.watermark = w
-		if floor := now.Add(-MaxAge); w.Before(floor) {
-			s.watermark = floor
-		}
+	}
+	// Before every query, not only the first: a pass that ran longer than
+	// MaxAge may have marked rows that are too old to notify by now.
+	if floor := now.Add(-MaxAge); s.watermark.Before(floor) {
+		s.watermark = floor
 	}
 	s.missingQueries++
 	n, latest, err := s.cfg.DB.MissingSince(ctx, s.watermark)
