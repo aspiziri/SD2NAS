@@ -77,6 +77,7 @@
     run(async () => {
       const res = await api(`/api/ingest/${id}/reimport-missing`, { method: 'POST' });
       toast(res.message, res.requested ? 'ok' : 'warn', 7000);
+      if (res.started) navigate('/ingest');
     });
   }
 
