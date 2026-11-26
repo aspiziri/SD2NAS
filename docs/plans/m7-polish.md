@@ -32,8 +32,8 @@
     - A token shorter than 16 bytes adds the `/healthz` warning `SD2NAS_TOKEN is shorter than 16 characters: pick a longer, random one`.
     - Open without the token: `GET|HEAD /api/auth`, `POST /api/login`, `POST /api/logout`, `/healthz`, and every path outside `/api/` (the UI's files). The path is judged after `path.Clean("/" + r.URL.Path)`.
     - Accepted credentials: header `Authorization: Bearer <token>` (scheme case-insensitive) or cookie `sd2nas_session` = lowercase hex of HMAC-SHA256(key = token, message = `sd2nas-session-v1`). Both compared with `crypto/subtle` (the token as SHA-256 digests, so its length doesn't leak).
-    - Refusal: 401, header `WWW-Authenticate: Bearer realm="SD2NAS"`, `Cache-Control: no-store`, JSON `{"error":"This SD2NAS needs its access token.","code":"token_required"}`; with `?format=text` the two lines `alert` / `SD2NAS refused the request: the token is missing or wrong. Set SD2NAS_TOKEN in sd2nas.cfg to the container's token.`
-    - `POST /api/login {"token": "…"}` (through the guard: `X-SD2NAS: 1`, same origin): right → 204 with `Set-Cookie: sd2nas_session=<hmac>; Path=/; Max-Age=34560000; HttpOnly; SameSite=Strict` (no `Secure`: the LAN is plain HTTP). Wrong → 401 `{"error":"That token is not right.","code":"bad_token"}`. Missing/empty token field → 400 `Enter the token.` No token configured → 400 `SD2NAS has no token set.`
+    - Refusal: 401, header `WWW-Authenticate: Bearer realm="SD2NAS"`, `Cache-Control: no-store`, JSON `{"error":"This SD2NAS needs its password.","code":"token_required"}`; with `?format=text` the two lines `alert` / `SD2NAS refused the request: the token is missing or wrong. Set SD2NAS_TOKEN in sd2nas.cfg to the container's token.`
+    - `POST /api/login {"token": "…"}` (through the guard: `X-SD2NAS: 1`, same origin): right → 204 with `Set-Cookie: sd2nas_session=<hmac>; Path=/; Max-Age=34560000; HttpOnly; SameSite=Strict` (no `Secure`: the LAN is plain HTTP). Wrong → 401 `{"error":"That password is not right.","code":"bad_token"}`. Missing/empty token field → 400 `Enter the password.` No token configured → 400 `SD2NAS has no token set.`
     - `POST /api/logout` → 204 with `Set-Cookie: sd2nas_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict`.
     - `GET /api/auth` → 200 `{"required": bool, "authorized": bool}`.
     - **No token configured = behaviour exactly as today**, apart from the three new routes and the `HEAD /api/events` fix.
@@ -84,6 +84,7 @@
 2. **What stays open with a token:** `/healthz`, the UI's static files, `GET /api/auth`, `POST /api/login`, `POST /api/logout`. **[override?]** Docker's `HEALTHCHECK` (`wget …/healthz`) and Unraid's health dot have no token; `/healthz` reveals version, TZ, uid/gid and mount paths, not photos. Cost of protecting it: the Dockerfile health check needs the token (`wget --header` from env), and a forgotten token shows the container unhealthy.
 3. **The cookie is a fixed HMAC of the token, valid 400 days (browsers' cap); no server-side sessions.** **[override?]** Changing `SD2NAS_TOKEN` signs every browser out; "Sign out on this device" clears one. Cost of real sessions: a table, expiry and a revoke list.
 4. **No login rate limit; a `/healthz` warning for tokens under 16 characters; the charset `[A-Za-z0-9._~+/=-]`, refused at startup otherwise.** **[override?]** LAN only, and a random 48-hex token (README: `openssl rand -hex 24`) can't be guessed. The charset keeps the token intact in the bash-sourced `sd2nas.cfg` (the frozen card script `source`s it; `$`, quotes, `;` would be mangled or executed), and it is written single-quoted. Cost of a limiter: shared state, a 429 path, and a lock-out risk for the owner. Cost of a wider charset: tokens the card script silently sends wrong, or a cfg line bash executes.
+5a. **Owner ruling: user-facing text says "password".** The env var, cfg key, header and code identifiers stay `SD2NAS_TOKEN` / token (the card script already reads it). The Login page, its errors, the API's JSON error sentences and the template field name say "password" and point at `SD2NAS_TOKEN`; the script's `format=text` refusal keeps naming `SD2NAS_TOKEN in sd2nas.cfg`.
 5. **`SD2NAS_TOKEN` is env-only** (no `--token` flag), so it never appears in a process list.
 6. **`staging_notice_at` (HH:MM, default 09:00) is a catalog setting, applied at once.** **[override?]** "Once a day" is unchanged: the day's key decides, so moving the time later after today's notice sends nothing more today, and moving it earlier before it ran sends it now. Cost of an env var instead: a container restart to change it, and no Settings field.
 7. **The missing-files notice comes from a catalog watermark, not the last pass's count** (folds in T6-m4 and the crashed-pass follow-up). Rows with `state = 'missing'` and `updated_at` after the newest `missing:` notice (or after now − 24 h) are counted once no pass is running; the query runs only when `Status.Missing` or `Last.FinishedAt` changed, or at the first check. Cost of keeping per-pass counts: both follow-ups stay open.
@@ -352,7 +353,7 @@ docs/PLAN.md                                                                    
   - `TestTokenBearer`: `Authorization: Bearer <tok>` → 200; `bearer <tok>` → 200; `Bearer wrong`, `Basic <tok>`, `Bearer` → 401.
   - `TestTokenTextRefusal`: `POST /api/ingest?wait=1&format=text` with `X-SD2NAS: 1` and a wrong Bearer → 401, body exactly `alert\nSD2NAS refused the request: the token is missing or wrong. Set SD2NAS_TOKEN in sd2nas.cfg to the container's token.\n`.
   - `TestGuardBeforeToken`: a POST with the right Bearer but no `X-SD2NAS` → 403 (guard first).
-  - `TestLogin`: right token → 204 and a cookie with exactly `Path=/`, `Max-Age=34560000`, `HttpOnly`, `SameSite=Strict`, no `Secure`, value = hex HMAC; then `GET /api/settings` with it → 200. Wrong → 401 `That token is not right.` code `bad_token`; `{}` and `{"token":""}` → 400 `Enter the token.`; without `X-SD2NAS` → 403; unknown field → 400.
+  - `TestLogin`: right token → 204 and a cookie with exactly `Path=/`, `Max-Age=34560000`, `HttpOnly`, `SameSite=Strict`, no `Secure`, value = hex HMAC; then `GET /api/settings` with it → 200. Wrong → 401 `That password is not right.` code `bad_token`; `{}` and `{"token":""}` → 400 `Enter the password.`; without `X-SD2NAS` → 403; unknown field → 400.
   - `TestLogout`: 204, `Max-Age=0` (the `Set-Cookie` text contains `Max-Age=0`).
   - `TestCookieOfOtherToken`: a cookie computed from another token → 401.
   - `TestTokenCleanedPath`: `GET /x/../api/settings` and `GET /api/./settings` → exactly 401 with `code: token_required` (`requireToken` runs before the mux and cleans the path).
@@ -424,7 +425,7 @@ docs/PLAN.md                                                                    
               writeFail(w, r, http.StatusUnauthorized, tokenTextRefusal)
               return
           }
-          writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "This SD2NAS needs its access token.", "code": "token_required"})
+          writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "This SD2NAS needs its password.", "code": "token_required"})
       })
   }
   ```
@@ -434,7 +435,7 @@ docs/PLAN.md                                                                    
 - [ ] **Step 4: Wire** (`cmd/sd2nas/main.go`): `srv.SetToken(cfg.Token)` right after `SetLogger`; `if w := tokenWarning(cfg.Token); w != "" { srv.AddWarning(w) }` with `tokenWarning` in package main returning the binding sentence for `0 < len < 16`. `TestTokenWarning` in `main_test.go`.
 - [ ] **Step 5: Template.** Add after the Card poller entry:
   ```xml
-  <Config Name="Token" Target="SD2NAS_TOKEN" Default="" Mode="" Description="Optional. Generate one with: openssl rand -hex 24 (letters, digits and . _ ~ + / = - only, or SD2NAS won't start). When set, the web UI asks for it once per browser, and the card script must send it: add it single-quoted to sd2nas.cfg as the README shows. Leave empty for no token: then anyone on your network can use SD2NAS." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="Password (SD2NAS_TOKEN)" Target="SD2NAS_TOKEN" Default="" Mode="" Description="Optional password for the web UI and the card script. Generate one with: openssl rand -hex 24 (letters, digits and . _ ~ + / = - only, or SD2NAS won't start). When set, the web UI asks for it once per browser, and the card script must send it: add it single-quoted to sd2nas.cfg as the README shows. Leave empty for no token: then anyone on your network can use SD2NAS." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
   ```
   `template_test.go`: `wantTargets` gains `"SD2NAS_TOKEN"` last; assert its `Mask == "true"`, `Default == ""`, `Display == "advanced"`, and that the description mentions `sd2nas.cfg` and `openssl rand -hex 24`.
 - [ ] **Step 6:** gofmt/vet/test (`./internal/config/ ./internal/api/ ./cmd/... ./deploy/...`), Linux and race commands; commit `Add optional token auth`.
@@ -723,7 +724,7 @@ docs/PLAN.md                                                                    
 - [ ] **Step 2: Implement.**
   - `App.svelte`: on mount `await checkAuth()`; when `required && !authorized`, render only `<Login />` (no Nav, no `connectEvents`); otherwise as today. The unauthorized handler sets `auth.authorized = false` (cookie expired, token changed), which closes the `EventSource` and shows Login.
   - `live.svelte.js` (in this task's files): export `disconnectEvents()`, which sets a `stopped` flag, closes the source and clears the 5 s retry timer; `connectEvents()` clears `stopped`; the `onerror` retry and the `visibilitychange` listener do nothing while `stopped`. Otherwise the Login screen would loop 401s on `/api/events` every 5 s and on every return to the tab. An `EventSource` 401 never reaches the api.js handler: an expired cookie is noticed at the next `api()` call (every page loads through it).
-  - `Login.svelte`: heading `SD2NAS`, text "This SD2NAS is protected by a token. Enter it once; this browser remembers it for a year.", a password input (`autocomplete="current-password"`, Enter submits), **Sign in**. 401 → `That token is not right.`; success → `location.reload()`. Centred card on desktop, full width with 16 px gutters on a phone.
+  - `Login.svelte`: heading `SD2NAS`, text "This SD2NAS is protected by a password. Enter it once; this browser remembers it for a year.", a hint under the field "It's the SD2NAS_TOKEN value in the container's settings.", a password input labelled **Password** (`autocomplete="current-password"`, Enter submits), **Sign in**. 401 → `That password is not right.`; success → `location.reload()`. Centred card on desktop, full width with 16 px gutters on a phone.
   - A `GET /api/auth` failure (network) shows the app as today (the API's own errors surface).
 - [ ] **Step 3:** `cd web && npm test && npm run build`; commit `Ask for the token in the web UI`. Controller: run with `SD2NAS_TOKEN` set and check login, reload, sign out, at 375×812 and desktop (no sideways scroll, ≥ 44 px), and that the network log shows no repeating `/api/events` 401s on the Login screen; and without a token (no login screen).
 
@@ -750,7 +751,7 @@ docs/PLAN.md                                                                    
 - [ ] **Step 2: Pin.** For each of `node:24-alpine`, `golang:1.26-alpine`, `alpine:3.22`: `docker pull <tag>`, then `docker image inspect --format '{{index .RepoDigests 0}}' <tag>` for the digest, and write the most specific tag that shares it (e.g. `node:24.<x>.<y>-alpine3.22`; find it with `docker buildx imagetools inspect`). A comment above the first `FROM`: how to refresh the pins (the two commands). Build the image (`docker build -f deploy/Dockerfile -t sd2nas:m7 .`) to prove it.
 - [ ] **Step 3: Template.** `<Repository>ghcr.io/aspiziri/sd2nas:latest</Repository>`; drop the `:edge` comment; `template_test.go` expects `:latest`.
 - [ ] **Step 4: README.**
-  - **Optional access token** (after Card script): generate and install it on Unraid without a placeholder —
+  - **Optional password (`SD2NAS_TOKEN`)** (after Card script): generate and install it on Unraid without a placeholder —
     ```
     TOKEN=$(openssl rand -hex 24); echo "$TOKEN"
     printf "\nSD2NAS_TOKEN='%s'\n" "$TOKEN" >> /boot/config/plugins/unassigned.devices/sd2nas.cfg
