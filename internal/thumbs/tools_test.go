@@ -9,13 +9,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,6 +181,17 @@ func fakeAnswer(mode string, args []string, stdout, stderr io.Writer) (code int,
 			fmt.Fprint(stderr, "[out#0/image2pipe @ 0x0] Nothing was written into output file, because at least one of its streams received no packets.")
 			return 234, true
 		}
+	case "ffmpeg-needs-file":
+		// Like real ffmpeg: exit non-zero when the input file is gone.
+		for i, a := range args {
+			if a == "-i" && i+1 < len(args) {
+				if _, err := os.Stat(strings.TrimPrefix(args[i+1], "file:")); err != nil {
+					fmt.Fprintln(stderr, args[i+1]+": No such file or directory")
+					return 254, true
+				}
+			}
+		}
+		return write(jpg)
 	case "big", "huge":
 		return write(make([]byte, 2<<20)) // tests lower maxToolOutput to 1 MiB
 	default:
@@ -453,6 +467,77 @@ func TestVideoFailureReportsBoth(t *testing.T) {
 		t.Errorf("err = %v, want ErrUndecodable", err)
 	}
 	wantArgs(t, argsFile, videoArgs("1", src.Path), videoArgs("0", src.Path))
+}
+
+// TestVideoMovedWhileQueuedNotRemembered: the file was there when Get
+// checked it, but was renamed (by Shift, Move or Promote) before ffmpeg
+// ran, as happens while a render waits for a worker slot. The failure is
+// not the file's fault: it is answered as a missing file and not
+// remembered, so the next Get renders once the file is back.
+func TestVideoMovedWhileQueuedNotRemembered(t *testing.T) {
+	cases := []struct {
+		name string
+		move func(t *testing.T, path string)
+	}{
+		{"removed", func(t *testing.T, path string) {
+			if err := os.Rename(path, path+".moved"); err != nil {
+				t.Error(err)
+			}
+		}},
+		{"replaced", func(t *testing.T, path string) {
+			// Another file renamed onto the path; this one fails too.
+			other := writeSource(t, filepath.Dir(path), "other.bin", []byte("another file"))
+			if err := os.Rename(path, path+".moved"); err != nil {
+				t.Error(err)
+			}
+			if err := os.Rename(other, path); err != nil {
+				t.Error(err)
+			}
+		}},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mode := "ffmpeg-needs-file"
+			if tc.name == "replaced" {
+				mode = "fail"
+			}
+			c, _ := fakeCache(t, mode, Config{Workers: 1})
+			src := fakeSource(t, 13+i, media.KindVideo)
+			var renders atomic.Int32
+			c.render = func(ctx context.Context, s Source) (image.Image, error) {
+				if renders.Add(1) == 1 {
+					tc.move(t, s.Path)
+				}
+				return c.renderSource(ctx, s)
+			}
+			_, err := c.Get(context.Background(), src, ThumbSize)
+			if !errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrUndecodable) || errors.Is(err, ErrNoImage) {
+				t.Fatalf("first Get err = %v, want fs.ErrNotExist and not a fault of the file", err)
+			}
+			c.mu.Lock()
+			kept := len(c.failed)
+			c.mu.Unlock()
+			if kept != 0 {
+				t.Fatalf("%d failures remembered, want 0", kept)
+			}
+			if tc.name == "replaced" {
+				t.Setenv("SD2NAS_FAKE_TOOL", "ffmpeg-needs-file")
+				if err := os.Remove(src.Path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Rename(src.Path+".moved", src.Path); err != nil {
+				t.Fatal(err)
+			}
+			dst, err := c.Get(context.Background(), src, ThumbSize)
+			if err != nil {
+				t.Fatalf("second Get after the file is back: %v", err)
+			}
+			if w, h := dims(t, dst); w != 64 || h != 32 {
+				t.Fatalf("size = %dx%d, want 64x32", w, h)
+			}
+		})
+	}
 }
 
 func TestVideoBadFrame(t *testing.T) {

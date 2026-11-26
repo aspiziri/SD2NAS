@@ -200,7 +200,9 @@ func (c *Cache) Remove(sha string) error {
 // render, which is cancelled only once every caller has gone. At most
 // Workers renders run at once. A render that failed for a reason of the
 // file is remembered by sha, for both sizes: later calls return its error
-// wrapped in ErrRemembered until Remove(sha).
+// wrapped in ErrRemembered until Remove(sha). A render that failed because
+// the file moved away meanwhile is answered as fs.ErrNotExist instead, and
+// not remembered.
 func (c *Cache) Get(ctx context.Context, src Source, size int) (string, error) {
 	if !ValidSHA(src.SHA256) {
 		return "", fmt.Errorf("%w: %q", ErrBadSHA, src.SHA256)
@@ -303,7 +305,8 @@ func (c *Cache) generateRecovered(ctx context.Context, src Source, size int, dst
 }
 
 func (c *Cache) generate(ctx context.Context, src Source, size int, dst string) error {
-	if _, err := os.Stat(src.Path); err != nil {
+	before, err := os.Stat(src.Path)
+	if err != nil {
 		return err // fs.ErrNotExist reaches the caller as is
 	}
 	select {
@@ -316,12 +319,37 @@ func (c *Cache) generate(ctx context.Context, src Source, size int, dst string) 
 	defer cancel()
 	img, err := c.render(ctx, src)
 	if err != nil {
-		return fmt.Errorf("%s: %w", src.Path, err)
+		err = fmt.Errorf("%s: %w", src.Path, err)
+		if fileFault(err) {
+			// Shift, Move or Promote may have renamed the file while the
+			// render waited for a slot, so that the tool failed on a path
+			// that is gone. That is no fault of the file: answer as a
+			// missing file, which run doesn't remember.
+			if moveErr := moved(src.Path, before); moveErr != nil {
+				return moveErr
+			}
+		}
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err // cancelled or timed out while decoding in Go
 	}
 	return writeJPEG(dst, imaging.Fit(img, size, size, imaging.Lanczos), quality(size))
+}
+
+// moved returns nil while path still names the file that was there
+// (before). Otherwise it returns an error that wraps fs.ErrNotExist when
+// the file is gone or another file has taken its place, or the error of
+// a stat that failed for another reason.
+func moved(path string, before fs.FileInfo) error {
+	now, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(before, now) || now.Size() != before.Size() || !now.ModTime().Equal(before.ModTime()) {
+		return fmt.Errorf("%s: %w (another file took its place while its thumbnail was rendering)", path, fs.ErrNotExist)
+	}
+	return nil
 }
 
 func quality(size int) int {
