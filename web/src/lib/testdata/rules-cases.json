@@ -17,8 +17,30 @@
     { "key": "staging_notice_at", "value": "09:00", "ok": true },
     { "key": "staging_notice_at", "value": "9:00", "ok": false }
   ],
-  "shiftWall": [],
-  "shiftedName": [],
-  "folderDate": [],
-  "wholeName": []
+  "shiftWall": [
+    { "capture": "2025-03-09T01:30:00", "seconds": 3600, "want": "2025-03-09T02:30:00" },
+    { "capture": "2025-06-01T10:00:00", "seconds": -86400, "want": "2025-05-31T10:00:00" },
+    { "capture": "2024-12-31T23:59:30", "seconds": 45, "want": "2025-01-01T00:00:15" }
+  ],
+  "shiftedName": [
+    { "name": "2025-05-30 14.02.11.JPG", "capture": "2025-05-30T14:02:11", "seconds": 3600, "want": "2025-05-30 15.02.11.JPG" },
+    { "name": "2025-05-30 14.02.11-1.JPG", "capture": "2025-05-30T14:02:11", "seconds": 3600, "want": "2025-05-30 15.02.11-1.JPG" },
+    { "name": "2025-05-30 14.02.11 - 3840x2160 - 25p - 12sec.MP4", "capture": "2025-05-30T14:02:11", "seconds": 3600, "want": "2025-05-30 15.02.11 - 3840x2160 - 25p - 12sec.MP4" },
+    { "name": "IMG_0001.JPG", "capture": "2025-05-30T14:02:11", "seconds": 3600, "want": "IMG_0001.JPG" },
+    { "name": "2025-05-30 09.00.00.JPG", "capture": "2025-05-30T14:02:11", "seconds": 3600, "want": "2025-05-30 09.00.00.JPG" },
+    { "name": "2025-05-31 23.59.59.ARW", "capture": "2025-05-31T23:59:59", "seconds": 1, "want": "2025-06-01 00.00.00.ARW" }
+  ],
+  "folderDate": [
+    { "capture": "2025-05-31T03:59:59", "dayStartsAt": "04:00", "want": "2025-05-30" },
+    { "capture": "2025-05-31T04:00:00", "dayStartsAt": "04:00", "want": "2025-05-31" },
+    { "capture": "2025-05-31T04:00:01", "dayStartsAt": "04:00", "want": "2025-05-31" },
+    { "capture": "2025-06-01T00:30:00", "dayStartsAt": "04:00", "want": "2025-05-31" },
+    { "capture": "2025-06-01T00:30:00", "dayStartsAt": "00:00", "want": "2025-06-01" }
+  ],
+  "wholeName": [
+    { "name": "2025-05-30 - Trip", "dates": ["2025-05-31", "2025-06-01"], "want": "2025-05-31 - Trip" },
+    { "name": "Untitled", "dates": ["2025-05-31"], "want": "Untitled" },
+    { "name": "2025-05-30", "dates": ["2025-06-02"], "want": "2025-06-02" },
+    { "name": "2025-05-30 - Trip", "dates": [], "want": "2025-05-30 - Trip" }
+  ]
 }

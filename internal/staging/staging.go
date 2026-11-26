@@ -52,6 +52,9 @@ type Service struct {
 	rename     func(oldpath, newpath string) error // os.Rename; tests inject EXDEV
 	afterHash  func(path string)                   // tests: runs between hashing a rescanned file and checking it didn't change
 
+	// shiftAsset is db.ShiftAsset; tests inject failures.
+	shiftAsset func(ctx context.Context, sha, relPath string, capture, at time.Time) error
+
 	bgCtx    context.Context // cancelled by Close; promote and rescan run on it
 	bgCancel context.CancelFunc
 	wg       sync.WaitGroup
@@ -79,6 +82,7 @@ func New(db *catalog.DB, photosRoot string) *Service {
 func NewService(cfg Config) *Service {
 	s := &Service{db: cfg.DB, photosRoot: cfg.PhotosRoot, locks: cfg.Locks, now: cfg.Now, log: cfg.Log,
 		removedFn: cfg.Removed, rules: media.DefaultRules(), rename: os.Rename}
+	s.shiftAsset = s.db.ShiftAsset
 	if s.locks == nil {
 		s.locks = NewLocks()
 	}
