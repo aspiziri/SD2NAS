@@ -71,6 +71,13 @@
     });
   }
 
+  function doReimportMissing() {
+    run(async () => {
+      const res = await api(`/api/ingest/${id}/reimport-missing`, { method: 'POST' });
+      toast(res.message, res.requested ? 'ok' : 'warn', 7000);
+    });
+  }
+
   let ctl = null; // the in-flight request; starting another aborts it
 
   // load keeps the last good data on screen if a refetch fails.
@@ -190,6 +197,13 @@
     <details open>
       <summary>{missingCopies(missing.length)}</summary>
       <p class="muted small" style="margin:8px 0">SD2NAS knows these files, but their copies in the archive are gone, so the card isn't safe to format. Keep it until you've found or restored them; the Archive index page lists the missing files.</p>
+      {#if forget && forget.restore_requested > 0}
+        <p class="small" style="margin:8px 0">{plural(forget.restore_requested, 'file', 'files')} will be imported again the next time you insert the card.</p>
+      {/if}
+      {#if forget && forget.restorable > forget.restore_requested}
+        <button class="btn" disabled={importing} onclick={() => { dialogError = ''; dialog = 'reimportMissing'; }}>Re-import {plural(forget.restorable, 'missing file', 'missing files')}…</button>
+        {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
+      {/if}
       {@render fileList(missing, missingRow)}
     </details>
   {/if}
@@ -230,6 +244,7 @@
       <li>{plural(forget.staged, 'file', 'files')} still in staging ({formatBytes(forget.staged_bytes)})</li>
       <li>{plural(forget.culled, 'culled file', 'culled files')}</li>
       <li>{plural(forget.archived, 'file', 'files')} already in the archive stay known</li>
+      {#if forget.missing > 0}<li>{plural(forget.missing, 'file', 'files')} whose archive copy is missing stay known</li>{/if}
     </ul>
     {#if forget.staged}
       <label class="toggle"><input type="checkbox" bind:checked={deleteFiles} /> <span>Also delete the {plural(forget.staged, 'file', 'files')} still in staging</span></label>
@@ -253,6 +268,16 @@
   {#snippet actions()}
     <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
     <button class="btn primary" onclick={doReimport} disabled={busy}>{busy ? 'Working…' : 'Re-import'}</button>
+  {/snippet}
+</Dialog>
+
+<Dialog open={dialog === 'reimportMissing'} title="Re-import {plural(forget?.restorable ?? 0, 'missing file', 'missing files')}?" onclose={() => !busy && (dialog = '')} {busy}>
+  <p class="muted">SD2NAS copies these files from the card into Staging again. If an array disk dropped out, fix that first: its files come back by themselves at the next archive scan.</p>
+  <p class="muted">The copying happens the next time the card is inserted; if its import is already running, this request waits for the next insert.</p>
+  {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
+  {#snippet actions()}
+    <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
+    <button class="btn primary" onclick={doReimportMissing} disabled={busy}>{busy ? 'Working…' : 'Re-import'}</button>
   {/snippet}
 </Dialog>
 

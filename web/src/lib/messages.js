@@ -1,4 +1,4 @@
-import { formatCount } from './format.js';
+import { formatCount, formatBytes } from './format.js';
 
 export const plural = (n, one, many) => `${formatCount(n)} ${n === 1 ? one : many}`;
 
@@ -93,3 +93,20 @@ export function promoteToast(job, before) {
 // The same sentence the server writes for an import, but with thousands grouped.
 export const missingCopies = (n) =>
   n === 1 ? "1 file's archive copy is missing" : `${formatCount(n)} files' archive copies are missing`;
+
+const HOLDERS = {
+  promote: 'a promote is moving it',
+  operation: 'a staging change is in progress',
+  rescan: 'the staging rescan is checking it',
+};
+
+// waitingText says why an import waits for a staging folder.
+export const waitingText = (folder, holder) => `Waiting for ${folder}: ${HOLDERS[holder] ?? 'it is busy'}.`;
+
+// copyDetail describes the file being copied, only for big ones: small files
+// pass too fast to be worth a line.
+export function copyDetail(p) {
+  if (!p?.current || !(p.current_size >= 50_000_000)) return null;
+  const name = p.current.split(/[\\/]/).at(-1);
+  return `Copying ${name} · ${formatBytes(p.current_done ?? 0)} of ${formatBytes(p.current_size)}`;
+}

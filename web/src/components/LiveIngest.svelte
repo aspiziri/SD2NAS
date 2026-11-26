@@ -1,6 +1,7 @@
 <script>
   import { live } from '../lib/live.svelte.js';
   import { phaseSteps, progressFraction, formatCount, formatBytes, cardName, knownCount, levelClass, addSample, copyEstimate, formatTimeLeft } from '../lib/format.js';
+  import { copyDetail, waitingText } from '../lib/messages.js';
 
   const running = $derived(live.current.running);
   const queued = $derived(live.current.queued);
@@ -8,6 +9,7 @@
   const steps = $derived(phaseSteps(p?.phase ?? 'queued'));
   const pct = $derived(Math.round(progressFraction(p) * 100));
   const last = $derived(live.finished);
+  const detail = $derived(copyDetail(p));
 
   // Copy speed and time left, from the progress events of the current job.
   // The samples are plain variables: only the estimate is shown.
@@ -53,6 +55,8 @@
       {:else}
         Finishing…
       {/if}
+      {#if detail}<br><span class="detail">{detail}</span>{/if}
+      {#if p?.waiting_folder}<br><span class="detail">{waitingText(p.waiting_folder, p.waiting_holder)}</span>{/if}
     </div>
     {#if p}
       <div class="stats" style="margin-top:12px">
@@ -78,3 +82,7 @@
   {/if}
   {#if !live.connected}<p class="small muted">Reconnecting to live updates…</p>{/if}
 </div>
+
+<style>
+  .detail { overflow-wrap: anywhere; }
+</style>
