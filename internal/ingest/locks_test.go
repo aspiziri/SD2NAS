@@ -143,7 +143,7 @@ func startBlocked(t *testing.T) *blockedImport {
 	t.Cleanup(unlock)
 	copied := make(chan struct{})
 	var once sync.Once
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		once.Do(func() { close(copied) })
 		return media.CopyHashed(ctx, src, dst)
 	}

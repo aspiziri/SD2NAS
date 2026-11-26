@@ -27,7 +27,7 @@ func TestWorkerSurvivesPanic(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
 	var calls atomic.Int32
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		if calls.Add(1) == 1 {
 			panic("boom")
 		}
@@ -68,7 +68,7 @@ func TestWorkerSurvivesPanic(t *testing.T) {
 func TestPanicReleasesFolderLocks(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
-	e.r.copyFile = func(context.Context, string, string) (string, error) {
+	e.r.copyFile = func(context.Context, string, string, func(int64)) (string, error) {
 		panic("boom")
 	}
 	m := newManager(t, e)
@@ -117,7 +117,7 @@ func TestPanicOnSecondFileKeepsCounts(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
 	var calls atomic.Int32
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		if calls.Add(1) == 2 {
 			panic("boom")
 		}

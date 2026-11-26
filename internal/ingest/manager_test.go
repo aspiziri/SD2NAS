@@ -46,7 +46,7 @@ func gate(e *env) (started <-chan string, release func()) {
 	st := make(chan string, 16)
 	rel := make(chan struct{})
 	var once sync.Once
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		st <- src
 		select {
 		case <-rel:

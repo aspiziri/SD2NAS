@@ -40,9 +40,9 @@ type Runner struct {
 	locks *staging.Locks
 	// Seams, set by NewRunner to the media functions; package tests replace
 	// them to inject failures or block.
-	fingerprint func(path string) (string, error)                          // media.QuickFingerprint
-	hashFile    func(path string) (string, error)                          // media.HashFile
-	copyFile    func(ctx context.Context, src, dst string) (string, error) // media.CopyHashed
+	fingerprint func(path string) (string, error)                                         // media.QuickFingerprint
+	hashFile    func(path string) (string, error)                                         // media.HashFile
+	copyFile    func(ctx context.Context, src, dst string, _ func(int64)) (string, error) // media.CopyHashedProgress
 }
 
 // NewRunner returns a Runner for cfg.
@@ -51,7 +51,7 @@ func NewRunner(cfg Config) *Runner {
 	if locks == nil {
 		locks = staging.NewLocks()
 	}
-	return &Runner{cfg: cfg, locks: locks, fingerprint: media.QuickFingerprint, hashFile: media.HashFile, copyFile: media.CopyHashed}
+	return &Runner{cfg: cfg, locks: locks, fingerprint: media.QuickFingerprint, hashFile: media.HashFile, copyFile: media.CopyHashedProgress}
 }
 
 func (r *Runner) now() time.Time {
@@ -242,8 +242,10 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 		if j.ctx.Err() != nil {
 			return catalog.StatusCancelled, ""
 		}
-		res := j.importOne(f)
+		base := j.p.Snapshot().BytesDone // only this goroutine writes BytesDone while copying
+		res := j.importOne(f, base)
 		if res.canceled {
+			j.p.update(func(s *ProgressSnapshot) { s.Current, s.CurrentSize, s.CurrentDone = "", 0, 0 })
 			return catalog.StatusCancelled, ""
 		}
 		if !res.recorded {
@@ -253,7 +255,11 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 		}
 		j.addOutcome(res.row.Outcome)
 		j.warnings = append(j.warnings, res.warnings...)
-		j.p.update(func(s *ProgressSnapshot) { s.FilesDone++; s.BytesDone += f.Size })
+		j.p.update(func(s *ProgressSnapshot) {
+			s.FilesDone++
+			s.BytesDone = base + f.Size
+			s.Current, s.CurrentSize, s.CurrentDone = "", 0, 0
+		})
 		if res.row.Outcome == catalog.OutcomeFailed {
 			if err := j.cardErr(); err != nil {
 				return catalog.StatusFailed, "card removed during import: " + err.Error()
@@ -489,7 +495,13 @@ func (j *ingestRun) folderFor(date string) (catalog.StagingFolder, error) {
 		if _, ok := j.held[f.ID]; ok {
 			return f, nil
 		}
-		release, err := j.r.locks.Lock(j.ctx, staging.HolderIngest, f.ID)
+		release, err := j.r.locks.TryLock(staging.HolderIngest, f.ID)
+		var busy *staging.BusyError
+		if errors.As(err, &busy) {
+			j.p.update(func(s *ProgressSnapshot) { s.WaitingFolder, s.WaitingHolder = f.Name, string(busy.Holder) })
+			release, err = j.r.locks.Lock(j.ctx, staging.HolderIngest, f.ID)
+			j.p.update(func(s *ProgressSnapshot) { s.WaitingFolder, s.WaitingHolder = "", "" })
+		}
 		if err != nil {
 			return catalog.StagingFolder{}, err
 		}
@@ -508,7 +520,9 @@ func (j *ingestRun) releaseFolders() {
 	}
 }
 
-func (j *ingestRun) importOne(f newFile) fileResult {
+// importOne imports one new file. base is the progress' BytesDone before it:
+// the file's copy reports base plus its own bytes.
+func (j *ingestRun) importOne(f newFile, base int64) fileResult {
 	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
 	start := time.Now()
 	c, meta, err := captureOf(f.Path, f.Kind) // meta is nil unless f is a video whose metadata was read
@@ -534,8 +548,15 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 		return fail(err)
 	}
 	name := media.DestFileName(c.Time, f.Kind, meta, filepath.Ext(f.Path))
+	j.p.update(func(s *ProgressSnapshot) { s.Current, s.CurrentSize, s.CurrentDone = f.Rel, f.Size, 0 })
+	progress := func(done int64) {
+		j.p.update(func(s *ProgressSnapshot) {
+			s.CurrentDone = min(done, f.Size)
+			s.BytesDone = base + s.CurrentDone
+		})
+	}
 	start = time.Now()
-	dst, sum, dup, err := j.copyNew(f, dir, name)
+	dst, sum, dup, err := j.copyNew(f, dir, name, progress)
 	j.copyDur += time.Since(start)
 	if err != nil {
 		if media.ClassifyCopyError(err, f.Path, dst) == media.CopyFailCanceled {
@@ -602,15 +623,17 @@ func (j *ingestRun) rel(dst string) (string, error) {
 
 // copyNew picks a free name in dir and copies f there, retrying the
 // failures a retry can fix (Decision 13). dup reports identical content
-// already at dst, so nothing was copied.
-func (j *ingestRun) copyNew(f newFile, dir, name string) (dst, sum string, dup bool, err error) {
+// already at dst, so nothing was copied. progress reports the bytes copied
+// so far; each attempt starts again from 0.
+func (j *ingestRun) copyNew(f newFile, dir, name string, progress func(int64)) (dst, sum string, dup bool, err error) {
 	const attempts = 3
 	for range attempts {
 		dst, dup, err = media.FreeName(f.Path, dir, name)
 		if err != nil || dup {
 			return dst, "", dup, err
 		}
-		sum, err = j.r.copyFile(j.ctx, f.Path, dst)
+		progress(0)
+		sum, err = j.r.copyFile(j.ctx, f.Path, dst, progress)
 		if err == nil {
 			return dst, sum, false, nil
 		}
