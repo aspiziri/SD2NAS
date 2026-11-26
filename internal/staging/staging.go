@@ -348,7 +348,8 @@ func (s *Service) List(ctx context.Context) (Listing, error) {
 	return out, nil
 }
 
-// diskFolders returns the visible directories in Staging/. A missing
+// diskFolders returns the directories in Staging/ the rescan looks into (not
+// dot-names or NAS metadata, see skipName). A missing
 // Staging/ means no import has happened yet.
 func (s *Service) diskFolders() (map[string]bool, error) {
 	entries, err := os.ReadDir(filepath.Join(s.photosRoot, Dir))
@@ -360,7 +361,7 @@ func (s *Service) diskFolders() (map[string]bool, error) {
 	}
 	out := map[string]bool{}
 	for _, e := range entries {
-		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+		if e.IsDir() && !skipName(e.Name()) {
 			out[e.Name()] = true
 		}
 	}

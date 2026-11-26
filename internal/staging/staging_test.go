@@ -147,6 +147,22 @@ func TestListUntrackedAndMissing(t *testing.T) {
 	}
 }
 
+func TestListSkipsNASMetadata(t *testing.T) {
+	fx := setup(t)
+	for _, name := range []string{"@eaDir", "#recycle", ".x"} {
+		if err := os.MkdirAll(filepath.Join(fx.photos, "Staging", name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l, err := fx.svc.List(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(l.Untracked, []string{"2025-05-30 - Trip"}) {
+		t.Errorf("untracked = %v", l.Untracked)
+	}
+}
+
 func TestListNoStagingDir(t *testing.T) {
 	db, err := catalog.Open(filepath.Join(t.TempDir(), "sd2nas.db"))
 	if err != nil {
