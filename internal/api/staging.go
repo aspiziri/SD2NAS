@@ -244,13 +244,20 @@ func (h *stagingHandlers) move(w http.ResponseWriter, r *http.Request) {
 		FileShas []string `json:"fileShas"`
 		ToID     *int64   `json:"toId"`
 		NewTitle *string  `json:"newTitle"`
+		NewName  *string  `json:"newName"` // the new folder's whole name
 	}
 	if err := decodeBody(w, r, &body, largeBody); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if (body.ToID == nil) == (body.NewTitle == nil) {
-		writeError(w, http.StatusBadRequest, "Give exactly one of toId and newTitle.")
+	given := 0
+	for _, p := range []bool{body.ToID != nil, body.NewTitle != nil, body.NewName != nil} {
+		if p {
+			given++
+		}
+	}
+	if given != 1 {
+		writeError(w, http.StatusBadRequest, "Give exactly one of toId, newTitle and newName.")
 		return
 	}
 	req := staging.MoveRequest{SHAs: body.FileShas}
@@ -260,6 +267,12 @@ func (h *stagingHandlers) move(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.ToID = *body.ToID
+	} else if body.NewName != nil {
+		req.NewName = *body.NewName
+		if strings.TrimSpace(req.NewName) == "" {
+			writeError(w, http.StatusBadRequest, "Give the new folder a name.")
+			return
+		}
 	} else {
 		req.NewTitle = *body.NewTitle
 		if strings.TrimSpace(req.NewTitle) == "" {

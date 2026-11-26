@@ -477,11 +477,12 @@ const MaxFiles = 20000
 var ErrChanged = errors.New("staging: files moved while the request was being made; reload and try again")
 
 // MoveRequest names the files to move and exactly one destination: an
-// existing folder, or the title of a new one.
+// existing folder, or the title or whole name of a new one.
 type MoveRequest struct {
 	SHAs     []string
 	ToID     int64  // an existing folder…
-	NewTitle string // …or a new folder "<earliest source date> - NewTitle" (exactly one of the two)
+	NewTitle string // …or a new folder "<earliest source date> - NewTitle"…
+	NewName  string // …or a new folder with this whole name (CleanName) (exactly one of the three)
 }
 
 // MoveResult is what Move did.
@@ -633,9 +634,20 @@ func (s *Service) Move(ctx context.Context, req MoveRequest) (MoveResult, error)
 		return MoveResult{}, err
 	}
 	title := strings.TrimSpace(req.NewTitle)
+	var newName string
+	given := 0
+	for _, b := range []bool{req.ToID > 0, req.NewTitle != "", req.NewName != ""} {
+		if b {
+			given++
+		}
+	}
 	switch {
-	case req.ToID > 0 && req.NewTitle != "", req.ToID <= 0 && req.NewTitle == "":
-		return MoveResult{}, fmt.Errorf("%w: give either a destination folder or a new folder's title", ErrBadRequest)
+	case given != 1:
+		return MoveResult{}, fmt.Errorf("%w: give either a destination folder or a new folder's title or name", ErrBadRequest)
+	case req.NewName != "":
+		if newName, err = CleanName(req.NewName); err != nil {
+			return MoveResult{}, err
+		}
 	case req.ToID <= 0:
 		if title, err = CleanTitle(title); err != nil {
 			return MoveResult{}, err
@@ -667,9 +679,12 @@ func (s *Service) Move(ctx context.Context, req MoveRequest) (MoveResult, error)
 
 	dest, ok := locked[req.ToID]
 	if !ok { // a new folder
-		name := FolderName(earliestDate(sources), title)
-		if err := checkName(name); err != nil {
-			return MoveResult{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+		name := newName
+		if name == "" {
+			name = FolderName(earliestDate(sources), title)
+			if err := checkName(name); err != nil {
+				return MoveResult{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+			}
 		}
 		releaseName, err := s.lockName(name)
 		if err != nil {

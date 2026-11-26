@@ -856,6 +856,25 @@ func TestMoveToNewFolder(t *testing.T) {
 	e.nameKeyFree(t, "2025-05-30 - Picks")
 }
 
+func TestMoveToNewFolderNamed(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMoveEnv(t, e)
+	v := e.version()
+	res, err := e.svc.Move(t.Context(), MoveRequest{SHAs: []string{m.bJPG}, NewName: " 2025-06-02 - Picks "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Folder.Name != "2025-06-02 - Picks" || res.Moved != 1 {
+		t.Fatalf("result = %+v", res)
+	}
+	if p := e.relPath(t, m.bJPG); p != "Staging/2025-06-02 - Picks/b.JPG" {
+		t.Errorf("rel_path = %q", p)
+	}
+	e.bumped(t, v)
+	e.lockFree(t, m.a.ID, m.b.ID, res.Folder.ID)
+	e.nameKeyFree(t, res.Folder.Name)
+}
+
 func TestMoveNewFolderRules(t *testing.T) {
 	e := newOpsEnv(t)
 	m := newMoveEnv(t, e)
@@ -871,6 +890,10 @@ func TestMoveNewFolderRules(t *testing.T) {
 		{"bad character", MoveRequest{SHAs: sha, NewTitle: "a/b"}, ErrBadTitle},
 		{"too long once dated", MoveRequest{SHAs: sha, NewTitle: strings.Repeat("x", 195)}, ErrBadTitle},
 		{"both", MoveRequest{SHAs: sha, ToID: m.b.ID, NewTitle: "Picks"}, ErrBadRequest},
+		{"title and name", MoveRequest{SHAs: sha, NewTitle: "Picks", NewName: "2025-06-01 - Picks"}, ErrBadRequest},
+		{"bad name", MoveRequest{SHAs: sha, NewName: "2025-06-01 - a/b"}, ErrBadTitle},
+		{"blank name", MoveRequest{SHAs: sha, NewName: "  "}, ErrBadTitle},
+		{"whole name exists", MoveRequest{SHAs: sha, NewName: "2025-05-30 - Picks"}, catalog.ErrNameTaken},
 		{"neither", MoveRequest{SHAs: sha}, ErrBadRequest},
 		{"name exists", MoveRequest{SHAs: sha, NewTitle: "Picks"}, catalog.ErrNameTaken},
 		{"unknown folder", MoveRequest{SHAs: sha, ToID: 999}, catalog.ErrNotFound},

@@ -352,7 +352,18 @@ func TestStagingMoveAndCullAPI(t *testing.T) {
 		t.Errorf("culled file's thumbnail still cached (stat err %v)", err)
 	}
 
+	rec = send(t, f.s, http.MethodPost, "/api/staging/move", fmt.Sprintf(`{"fileShas":[%q],"newName":"2025-06-02 - Raw"}`, arw))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("move by name: status %d, body %s", rec.Code, rec.Body)
+	}
+	decodeInto(t, rec, &mv)
+	if mv.Folder.Name != "2025-06-02 - Raw" || mv.Moved != 1 {
+		t.Errorf("move by name result %+v", mv)
+	}
+
 	// Bad requests.
+	wantCode(t, send(t, f.s, http.MethodPost, "/api/staging/move", fmt.Sprintf(`{"fileShas":[%q],"newTitle":"x","newName":"y"}`, arw)), http.StatusBadRequest, "")
+	wantCode(t, send(t, f.s, http.MethodPost, "/api/staging/move", fmt.Sprintf(`{"fileShas":[%q],"newName":" "}`, arw)), http.StatusBadRequest, "")
 	both := fmt.Sprintf(`{"fileShas":[%q],"toId":%d,"newTitle":"x"}`, arw, mv.Folder.ID)
 	wantCode(t, send(t, f.s, http.MethodPost, "/api/staging/move", both), http.StatusBadRequest, "")
 	wantCode(t, send(t, f.s, http.MethodPost, "/api/staging/move", fmt.Sprintf(`{"fileShas":[%q]}`, arw)), http.StatusBadRequest, "")
@@ -384,7 +395,7 @@ func TestStagingBadRequestSentences(t *testing.T) {
 		{http.MethodPatch, "/api/staging/1", `{"title":"x","extra":1}`, "The request has a field this server does not know."},
 		{http.MethodPatch, "/api/staging/1", `{}`, "Give a name, or a title (an empty one removes it)."},
 		{http.MethodPost, "/api/staging/cull", `{"fileShas":["` + strings.Repeat("a", 5<<20) + `"]}`, "The request is too large."},
-		{http.MethodPost, "/api/staging/move", `{"fileShas":[]}`, "Give exactly one of toId and newTitle."},
+		{http.MethodPost, "/api/staging/move", `{"fileShas":[]}`, "Give exactly one of toId, newTitle and newName."},
 		{http.MethodPost, "/api/staging/move", `{"fileShas":[],"toId":0}`, "The destination folder id must be a positive whole number."},
 		{http.MethodPost, "/api/staging/move", `{"fileShas":[],"newTitle":" "}`, "Give the new folder a title."},
 		{http.MethodPost, "/api/staging/promote", `[]`, "The request body is not valid JSON."},
