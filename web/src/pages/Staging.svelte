@@ -329,7 +329,7 @@
 {:else if !data}
   <p class="muted">Loading…</p>
 {:else}
-  <p class="sub">{plural(folders.length, 'folder', 'folders')} · {formatCount(totals.files)} files · {formatBytes(totals.bytes)}</p>
+  <p class="sub">{plural(folders.length, 'folder', 'folders')} · {plural(totals.files, 'file', 'files')} · {formatBytes(totals.bytes)}</p>
   {#if showQueue}
     <PromoteProgress {queue} {showLast} {cancelling} oncancel={cancelPromote} ondismiss={(j) => (dismissedJob = j.id)} />
   {/if}
