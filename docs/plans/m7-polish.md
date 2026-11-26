@@ -27,7 +27,8 @@
   - **Do not modify** `internal/indexer/` (non-test files), `internal/cardwatch/`, `internal/lockfile/`, `deploy/unassigned-devices.sh`, `deploy/script_test.go`, `deploy/entrypoint.sh`, `.github/`. The card-script contract (`POST /api/ingest?wait=1&format=text` and `POST /api/notifications/take?format=text` answering `level\nmessage\n`) keeps its shape.
 - **Binding values** (reviewers check them verbatim):
   - **Token:**
-    - Env `SD2NAS_TOKEN` only (no flag, so it never shows in `ps`). Empty = no token. A value with any byte outside 0x21–0x7E → `config.Load` error `SD2NAS_TOKEN must be printable ASCII with no spaces` (exit 1).
+    - Env `SD2NAS_TOKEN` only (no flag, so it never shows in `ps`). Empty = no token. Otherwise it must match `^[A-Za-z0-9._~+/=-]+$` (safe inside the bash-sourced `sd2nas.cfg`); anything else → `config.Load` error exactly `SD2NAS_TOKEN may use only letters, digits and . _ ~ + / = -`, which `main` logs as `exiting` (key `err`) and SD2NAS **refuses to start** (exit 1).
+    - Template and README tell the owner to generate it with `openssl rand -hex 24` and to write it single-quoted in `sd2nas.cfg` (`SD2NAS_TOKEN='…'`, appended with the `printf` form in Task 13).
     - A token shorter than 16 bytes adds the `/healthz` warning `SD2NAS_TOKEN is shorter than 16 characters: pick a longer, random one`.
     - Open without the token: `GET|HEAD /api/auth`, `POST /api/login`, `POST /api/logout`, `/healthz`, and every path outside `/api/` (the UI's files). The path is judged after `path.Clean("/" + r.URL.Path)`.
     - Accepted credentials: header `Authorization: Bearer <token>` (scheme case-insensitive) or cookie `sd2nas_session` = lowercase hex of HMAC-SHA256(key = token, message = `sd2nas-session-v1`). Both compared with `crypto/subtle` (the token as SHA-256 digests, so its length doesn't leak).
@@ -40,12 +41,13 @@
   - **Settings:**
     - New key `staging_notice_at`, appended to `SettingKeys()` (8 keys), field `Settings.StagingNoticeAt time.Duration`, default `09:00`, reason `want HH:MM, 00:00 to 23:59`.
     - `GET /api/settings` → `{"settings": {...}, "defaults": {...}}`; `defaults` is `DefaultSettings().Strings()` with `backup_dir` = `idx.BackupDir(catalog.DefaultSettings())`.
-    - Existing 400 sentences unchanged: `Name at least one setting.`, `Unknown setting <key>.`, `Setting <key> must be a string.`, `Setting <key>: <reason>.`, `Setting backup_dir: pick a folder outside Archive/ and Staging/.` Any other `CheckBackupDir` error → `Setting backup_dir: <err>.`
+    - Existing 400 sentences unchanged: `Name at least one setting.`, `Unknown setting <key>.`, `Setting <key> must be a string.`, `Setting <key>: <reason>.`, `Setting backup_dir: pick a folder outside Archive/ and Staging/.` (`CheckBackupDir` returns only `nil` or `ErrBackupInside`, so no other branch is added.)
     - `POST /api/archive/changed/accept`: a non-integer `upTo` (`1.5`, `"3"`, `true`) → 400 `upTo must be a positive whole number.` (not the JSON sentence).
   - **Notices:** the stale-staging check runs at the first check at or after `staging_notice_at` (container local time), keyed `staging:<YYYY-MM-DD>`, once a day. A settings change applies at once (the loop is nudged). The missing notice key is `missing:<newest updated_at of the counted rows, UTC, RFC 3339 nano>`; texts unchanged (`The archive scan marked 1 file missing from Archive/. See the Archive index page.` / `… marked <N> files missing …`).
   - **Thumbnails:** failures cached per sha (both sizes) only for `ErrUndecodable`, `ErrTooLarge`, `ErrNoImage`; at most **10000** entries (the map is cleared when full); `Remove(sha)` forgets it; a cached failure is returned wrapped as `fmt.Errorf("%w: %w", ErrRemembered, original)` with `ErrRemembered = errors.New("thumbs: an earlier render of this file failed")`. exiftool: one process started with `-stay_open True -@ -` on the first RAW render; each request ends `-echo4` / `{ready<N>}` / `-execute<N>`; `Close` sends `-stay_open` / `False`, closes stdin, waits at most **1 s**, then kills.
   - **Copy progress fields** (`ProgressSnapshot`): `current` (card path), `current_size`, `current_done`, `waiting_folder`, `waiting_holder`, all `omitempty`.
   - **Re-import missing:** schema version **5** (`restore_requests`). `POST /api/ingest/{id}/reimport-missing` answers 200 `{"requested": n, "started": <ingest view>|null, "message": "…"}`, messages:
+    - An unknown import id → 404 `That import no longer exists.`; a non-positive one → 400 `The import id must be a positive whole number.`
     - `Nothing to re-import: none of this import's files is still missing from the archive.`
     - `Importing <n> file(s) again from <card>.` (`file`/`files` by `plural`)
     - `<n> file(s) will be imported again the next time you insert <card>.`
@@ -67,11 +69,11 @@
 
 ## Review Focus
 
-1. **No token = no change.** Every existing `internal/api` and `deploy` test passes untouched. With a token, nothing under `/api/` answers without it except the three auth routes; the card script's Bearer + `X-SD2NAS: 1` + no `Origin` still works; a wrong token gives the script two text lines. Cookie flags exact; compares constant-time; cleaned paths. Pinned in Task 3.
-2. **Shift never loses or rewrites a file.** Bytes and hashes unchanged; renames go through `moveFile` (FreeName, never overwrites, a candidate that is the file itself keeps it); wall-clock arithmetic (no DST jump); only `staged` rows; filesystem step then catalog step per file; a failure mid-way leaves every file either fully shifted or untouched. Pinned in Task 7.
-3. **Re-import missing.** `missing` rows are never deleted; `missing → staged` happens only when the copy's full hash equals the asset, in one transaction, guarded by `state = 'missing'`; otherwise the normal new/duplicate paths run. "Safe to format" follows. Ingest is still the only lock waiter. Pinned in Task 6.
+1. **No token = no change.** Every existing `internal/api` and `deploy` test passes, changed only where a task names the change (the settings key count and `TestSettingsAPI`'s `len == 7` in Task 1, the `{"upTo":"x"}` sentence in Task 1, `wantTargets`/Repository in Tasks 3 and 13). With a token, nothing under `/api/` answers without it except the three auth routes; the card script's Bearer + `X-SD2NAS: 1` + no `Origin` still works; a wrong token gives the script two text lines. Cookie flags exact; compares constant-time; cleaned paths (always 401, never a redirect); a token outside `[A-Za-z0-9._~+/=-]` stops startup with the pinned sentence, so the bash-sourced `sd2nas.cfg` can always carry it. Pinned in Task 3.
+2. **Shift never loses or rewrites a file.** Bytes and hashes unchanged; renames go through `moveFile` (FreeName, never overwrites, a candidate that is the file itself keeps it); wall-clock arithmetic (no DST jump); only `staged` rows; filesystem step then catalog step per file, and a failed catalog step moves the file back; a failure mid-way (or shutdown, between files) leaves every file either fully shifted or untouched. Pinned in Task 7.
+3. **Re-import missing.** `missing` rows are never deleted; `missing → staged` happens only when the copy's full hash equals the asset, in one transaction, guarded by `state = 'missing'`; otherwise the normal new/duplicate paths run. A request counts only while its asset is missing and was marked missing before the request (no stale restores). "Safe to format" follows. Ingest is still the only lock waiter; the re-import goes through `Server.SubmitIngest`. Pinned in Task 6.
 4. **Notices never repeat, never skip.** Changing `staging_notice_at` mid-day neither sends a second `staging:<date>` nor loses today's; the missing watermark survives a restart (newest `missing:` key) and covers crashed passes and two passes per check; no DB write or full scan per 30 s tick. Pinned in Task 2.
-5. **exiftool lifecycle.** No orphan process after a timeout, a cancelled render, oversized output, a dead process or `Close`; a reply is never read as another request's (marker per request, kill on any doubt); `docker stop` stays under 2 s. The failure cache holds only file faults (never timeouts, cancels, a missing tool, a missing file). Pinned in Task 4.
+5. **exiftool lifecycle.** No orphan process after a timeout, a cancelled render, oversized output, a dead process, a recovered panic or `Close`; a reply is never read as another request's (marker per request, a foreign marker is doubt, kill unless the request completed cleanly); `docker stop` stays under 2 s. The failure cache holds only file faults (never timeouts, cancels, a missing tool, a missing file). Pinned in Task 4.
 6. **Copy progress** publishes nothing itself; the feed's 500 ms poll stays the only publisher of `ingest.current`; `bytes_done` ends each file at `start + size` whatever the outcome. Pinned in Task 5.
 7. **UI** at 375×812 and desktop for every new view (controller's browser check).
 8. **Docs match reality:** README, template, PLAN §16; the `v0.1.0` item stays unticked with exact owner commands.
@@ -81,24 +83,25 @@
 1. **The browser authenticates with a cookie set by `POST /api/login`; the card script keeps Bearer.** **[override?]** `EventSource` and `<img src=/api/thumbs/…>` can't send headers, so a header-only scheme would need the token in every URL. Cost of a `?token=` query parameter instead: the token lands in browser history, server logs and every thumbnail URL, and thumbnails couldn't be cached by URL.
 2. **What stays open with a token:** `/healthz`, the UI's static files, `GET /api/auth`, `POST /api/login`, `POST /api/logout`. **[override?]** Docker's `HEALTHCHECK` (`wget …/healthz`) and Unraid's health dot have no token; `/healthz` reveals version, TZ, uid/gid and mount paths, not photos. Cost of protecting it: the Dockerfile health check needs the token (`wget --header` from env), and a forgotten token shows the container unhealthy.
 3. **The cookie is a fixed HMAC of the token, valid 400 days (browsers' cap); no server-side sessions.** **[override?]** Changing `SD2NAS_TOKEN` signs every browser out; "Sign out on this device" clears one. Cost of real sessions: a table, expiry and a revoke list.
-4. **No login rate limit; a `/healthz` warning for tokens under 16 characters; printable ASCII only.** **[override?]** LAN only, and a random 48-hex token (README: `openssl rand -hex 24`) can't be guessed. Cost of a limiter: shared state, a 429 path, and a lock-out risk for the owner.
+4. **No login rate limit; a `/healthz` warning for tokens under 16 characters; the charset `[A-Za-z0-9._~+/=-]`, refused at startup otherwise.** **[override?]** LAN only, and a random 48-hex token (README: `openssl rand -hex 24`) can't be guessed. The charset keeps the token intact in the bash-sourced `sd2nas.cfg` (the frozen card script `source`s it; `$`, quotes, `;` would be mangled or executed), and it is written single-quoted. Cost of a limiter: shared state, a 429 path, and a lock-out risk for the owner. Cost of a wider charset: tokens the card script silently sends wrong, or a cfg line bash executes.
 5. **`SD2NAS_TOKEN` is env-only** (no `--token` flag), so it never appears in a process list.
 6. **`staging_notice_at` (HH:MM, default 09:00) is a catalog setting, applied at once.** **[override?]** "Once a day" is unchanged: the day's key decides, so moving the time later after today's notice sends nothing more today, and moving it earlier before it ran sends it now. Cost of an env var instead: a container restart to change it, and no Settings field.
 7. **The missing-files notice comes from a catalog watermark, not the last pass's count** (folds in T6-m4 and the crashed-pass follow-up). Rows with `state = 'missing'` and `updated_at` after the newest `missing:` notice (or after now − 24 h) are counted once no pass is running; the query runs only when `Status.Missing` or `Last.FinishedAt` changed, or at the first check. Cost of keeping per-pass counts: both follow-ups stay open.
-8. **The Settings page sends only changed keys** (all-or-nothing PUT), and `GET /api/settings` adds `defaults`, so "Use default" works and an untouched `backup_dir` stays `""` (following the photos root) instead of being saved as a path.
+8. **The Settings page sends only changed keys** (all-or-nothing PUT), and `GET /api/settings` adds `defaults`, so "Use default" works and an untouched `backup_dir` stays `""` (following the photos root) instead of being saved as a path. `GET` returns the resolved `backup_dir`, never `""`, so the page shows "(default)" when `settings.backup_dir === defaults.backup_dir`; "Use default" sends `""`.
 9. **The Settings page shows all 8 catalog keys**, including `verify_known` and `free_space_reserve_gb`, which M7's list didn't name. **[override?]** Cost of hiding them: they stay reachable only by `curl`.
 10. **The default promote pattern stays per device** (`localStorage`, shown under "This device"). **[override?]** Cost of a catalog setting: a ninth key, a pattern validator in Go (`staging.CheckPattern` exists) and migrating each device's remembered value.
 11. **Thumbnail failures are remembered in memory, per file, until restart.** **[override?]** A restart (an update, usually) retries each once, which also picks up a newer exiftool/ffmpeg. Cost of on-disk markers: files under `/config/thumbs`, invalidation on tool upgrades, and `Remove` changes.
 12. **One exiftool process for the container, requests serialized, started lazily, restarted after any failure; no idle stop.** **[override?]** Perl startup (~0.3–0.5 s per RAW today) is paid once; a request takes ~20–50 ms, so serializing is faster than four processes. Paths containing CR or LF (an argfile can't carry them) fall back to today's one-shot run. Cost of a pool: N × ~30 MB RSS and N protocols to keep in sync. Cost of an idle stop: a timer and a restart race.
 13. **Byte progress needs no new event:** the 500 ms ingest feed already publishes `ingest.current` only when it changed, so copying publishes at most 2 frames/s, the same ceiling as today. F11 folds in as `waiting_folder` / `waiting_holder`.
-14. **Re-import missing records a persistent request (schema v5 `restore_requests`).** **[override?]** The card script unmounts the card when SD2NAS answers 200, which a `missing` import does, so "import now while it's mounted" alone would almost never work. The request applies to the next import of any card holding that content; if the card is still mounted (poller setups, or the owner mounted it by hand) the import starts at once. Cost of no persistence: the button only works with a hand-mounted card.
+14. **Re-import missing records a persistent request (schema v5 `restore_requests`).** **[override?]** The card script unmounts the card when SD2NAS answers 200, which a `missing` import does, so "import now while it's mounted" alone would almost never work. The request applies to the next import of any card holding that content; if the card is still mounted (poller setups, or the owner mounted it by hand) the import starts at once. A request counts only while its asset is `missing` with `updated_at <= requested_at`: content that reappeared and went missing again needs a fresh request. Cost of no persistence: the button only works with a hand-mounted card.
 15. **A restored file becomes an ordinary staged asset**: same sha, `first_ingest` kept, counted as `new` in that import (so "N new … Card safe to format." reads right), forgettable like any staged file. **[override?]** Cost of a separate `restored` outcome: a CHECK-constraint rebuild of `ingest_files`, new counts, and a change to `Describe`'s text that the card script passes through.
 16. **The re-import dialog warns about a dropped disk** ("if an array disk dropped out, fix that first: its files come back by themselves at the next archive scan") instead of an indexer threshold. The dropped-disk threshold stays deferred, since it is indexer core.
 17. **Shift times applies to staged files only.** **[override?]** Archived files are the indexer's, live inside Capture One sessions whose `.cosessiondb` references file names, and renaming them would break sessions. Cost of allowing it: Capture One sessions to repair by hand and an indexer interaction (moves vs. changes).
-18. **Shift works on one folder per request**, from the Folder page (selection, or "Shift all times…"). **[override?]** Cost of multi-folder: locking and re-filing across many sources, and a harder preview.
+18. **Shift works on one folder per request**, from the Folder page (selection, or "Shift all times…", which sends every staged file whatever the kind filter shows). A folder of more than `MaxFiles` (20000) files can't be shifted whole; the button is disabled with a sentence. **[override?]** Cost of multi-folder: locking and re-filing across many sources, and a harder preview. Cost of a `folderId` whole mode for huge folders: a second request shape and its validation.
 19. **Where shifted files go.** **[override?]**
     - If the request covers **every staged file of the folder**, the files stay: the folder's dates become their new folder dates, and a name starting with a date takes the earliest new date (title kept). If that name is taken, the folder keeps its name and the result says which name it wanted.
-    - Otherwise a file **stays** when its new folder date is one of the folder's dates, and is **re-filed** like an import when not: into the folder whose dates contain it (`StagingFolderForDate`'s choice, read-only), else a new `YYYY-MM-DD` folder with the source's `created_at`.
+    - Otherwise a file **stays** when its new folder date is one of the folder's dates, and is **re-filed** like an import when not: into the folder whose dates contain it, else the folder named exactly that date (both `StagingFolderForDate`'s choices, read-only, so shift never tries to create a name that exists), else a new `YYYY-MM-DD` folder with the source's `created_at`.
+    - The shift stops between files on shutdown (`shifted N of M files: SD2NAS is shutting down`), and `Service.Close` waits for it, like the other long jobs.
     - Cost of always re-filing: shifting a titled folder by a day would empty it into an untitled one. Cost of never re-filing: a camera's files stay in a wrong-date folder until moved by hand.
 20. **Shift renames only the leading `YYYY-MM-DD HH.mm.ss` stamp, and only when it equals the file's old capture time;** everything after it (video details, `-1` burst suffixes) is kept, so burst order survives. Names without the stamp (files adopted from SMB) keep their name. Files are processed latest-first for a positive shift and earliest-first for a negative one, so a batch never collides with itself. Files with no capture time are skipped and counted.
 21. **Shifting adds seconds to the wall clock** (capture times are naive local wall clock), never through `time.Local`'s DST rules; limits ±100 years, results within 1970–2099.
@@ -106,7 +109,18 @@
 23. **Views:** Staging gets Cards | List | Timeline, Folder gets Grid | List, remembered per device. The timeline is chronological (oldest first, like the cards), grouped by month of the folder's date, undated folders last. **[override?]** Cost of a file-level timeline too: another layout to check on phone and desktop.
 24. **The template moves to `:latest` in this PR; the owner tags `v0.1.0` right after merging.** **[override?]** The template URL points at `main`, so a fresh install between merge and tag would find no `:latest` (minutes, and the owner is the only user). README documents `:edge` for following `main`. Cost of keeping `:edge`: every merge to main updates the NAS on the next "Check for Updates".
 25. **Base images are pinned as `name:<exact tag>@sha256:<digest>`**, checked by a Go test; no Dependabot config. **[override?]** Cost of Dependabot (a `.github/dependabot.yml`, not a dependency): a weekly PR per image to review.
-26. **Follow-ups folded in:** M5 settings nits (generic backup-dir error, the `upTo` sentence, the key-list test), the 24 px `<summary>`, T6-m4 and the crashed-pass notice, F9 (`diskFolders` uses `skipName`), F10 (staging first-load reload), "1 files", F11, M-6 (forget counts `missing`), `HEAD /api/events`. **Deferred** (unchanged code or not cheap): F6, F7, F8, F12, F14, the SSE write deadline, duplicate `ingest.finished`, a 500 carrying paths (only token holders see them now), client routes with a dot, history truncation at 1000, duplicate clock-warning strings, the dropped-disk threshold, the poller's repeated Warn, the open-rows panic hang, the shutdown log line, the M5 indexer-progress/logging details and missing tests, the Archive page load nits.
+26. **Follow-ups folded in:** M5 settings nits (the `upTo` sentence, the key-count tests; the "generic backup-dir error" nit is dropped because `CheckBackupDir` has no other error), the 24 px `<summary>`, T6-m4 and the crashed-pass notice, F9 (`diskFolders` uses `skipName`), F10 (staging first-load reload), "1 files", F11, M-6 (forget counts `missing`), `HEAD /api/events`. **Deferred** (unchanged code or not cheap): F6, F7, F8, F12, F14, the SSE write deadline, duplicate `ingest.finished`, a 500 carrying paths (only token holders see them now), client routes with a dot, history truncation at 1000, duplicate clock-warning strings, the dropped-disk threshold, the poller's repeated Warn, the open-rows panic hang, the shutdown log line, the M5 indexer-progress/logging details and missing tests, the Archive page load nits.
+27. **The JS shift preview (`lib/shift.js`) and the JS settings checks (`lib/settings.js` `checkField`) are preview-only mirrors of the Go rules; the server stays the judge.** The browser never blocks a request on them (a `checkField` complaint is shown, but Save still sends and the server's 400 sentence wins); there is no dry-run endpoint. To keep the mirrors honest, one case table, `web/src/lib/testdata/rules-cases.json`, is read by both the Go tests (`internal/staging/shift_test.go` and `internal/catalog/settings_test.go`, via `../../web/src/lib/testdata/rules-cases.json`) and the node tests (`shift.test.js`, `settings.test.js`): same inputs → same outputs. It lives under `web/` because the Dockerfile's web stage copies only `web/` before `npm test`. Shape:
+    ```json
+    {
+      "shiftWall":   [{"capture": "2025-03-09T01:30:00", "seconds": 3600, "want": "2025-03-09T02:30:00"}],
+      "shiftedName": [{"name": "2025-05-30 14.02.11-1.JPG", "capture": "2025-05-30T14:02:11", "seconds": 3600, "want": "2025-05-30 15.02.11-1.JPG"}],
+      "folderDate":  [{"capture": "2025-05-31T03:59:59", "dayStartsAt": "04:00", "want": "2025-05-30"}],
+      "wholeName":   [{"name": "2025-05-30 - Trip", "dates": ["2025-05-31", "2025-06-01"], "want": "2025-05-31 - Trip"}],
+      "settings":    [{"key": "staging_notice_at", "value": "24:00", "ok": false}]
+    }
+    ```
+    Task 1 creates the file with the `settings` section (one valid and one invalid value per key; the Go side checks `SetSettings` accepts or refuses each) and empty arrays for the rest; Task 7 fills in at least the five `shiftedName` cases of Task 7 Step 1, the two `shiftWall` cases, three `folderDate` cases (before, at and after the cutoff) and two `wholeName` cases (dated, `Untitled`). Tasks 9 and 10 read it. Cost of a dry-run endpoint instead: a second code path through `Shift` and a request per keystroke.
 
 ## File Structure
 
@@ -116,10 +130,11 @@ internal/catalog/
   notifications.go     LatestNotificationTime                                         (Task 2)
   archive.go           MissingSince                                                   (Task 2)
   schema.go, catalog.go   schemaV5 restore_requests, SchemaVersion = 5                (Task 6)
-  restore.go           RequestRestore, RestoreRequested, RestoreMissing                (Task 6)
+  restore.go           RequestRestore, RestoreRequested, RestoreMissing, RestorableMissing (Task 6)
   stagingops.go        ShiftAsset, StagingFolderWithDate                              (Task 7)
 internal/api/
-  settings.go          defaults, settings hooks, backup-dir error                     (Task 1)
+  server.go            settings hooks fields (Task 1); auth field, chain, routes (Task 3)
+  settings.go          defaults, runs the settings hooks                              (Task 1)
   archive.go           upTo sentence                                                  (Task 1)
   notifications.go     registers notes.SettingsChanged                                (Task 2)
   auth.go              token middleware, /api/auth, /api/login, /api/logout           (Task 3)
@@ -141,11 +156,12 @@ internal/staging/
   shift.go             ShiftRequest, ShiftResult, Service.Shift                        (Task 7)
   staging.go           diskFolders skips skipName                                     (Task 8)
 web/src/
+  lib/testdata/rules-cases.json    Go/JS shared rule cases (Decision 27)       (Tasks 1, 7)
   lib/views.js, lib/prefs.js       view sorting/grouping, per-device prefs            (Task 8)
   pages/Staging.svelte, pages/Folder.svelte   views                                   (Task 8)
   lib/shift.js, Folder.svelte      Shift dialog                                       (Task 9)
   lib/settings.js, pages/Settings.svelte, components/Nav.svelte, App.svelte, app.css   (Task 10)
-  lib/auth.svelte.js, pages/Login.svelte, lib/api.js, App.svelte                      (Task 11)
+  lib/auth.svelte.js, pages/Login.svelte, lib/api.js, lib/live.svelte.js, App.svelte  (Task 11)
   components/LiveIngest.svelte, pages/IngestDetail.svelte, lib/messages.js            (Task 12)
 deploy/
   Dockerfile           pinned base images                                             (Task 13)
@@ -177,32 +193,24 @@ docs/PLAN.md                                                                    
 ### Task 1: Settings: notice time key, defaults, API nits, hooks
 
 **Produces:** `catalog.KeyStagingNoticeAt`, `Settings.StagingNoticeAt`; `GET /api/settings` `defaults`; unexported `Server.onSettingsChanged(fn func())` and `Server.settingsHooks() []func()`.
-**Consumes:** `catalog.SetSettings`, `indexer.CheckBackupDir`, `indexer.Service.BackupDir`.
+**Consumes:** `catalog.SetSettings`, `indexer.Service.BackupDir`.
 
 - [ ] **Step 1: Catalog tests (RED).** In `internal/catalog/settings_test.go`:
   - `TestSettingsStrings`: replace the literal `7` with `len(want)`; `want` gains `KeyStagingNoticeAt: "09:00"`; `SettingKeys()` ends with `staging_notice_at` (8 keys).
+  - `TestSettingsDefaults`: its `want` struct literal gains `StagingNoticeAt: 9 * time.Hour` (it compares `got != want`).
+  - `TestSettingsCases` (Decision 27): create `web/src/lib/testdata/rules-cases.json` with the `settings` section — one valid and one invalid value per key (8 × 2), plus `"shiftWall": [], "shiftedName": [], "folderDate": [], "wholeName": []` — and check each entry with `SetSetting` on a fresh DB (`ok` true → nil error, false → `*SettingError`). Use only platform-independent values (for `backup_dir`: `""` valid, `relative/dir` invalid; an absolute path differs between Windows and Linux). The file is read via `../../web/src/lib/testdata/rules-cases.json`.
   - `TestStagingNoticeAt`: `SetSetting(KeyStagingNoticeAt, "18:30")` → `Settings().StagingNoticeAt == 18h30m`; `"24:00"`, `"9:00"`, `""` → `*SettingError` with Reason `want HH:MM, 00:00 to 23:59`.
 - [ ] **Step 2: Implement.** In `settings.go`: the constant, append to `settingKeys`, the field, `DefaultSettings()` `StagingNoticeAt: 9 * time.Hour`, an `apply` case sharing `parseClock` and the reason, a `Strings()` entry.
 - [ ] **Step 3: API tests (RED)** in `internal/api/settings_test.go` / `archive_test.go`:
+  - Existing tests to update: `TestSettingsAPI`'s two `len(...) != 7` checks become `len(catalog.SettingKeys())`; `TestArchiveChangedAndAccept`'s table entry `{"upTo":"x"}` now expects `upTo must be a positive whole number.` (it was the JSON sentence).
   - `TestSettingsGetDefaults`: `GET` → `defaults` has all 8 keys, `defaults.backup_dir == filepath.Join(photos, "Management", "SD2NAS")` (what `BackupDir` gives), `defaults.staging_notice_at == "09:00"`.
   - `TestSettingsPutNoticeAt`: `{"staging_notice_at":"18:30"}` → 200 and the value; `{"staging_notice_at":"25:00"}` → 400 `Setting staging_notice_at: want HH:MM, 00:00 to 23:59.`
   - `TestSettingsHooks`: a hook registered with `srv.onSettingsChanged` runs once after a 200 PUT, not after a 400; a hook registered **after** `MountSettings` still runs (hooks are read per request).
-  - `TestAcceptUpToNotWhole`: `{"upTo":1.5}`, `{"upTo":"3"}`, `{"upTo":true}`, `{"upTo":0}`, `{}` → 400 `upTo must be a positive whole number.`; `{"upTo":2}` still works; `{"upTo":` (bad JSON) → the JSON sentence.
+  - `TestAcceptUpToNotWhole`: `{"upTo":1.5}`, `{"upTo":"3"}`, `{"upTo":true}`, `{"upTo":0}`, `{"upTo":null}`, `{}` → 400 `upTo must be a positive whole number.`; `{"upTo":2}` still works; `{"upTo":` (bad JSON) → the JSON sentence.
 - [ ] **Step 4: Implement.**
   - `Server` gains `settingsMu sync.Mutex` and `settingsFns []func()`; `onSettingsChanged` appends under the mutex; `settingsHooks` returns a copy.
-  - `settingsHandlers` keeps `srv *Server`; after `h.idx.SettingsChanged()` it runs every hook. `write` adds `"defaults"`.
-  - Backup dir:
-    ```go
-    if key == catalog.KeyBackupDir && v != "" {
-        if err := indexer.CheckBackupDir(h.photosRoot, v); errors.Is(err, indexer.ErrBackupInside) {
-            writeError(w, http.StatusBadRequest, "Setting backup_dir: pick a folder outside Archive/ and Staging/.")
-            return
-        } else if err != nil {
-            writeError(w, http.StatusBadRequest, fmt.Sprintf("Setting backup_dir: %s.", strings.TrimRight(err.Error(), ". ")))
-            return
-        }
-    }
-    ```
+  - These fields live on `Server` in `internal/api/server.go`. `settingsHandlers` **gains** a `srv *Server` field (it has none today); after `h.idx.SettingsChanged()` it runs every hook from `h.srv.settingsHooks()`. `write` adds `"defaults"`.
+  - The backup-dir check stays as it is (`errors.Is(…, indexer.ErrBackupInside)`): `CheckBackupDir` returns nothing else, and the indexer is frozen.
   - `accept`: decode `UpTo json.RawMessage`; `n, err := strconv.ParseInt(string(raw), 10, 64)`; `len(raw) == 0 || err != nil || n < 1` → the sentence.
 - [ ] **Step 5:** `gofmt -l .`, `go vet ./...`, `go test ./internal/catalog/ ./internal/api/`; commit `Add the staging notice time setting and settings defaults`.
 
@@ -221,7 +229,7 @@ docs/PLAN.md                                                                    
   - `TestStagingNoticeAtSetting`: setting `18:00`; stale folder; checks at 17:59 → nothing; 18:00 → `staging:<date>`.
   - `TestStagingNoticeLaterAfterSent`: sent at 09:00; set `20:00`, `SettingsChanged()`; check at 20:01 → no second notice (`adds` unchanged).
   - `TestStagingNoticeEarlierRunsNow`: `09:00`, now 08:00, nothing sent; set `07:00`, `SettingsChanged()`; the loop checks within the 10 s deadline without a tick (use `Every: time.Hour`) → notice queued.
-  - `TestNoticeAtReadOnce`: 100 checks read settings once (count via a `settingsReads` test field); after `SettingsChanged`, once more.
+  - `TestNoticeAtReadOnce`: before today's check is done (now ≥ the notice time, `StagingReady` false so the day never completes), 100 checks read settings once (`settingsReads`); after `SettingsChanged`, once more.
   - `TestNoticeAtReadFailure`: settings read fails (a stored bad value) → logged at Error, the default `09:00` used, retried at the next check.
   - `TestMissingTwoPassesOneCheck`: two passes mark 1 then 2 rows before one check → one notice `The archive scan marked 3 files missing from Archive/. See the Archive index page.` keyed `missing:<newest updated_at>`.
   - `TestMissingAfterCrash`: rows marked missing 1 h ago, `Status{Last: nil, Missing: 2}` (a crashed pass) → one notice for 2 at the first check.
@@ -239,6 +247,10 @@ docs/PLAN.md                                                                    
   missingSeen  int       // Status.Missing at the last missing check; -1 before the first
   lastFinished time.Time // Status.Last.FinishedAt at that check
   watermark    time.Time // rows marked missing at or before it are notified or too old
+
+  // test-only counters, like adds
+  settingsReads  int // DB.Settings calls made by noticeAt
+  missingQueries int // MissingSince calls made by checkMissing
 
   func (s *Service) loop() {
       defer s.wg.Done()
@@ -269,6 +281,7 @@ docs/PLAN.md                                                                    
       if s.at >= 0 && !s.reread.Swap(false) {
           return s.at
       }
+      s.settingsReads++
       set, err := s.cfg.DB.Settings(ctx)
       if err != nil {
           s.reread.Store(true) // try again at the next check
@@ -324,7 +337,7 @@ docs/PLAN.md                                                                    
     s.missingSeen, s.lastFinished = st.Missing, finished
     ```
   - `New` sets `at: -1`, `missingSeen: -1`, `nudge: make(chan struct{}, 1)`.
-- [ ] **Step 5: Wire.** `MountNotifications(notes)` calls `s.onSettingsChanged(notes.SettingsChanged)`. `TestSettingsPutNudgesNotices` (api): a PUT makes a waiting fake's `SettingsChanged` count 1.
+- [ ] **Step 5: Wire.** `MountNotifications(notes)` calls `s.onSettingsChanged(notes.SettingsChanged)`. `TestSettingsPutNudgesNotices` (api): `MountNotifications` takes the concrete `*notices.Service`, so use a real one — `Every: time.Hour`, a `Staging` func that signals a channel on each call, `Now` at or after the notice time; `Start`, wait for the first signal, `PUT /api/settings {"staging_notice_at":"00:00"}`, and expect a second signal within 10 s (no tick could have caused it).
 - [ ] **Step 6:** gofmt/vet/test the three packages; race command; commit `Make the stale-staging notice time a setting and count missing files from the catalog`.
 
 ### Task 3: Token auth (backend + template)
@@ -332,7 +345,7 @@ docs/PLAN.md                                                                    
 **Produces:** `config.Config.Token`; `api.Server.SetToken(token string)`; routes `GET /api/auth`, `POST /api/login`, `POST /api/logout`.
 **Consumes:** `guard`, `writeFail`, `wantsText`, `decodeBody`, `smallBody`.
 
-- [ ] **Step 1: Config tests (RED)** (`internal/config/config_test.go`): `TestTokenEnv`: unset → `""`; `abc123` → `abc123`; `"abc def"`, `"abc\x7f"`, `"é"` → error `SD2NAS_TOKEN must be printable ASCII with no spaces`. Implement in `Load` (env only).
+- [ ] **Step 1: Config tests (RED)** (`internal/config/config_test.go`): `TestTokenEnv`: unset → `""`; `abc123`, `0f3a…` (48 hex), `A-Z_a.z~+/=` → kept as is; `"abc def"`, `"a$b"`, `"a'b"`, `"a;b"`, `"abc\x7f"`, `"é"` → error exactly `SD2NAS_TOKEN may use only letters, digits and . _ ~ + / = -`. Implement in `Load` (env only) with `regexp.MustCompile("^[A-Za-z0-9._~+/=-]+$")`. `TestExitCode` (cmd) gains a case: a bad token → exit 1 and the `exiting` log line carrying that sentence.
 - [ ] **Step 2: API tests (RED)** (`internal/api/auth_test.go`, using the existing test server helpers):
   - `TestNoTokenUnchanged`: no `SetToken` → `GET /api/staging` 200, a guarded POST 200/4xx as before, `GET /api/auth` → `{"required":false,"authorized":true}`, `POST /api/login` → 400 `SD2NAS has no token set.`
   - `TestTokenRequired`: `SetToken("0123456789abcdef")`. Without credentials: `GET /api/settings`, `GET /api/thumbs/<sha>`, `GET /api/events`, `POST /api/staging/rescan` (with `X-SD2NAS: 1`) → 401 with the binding JSON, `WWW-Authenticate` and `no-store`. Open: `/healthz` 200, `/` 200, `/staging/3` 200 (SPA), `GET /api/auth` → `{"required":true,"authorized":false}`.
@@ -342,7 +355,7 @@ docs/PLAN.md                                                                    
   - `TestLogin`: right token → 204 and a cookie with exactly `Path=/`, `Max-Age=34560000`, `HttpOnly`, `SameSite=Strict`, no `Secure`, value = hex HMAC; then `GET /api/settings` with it → 200. Wrong → 401 `That token is not right.` code `bad_token`; `{}` and `{"token":""}` → 400 `Enter the token.`; without `X-SD2NAS` → 403; unknown field → 400.
   - `TestLogout`: 204, `Max-Age=0` (the `Set-Cookie` text contains `Max-Age=0`).
   - `TestCookieOfOtherToken`: a cookie computed from another token → 401.
-  - `TestTokenCleanedPath`: `GET /x/../api/settings` → not served without the token (401, or the mux's redirect with no settings body).
+  - `TestTokenCleanedPath`: `GET /x/../api/settings` and `GET /api/./settings` → exactly 401 with `code: token_required` (`requireToken` runs before the mux and cleans the path).
   - `TestHeadEvents`: `HEAD /api/events` → 200, `Content-Type: text/event-stream`, returns within 1 s with an empty body (no token set).
 - [ ] **Step 3: Implement** `internal/api/auth.go`:
   ```go
@@ -421,9 +434,9 @@ docs/PLAN.md                                                                    
 - [ ] **Step 4: Wire** (`cmd/sd2nas/main.go`): `srv.SetToken(cfg.Token)` right after `SetLogger`; `if w := tokenWarning(cfg.Token); w != "" { srv.AddWarning(w) }` with `tokenWarning` in package main returning the binding sentence for `0 < len < 16`. `TestTokenWarning` in `main_test.go`.
 - [ ] **Step 5: Template.** Add after the Card poller entry:
   ```xml
-  <Config Name="Token" Target="SD2NAS_TOKEN" Default="" Mode="" Description="Optional. When set, the web UI asks for this token once per browser, and the card script must send it: add SD2NAS_TOKEN= followed by the same value to sd2nas.cfg (see the README). Leave empty for no token: then anyone on your network can use SD2NAS." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="Token" Target="SD2NAS_TOKEN" Default="" Mode="" Description="Optional. Generate one with: openssl rand -hex 24 (letters, digits and . _ ~ + / = - only, or SD2NAS won't start). When set, the web UI asks for it once per browser, and the card script must send it: add it single-quoted to sd2nas.cfg as the README shows. Leave empty for no token: then anyone on your network can use SD2NAS." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
   ```
-  `template_test.go`: `wantTargets` gains `"SD2NAS_TOKEN"` last; assert its `Mask == "true"`, `Default == ""`, `Display == "advanced"`, and that the description mentions `sd2nas.cfg`.
+  `template_test.go`: `wantTargets` gains `"SD2NAS_TOKEN"` last; assert its `Mask == "true"`, `Default == ""`, `Display == "advanced"`, and that the description mentions `sd2nas.cfg` and `openssl rand -hex 24`.
 - [ ] **Step 6:** gofmt/vet/test (`./internal/config/ ./internal/api/ ./cmd/... ./deploy/...`), Linux and race commands; commit `Add optional token auth`.
 
 ### Task 4: Thumbnail failure cache + exiftool `-stay_open`
@@ -436,8 +449,11 @@ docs/PLAN.md                                                                    
   - `TestFailureNotRemembered`: `context.DeadlineExceeded` (per-render timeout), a cancelled caller, `exec.ErrNotFound`, `fs.ErrNotExist`, a plain `errors.New` → the next `Get` renders again.
   - `TestRemoveForgetsFailure`: after `Remove(sha)` the next `Get` renders.
   - `TestFailureCap`: with the cap lowered (a var, 3) the fourth failure clears the map first.
+  - Existing test to update: `TestGetRejectsHugeImage` renders two different files under one `shaN(20)`; give each iteration its own sha (`shaN(20+i)`), or the second gets the first's remembered error.
 - [ ] **Step 2: Implement** in `thumbs.go`: `failed map[string]error` (by sha) under `c.mu`, `var maxFailures = 10000`. In `Get` after the cached-file check: a remembered failure → `fmt.Errorf("%w: %w", ErrRemembered, err)`. In `run`, when `err` is one of the three file-fault classes and not a context error, store it (clear first when `len == maxFailures`). `Remove` deletes the entry. `internal/api/thumbs.go`: skip the Warn log when `errors.Is(err, thumbs.ErrRemembered)` (the status mapping is unchanged because the original class is still wrapped).
 - [ ] **Step 3: exiftool server tests (RED)** (`exifserver_test.go`). Extend `fakeTool`: when its args contain `-stay_open`, it reads argfile lines from stdin and, at each `-execute<N>`, acts on the `SD2NAS_FAKE_TOOL` mode, then prints `{ready<N>}` to stdout and the `-echo4` text to stderr; `-stay_open` + `False` exits 0. Each start appends a line to `SD2NAS_FAKE_TOOL_LOG`. Modes: `preview` (JSON with a small base64 JPEG and `Orientation: 6`), `hang`, `die`, `huge` (more than `maxToolOutput`, lowered by the test), `stderr` (empty stdout, `Error: File format error` on stderr).
+  - The stay_open loop also dispatches **every existing exiftool mode** of the fake (`exif-none`, `exif-huge`, `garbage`, …) per `-execute<N>`: it writes what the one-shot mode prints, then the markers, instead of exiting. It records each request's args as one JSON line in `SD2NAS_FAKE_ARGS`, so `wantArgs` checks requests, not the process argv.
+  - Existing tests rewritten accordingly: `TestRawPreviewArgs` and `TestRawFallsBackToJpgFromRaw` (expected args gain `-charset`, `filename=utf8` first; read from `SD2NAS_FAKE_ARGS`), `TestRawNoPreview`, `TestRawRejectsHugePreview`, `TestToolGarbage` (same modes through the loop), and `TestToolFailureSurfacesStderr`, which moves to the `stderr` mode (an exiting process is now the `die` case, which must not be `ErrUndecodable`). ffmpeg tests are untouched.
   - `TestExifServerReuses`: three RAW renders → correct images, one start.
   - `TestExifServerTimeout`: `hang` with a 200 ms render timeout → `context.DeadlineExceeded`, the process is gone (its pid no longer running, or `cmd.ProcessState` set), and the next render (mode switched to `preview`) starts a second process and succeeds.
   - `TestExifServerDies`: `die` → an error that is **not** `ErrUndecodable` (not remembered); the next render restarts.
@@ -486,7 +502,8 @@ docs/PLAN.md                                                                    
   }
   ```
   - Requests carry `-charset`, `filename=utf8`, `-json`, `-b`, `-n`, `-Orientation`, `-<Tag>`, `--`, `<path>` (today's args plus the charset).
-  - The marker counts only at the start of a line and at the very end of what was read (exiftool writes nothing after it until the next request).
+  - The marker counts only at the start of a line and at the very end of what was read (exiftool writes nothing after it until the next request). A `{ready<M>}` line with M ≠ N is doubt → kill.
+  - `run` defers "kill unless this request completed cleanly" (both markers read, nothing left unread), so a panic recovered by `generateRecovered`, or any early return between the write and the markers, never leaves a live process with an unread reply. `TestExifServerPanicKills`: a seam panics after the write → the next request starts a new process and gets its own answer.
   - Result handling in `rawPreview`: empty stdout with stderr text → `fmt.Errorf("exiftool: %w: %s", ErrUndecodable, msg)`; JSON parsing as today; a JSON `Error` field → `ErrUndecodable` with it; non-empty stderr alongside good output → the existing Warn log.
   - `kill`: `Process.Kill`, close stdin, wait for `Wait` (bounded by `WaitDelay = 5 s`), `e.proc = nil`.
   - `close` (called by `Cache.Close` after `c.wg.Wait()`): takes the lock, `closed = true`, writes `-stay_open\nFalse\n`, closes stdin, waits ≤ 1 s for exit, else `kill`.
@@ -499,7 +516,7 @@ docs/PLAN.md                                                                    
 **Consumes:** `media.CopyHashed` internals, `ingestRun.importOne`, `folderFor`, `staging.Locks.TryLock`, `*staging.BusyError`.
 
 - [ ] **Step 1: Media tests (RED)** (`copy_test.go`): `TestCopyHashedProgress`: a 1 MiB source → `progress` called with strictly increasing values ending at exactly 1 MiB, on the calling goroutine; the hash equals `CopyHashed`'s. `nil` progress works. A cancelled copy stops calling it.
-- [ ] **Step 2: Implement:** `CopyHashed` = `CopyHashedProgress(ctx, src, dst, nil)`; `ctxReader` gains `progress func(int64)` and `done int64`, calling it after every read with `n > 0`.
+- [ ] **Step 2: Implement:** `CopyHashed` = `CopyHashedProgress(ctx, src, dst, nil)`; `ctxReader` gains `progress func(int64)` and `done int64`, calling it after every read with `n > 0`. It needs a **pointer receiver** and a keyed literal (`&ctxReader{ctx: ctx, r: in, progress: progress}`); today's value receiver would reset `done` on every `Read`.
 - [ ] **Step 3: Ingest tests (RED)** (`internal/ingest`, replacing `Runner.copyFile`, whose signature becomes `func(ctx context.Context, src, dst string, progress func(int64)) (string, error)`; update the existing fakes):
   - `TestProgressBytesDuringCopy`: two new files of 10 and 20 bytes; the fake calls `progress(5)` on the second and blocks on a channel. The snapshot then has `Current == <second's card path>`, `CurrentSize == 20`, `CurrentDone == 5`, `BytesDone == 15`, `FilesDone == 1`. After release: `BytesDone == 30`, `Current == ""`, `CurrentSize == 0`.
   - `TestProgressBytesAfterFailure`: a copy that reports 7 bytes then fails → `BytesDone` ends at the file's size (today's per-file semantics), `Current` cleared.
@@ -509,20 +526,21 @@ docs/PLAN.md                                                                    
   - In `importOne`, before `copyNew`: `base := j.p.Snapshot().BytesDone` (only this goroutine writes it during copying) and set `Current`, `CurrentSize`, `CurrentDone = 0`. The callback: `s.CurrentDone = min(done, f.Size); s.BytesDone = base + s.CurrentDone`.
   - The pipeline's per-file update becomes `s.FilesDone++; s.BytesDone = base + f.Size; s.Current, s.CurrentSize, s.CurrentDone = "", 0, 0` (pass `base` back through `fileResult`, or compute it in the loop before `importOne`).
   - `folderFor`: before `Locks.Lock`, try `TryLock(staging.HolderIngest, f.ID)`; success → use it. A `*staging.BusyError` → set `WaitingFolder = f.Name`, `WaitingHolder = string(busy.Holder)`, then `Lock` (wait), then clear both whatever the result. Other errors as today.
-- [ ] **Step 5: API test:** `TestIngestCurrentCarriesCopyDetail`: the `ingest.current` JSON of a running job includes `current`, `current_size`, `current_done` while copying and omits them otherwise.
+- [ ] **Step 5: Shape test** (package `ingest`; package `api` can't hold a copy, because `Runner.copyFile` is unexported and `FreeSpace` runs before copying): `TestProgressSnapshotJSON`: `json.Marshal(ProgressSnapshot{…})` with the five fields set gives `current`, `current_size`, `current_done`, `waiting_folder`, `waiting_holder`; with them zero, none of the five keys appears. Step 3 covers the live values.
 - [ ] **Step 6:** gofmt/vet/test `./internal/media/ ./internal/ingest/ ./internal/api/`, race command; commit `Report copy progress per byte and show what an import waits for`.
 
 ### Task 6: Re-import missing (schema v5)
 
-**Produces:** `catalog.SchemaVersion = 5`; `catalog.DB.RequestRestore(ctx, ingestID int64, at time.Time) (int, error)`, `catalog.DB.RestoreRequested(ctx) (map[string]bool, error)`, `catalog.DB.RestoreMissing(ctx, ingestID int64, a Asset, fp string, row IngestFile) error`; `staging.ForgetSummary.Missing`, `.Restorable`, `.RestoreRequested`, `staging.ForgetResult.KeptMissing`; route `POST /api/ingest/{id}/reimport-missing`.
-**Consumes:** `knownOutcome`, `classifyOne`, `importOne`, `dropCopy`, `ErrWrongState`, `ingest.ErrBadCardPath`, `ingest.CardName`.
+**Produces:** `catalog.SchemaVersion = 5`; `catalog.DB.RequestRestore(ctx, ingestID int64, at time.Time) (int, error)`, `catalog.DB.RestoreRequested(ctx) (map[string]bool, error)`, `catalog.DB.RestoreMissing(ctx, ingestID int64, a Asset, fp string, row IngestFile) error`, `catalog.DB.RestorableMissing(ctx, ingestID int64) (restorable, requested int, err error)`; `staging.ForgetSummary.Missing` (`json:"missing"`), `.Restorable` (`json:"restorable"`), `.RestoreRequested` (`json:"restore_requested"`), `staging.ForgetResult.KeptMissing` (`json:"kept_missing"`); route `POST /api/ingest/{id}/reimport-missing`; `forgetHandlers.submit` (= `Server.SubmitIngest`).
+**Consumes:** `knownOutcome`, `classifyOne`, `importOne`, `dropCopy`, `ErrWrongState`, `ingest.ErrBadCardPath`, `ingest.CardName`, `Server.SubmitIngest`, `catalog.DB.Ingest`.
 
 - [ ] **Step 1: Schema (RED → GREEN).**
   ```go
   // schemaV5 (M7): "Re-import missing files". A row asks the next import of
   // a card holding this content to copy it into Staging again. No foreign
-  // key: requests for content that is no longer missing are ignored and
-  // cleared by RequestRestore.
+  // key: a request counts only while its asset is missing and was marked
+  // missing before the request; RequestRestore and RestoreRequested clear
+  // the rest.
   const schemaV5 = `
   CREATE TABLE restore_requests (
     sha256       BLOB PRIMARY KEY CHECK (length(sha256) = 32),
@@ -530,11 +548,15 @@ docs/PLAN.md                                                                    
   );
   `
   ```
-  `migrations` gains it; `SchemaVersion = 5`. Add a v4 → v5 step to the existing migration test.
+  `migrations` gains it; `SchemaVersion = 5`. Existing tests to update (the M6 failure class): `TestOpenCreatesSchema` (`catalog_test.go`) adds `restore_requests` to its table list; `TestMigrateV3ToV4` (`ingests_test.go`) compares with `SchemaVersion` instead of the literal `4`, keeping its notifications-index check. Then add `TestMigrateV4ToV5`.
 - [ ] **Step 2: Catalog tests (RED)** (`restore_test.go`):
   - `TestRequestRestore`: an import with `missing` file rows for assets A (missing), B (missing) and C (archived again) → returns 2, rows for A and B; calling again → 2, no duplicates; a stale request for C is deleted.
   - `TestRestoreMissing`: A missing → `RestoreMissing` with `State: staged`, a Staging rel path, mtime and capture → A is staged there with `first_ingest` unchanged, `checked_at` NULL, the request gone, the fingerprint present, the ingest row inserted (outcome `new`) — one transaction. Again → `ErrWrongState`, nothing written. A culled/archived asset → `ErrWrongState`.
+  - `TestRestoreRequestedFresh`: request A → A reappears (archived) → A goes missing again (`MarkMissing`, so `updated_at > requested_at`) → `RestoreRequested` doesn't return A, and its stale row is deleted.
+  - `TestRestorableMissing`: an import with 3 `missing` rows (2 assets still missing, 1 of them requested) → `(2, 1)`.
 - [ ] **Step 3: Implement** `internal/catalog/restore.go`:
+  - `RestoreRequested` (one `tx`): delete every request whose asset isn't `missing` or has `updated_at > requested_at`, then return the remaining shas (`SELECT r.sha256 FROM restore_requests r JOIN assets a ON a.sha256 = r.sha256 WHERE a.state = 'missing' AND a.updated_at <= r.requested_at`).
+  - `RestorableMissing`: two `QueryRow` counts over the import's `missing`-outcome rows whose asset is missing (all / with a fresh request). No catalog call inside a rows loop.
   - `RequestRestore` (one `tx`): `DELETE FROM restore_requests WHERE sha256 NOT IN (SELECT sha256 FROM assets WHERE state = 'missing')`; `INSERT OR IGNORE INTO restore_requests (sha256, requested_at) SELECT DISTINCT f.sha256, ? FROM ingest_files f JOIN assets a ON a.sha256 = f.sha256 WHERE f.ingest_id = ? AND f.outcome = 'missing' AND a.state = 'missing'`; return `SELECT COUNT(*) …` of that import's missing shas now requested.
   - `RestoreMissing`: `UPDATE assets SET state = 'staged', rel_path = ?, mtime = ?, capture_time = ?, tz_offset = ?, checked_at = NULL, updated_at = ? WHERE sha256 = ? AND state = 'missing'` (0 rows → `ErrWrongState`), `DELETE FROM restore_requests WHERE sha256 = ?`, `INSERT OR IGNORE` the fingerprint, insert the ingest file row (the same insert `RecordNew` uses).
 - [ ] **Step 4: Ingest tests (RED):**
@@ -544,8 +566,8 @@ docs/PLAN.md                                                                    
   - `TestImportRestoreLostRace`: A turns `archived` between classify and record (seam) → the copy is removed, outcome `in_archive`, A untouched.
   - `TestImportRestoreFullVerify`: with `verify_known = full` the same restore happens.
 - [ ] **Step 5: Implement** (`run.go`): the run loads `RestoreRequested` once after settings; in `classifyOne`, a match whose asset is `missing` and requested becomes `OutcomeNew` (in both the quick and full branches). In `importOne`, after the copy: `existing.State == StateMissing && j.restore[sum]` → `restoreMissing`, which calls `RestoreMissing` and, on `ErrWrongState`, re-reads the asset and falls back to `dropCopy`. Clock warnings as for a new file.
-- [ ] **Step 6: Staging/forget tests and code (M-6):** `ForgetSummary` counts `Missing` (assets of the import in state missing), `Restorable` (its `missing`-outcome rows whose asset is still missing) and `RestoreRequested` (of those, requested); `ForgetResult.KeptMissing`. Extend `TestForgetSummary`/`TestForget`; missing rows are still never deleted.
-- [ ] **Step 7: API tests and handler** (`forget.go`, `h.reimportMissing`, mirroring `reimport` without `Exclusive`): `RequestRestore(opContext(r), id, now)`; `n == 0` → the "Nothing to re-import" message; else `Submit` with the import's path/label/uuid and `feed.watch`, choosing among the binding messages exactly as `reimport` does. Tests: `TestReimportMissingStarts`, `TestReimportMissingNotMounted` (`ErrBadCardPath`), `TestReimportMissingNothing`, `TestReimportMissingBadID` (400 `The import id must be a positive whole number.`).
+- [ ] **Step 6: Staging/forget tests and code (M-6):** `ForgetSummary` counts `Missing` (assets of the import in state missing, from the existing `IngestAssets` slice), `Restorable` and `RestoreRequested` (from `RestorableMissing`, called after that slice is built); `ForgetResult.KeptMissing`; JSON tags as in Produces. Extend `TestForgetSummary`/`TestForget`; missing rows are still never deleted.
+- [ ] **Step 7: API tests and handler** (`forget.go`, `h.reimportMissing`, mirroring `reimport` without `Exclusive`): first `h.db.Ingest(ctx, id)` (`ErrNotFound` → `writeOpError`'s 404 `That import no longer exists.`); then `RequestRestore(opContext(r), id, now)`; `n == 0` → the "Nothing to re-import" message; else `h.submit(ctx, ingest.Request{…})` with the import's path/label/uuid — `forgetHandlers` gains `submit func(context.Context, ingest.Request) (*ingest.Job, error)` set to `s.SubmitIngest` in `MountForget` (the one submit + watch path, HANDOFF PF18) — choosing among the binding messages exactly as `reimport` does. Tests: `TestReimportMissingStarts` (the job is watched: `ingest.finished` arrives), `TestReimportMissingNotMounted` (`ErrBadCardPath`), `TestReimportMissingNothing`, `TestReimportMissingUnknownID` (404), `TestReimportMissingBadID` (400 `The import id must be a positive whole number.`).
 - [ ] **Step 8:** gofmt/vet/test `./internal/catalog/ ./internal/ingest/ ./internal/staging/ ./internal/api/ ./internal/indexer/`, Linux and race commands; commit `Offer to re-import files whose archive copy is missing`.
 
 ### Task 7: Shift times backend
@@ -578,7 +600,8 @@ docs/PLAN.md                                                                    
   }
   ```
   Tests: `TestShiftWall` (with `time.LoadLocation("America/Los_Angeles")`, skip if unavailable: `2025-03-09 01:30` + 1 h → wall `02:30`, a time that doesn't exist in that zone but is kept as a wall value; −24 h across a month end); `TestShiftedName` (`2025-05-30 14.02.11.JPG`, `2025-05-30 14.02.11-1.JPG`, `2025-05-30 14.02.11 - 3840x2160 - 25p - 12sec.MP4`, `IMG_0001.JPG` unchanged, a stamp that isn't the capture time unchanged).
-- [ ] **Step 2: Catalog (RED → GREEN):** `ShiftAsset` updates `capture_time`, `rel_path`, `updated_at` `WHERE sha256 = ? AND state = 'staged'` (0 rows → `ErrWrongState`) and `DELETE FROM clock_warnings WHERE sha256 = ?`, in one `tx`. `StagingFolderWithDate` is `StagingFolderForDate`'s first query without creating. Tests for both.
+- [ ] **Step 2: Catalog (RED → GREEN):** `ShiftAsset` updates `capture_time`, `rel_path`, `updated_at` `WHERE sha256 = ? AND state = 'staged'` (0 rows → `ErrWrongState`) and `DELETE FROM clock_warnings WHERE sha256 = ?`, in one `tx`. `StagingFolderWithDate` is `StagingFolderForDate`'s two lookups without writing: the folder whose dates contain the date (lowest id), else the folder **named** exactly the date (returned as is, its dates unchanged; the caller adds the date), else `false`. Tests for all three outcomes.
+  - Add the `testdata` cases (Decision 27) to `web/src/lib/testdata/rules-cases.json`: `shiftWall`, `shiftedName`, `folderDate`, `wholeName` as listed there. `TestShiftRuleCases` runs `shiftWall`, `shiftedName`, `media.FolderDate` and the whole-folder name rule (a small unexported `wholeFolderName(name string, dates []string) string`, also used by Step 4.6) over them.
 - [ ] **Step 3: Service tests (RED)** (`shift_test.go`, real temp dirs, the existing staging helpers):
   - `TestShiftRenamesKeepsBytes`: two JPGs in `2025-05-30`, +3600 → names +1 h, file hashes unchanged, catalog capture times +1 h and rel paths updated, `Status().Version` bumped, clock warnings of those shas gone.
   - `TestShiftWholeFolderFollowsDate`: all files of `2025-05-30 - Trip`, +86400 → the same folder id renamed `2025-05-31 - Trip`, dates `["2025-05-31"]`.
@@ -596,13 +619,17 @@ docs/PLAN.md                                                                    
   - `TestShiftRefusals`: `Seconds == nil`, `0`, `MaxShift+1`, files from two folders, an archived sha, a result in 1969 or 2100 → `ErrBadRequest` with the binding sentences (`plainReason` text).
   - `TestShiftBusy`: the folder held as `HolderIngest` → `*BusyError`, nothing changed. A re-file target held → `*BusyError`.
   - `TestShiftPartialFailure`: the service's `rename` seam fails on the second file → the first is renamed and recorded, the second untouched on disk and in the catalog, the error starts `shifted 1 of 2 files: `.
+  - `TestShiftCatalogFailureMovesBack`: a `shiftAsset` seam (defaults to `db.ShiftAsset`) fails on the second file after its rename → that file is moved back to its old name (on disk, same hash) and its row is unchanged; the error joins both and starts `shifted 1 of 2 files: `.
+  - `TestShiftRefilesIntoFolderNamedDate`: a folder named `2025-06-02` whose dates don't list 06-02 → the shifted file goes into it (its dates gain 06-02), no `ErrNameTaken`.
+  - `TestShiftStopsOnClose`: a seam blocks after the first file; `Close()` is called in another goroutine; the shift returns `shifted 1 of 3 files: SD2NAS is shutting down`, files 2–3 untouched, and `Close` returned only after the shift did.
 - [ ] **Step 4: Implement `Service.Shift`.** Order (each step's code follows `Move`):
+  0. Register with the service like promote and rescan: under `s.mu`, `closed` → `ErrClosed`, else `s.wg.Add(1)` (released by a defer), so `Close` waits for it. Before each file, `s.bgCtx.Err() != nil` stops the loop with `shifted N of M files: SD2NAS is shutting down`. The filesystem calls use `s.bgCtx`-independent `ctx` (the request's `opContext`), so a file in progress finishes.
   1. Validate: `Seconds` nil/0/over `MaxShift` (`fmt.Errorf("%w: Shift by …", ErrBadRequest)` so `plainReason` gives the sentence); `checkSHAs`.
   2. `locate`; all files in one folder, else `Shift files from one folder at a time.` `whole` = the request covers every staged asset under that folder (`AssetsUnder`).
   3. Compute each file's new capture (`shiftWall`) and refuse a result outside 1970–2099 naming `path.Base(rel)`. Files with a zero capture time are skipped.
   4. Unless `whole`, find re-file targets for dates not in the source's dates with `StagingFolderWithDate`; `lockLocated(shas, targetIDs...)`; under the locks recompute the plan; a different target → `ErrChanged`. New date folders: `lockName(date)`, `nameFree`, `MkdirAll`, `CreateStagingFolder(date, [date], src.CreatedAt)`, lock the new row — as `Move` does.
-  5. Process files sorted by old capture time (then name): descending for a positive shift, ascending for a negative one. Per file: destination dir = same subpath in the target folder; new base from `shiftedName`; if the dir and base are unchanged skip the rename; else `moveFile(ctx, from, dir, base, sha)`; then `ShiftAsset(sha, newRel, newCapture, now)`. On an error: stop, keep what was done, return `shifted N of M files: <err>` (joined with `syncDirs`).
-  6. Dates: `whole` → `SetStagingFolderInfo(src, new folder dates)`; then if `SplitName(src.Name)` has a date and the earliest new date differs, `lockName` + `nameFree` + `renameFolder` to `FolderName(earliest, title)`; `ErrNameTaken`/busy name → keep, set `WantedName`. Partial → each target folder's dates gain its files' dates; `dropIfEmpty(src)`.
+  5. Process files sorted by old capture time (then name): descending for a positive shift, ascending for a negative one. Per file: destination dir = same subpath in the target folder; new base from `shiftedName`; if the dir and base are unchanged skip the rename; else `moveFile(ctx, from, dir, base, sha)`; then `ShiftAsset(sha, newRel, newCapture, now)`. If `ShiftAsset` fails after a rename, move the file back with `moveFile(ctx, to, oldDir, oldBase, sha)` and join both errors (a failed move-back is logged and joined too; the next rescan follows the file). On an error: stop, keep what was done, return `shifted N of M files: <err>` (joined with `syncDirs`). A new date folder that ends up with no file (a failure before its first move) is removed with `dropIfEmpty`.
+  6. Dates: `whole` → `SetStagingFolderInfo(src, new folder dates)`; then if `wholeFolderName(src.Name, newDates)` differs from `src.Name`, `lockName` + `nameFree` + `renameFolder` to it; `ErrNameTaken`/busy name → keep, set `WantedName`. Partial → each target folder's dates gain its files' dates; `dropIfEmpty(src)`.
   7. `syncDirs(touched)`; `s.changed()`; `Folder = summary(src)` unless removed.
   ```go
   type ShiftRequest struct {
@@ -649,19 +676,19 @@ docs/PLAN.md                                                                    
 **Produces:** `web/src/lib/shift.js` (`parseAmount`, `secondsBetween`, `shiftWall`, `shiftedName`, `folderDateOf`, `wholeFolderName`); the Shift dialog on the Folder page.
 **Consumes:** `POST /api/staging/shift`, `GET /api/settings` (`day_starts_at`, for the preview only).
 
-- [ ] **Step 1: Node tests (RED)** `shift.test.js` (all arithmetic on `Date.UTC`, so results don't depend on the test machine's TZ):
+- [ ] **Step 1: Node tests (RED)** `shift.test.js` (all arithmetic on `Date.UTC`, so results don't depend on the test machine's TZ). First, `TestRuleCases`-style: read `src/lib/testdata/rules-cases.json` (`fs.readFileSync(new URL('./testdata/rules-cases.json', import.meta.url))`) and check `shiftWall`, `shiftedName`, `folderDateOf` and `wholeFolderName` give every case's `want` (Decision 27: the same table the Go test uses). Then:
   - `parseAmount({sign:'+', days:'0', hours:'1', minutes:'30', seconds:'0'})` → `{seconds: 5400}`; `'-'` → `-5400`; all zero → `{error: 'Shift by at least one second.'}`; `'1.5'` or `'x'` → `{error: 'Use whole numbers.'}`; more than 100 years → `{error: 'Shift by at most 100 years.'}`; empty fields count as 0.
   - `secondsBetween('2000-01-01T00:03:10', '2025-05-30T14:02')` → the exact difference (a target without seconds means `:00`).
   - `shiftWall('2025-03-09T01:30:00', 3600)` → `'2025-03-09T02:30:00'`.
   - `shiftedName` mirrors Go's (same five cases as Task 7).
   - `folderDateOf('2025-05-31T03:59:59', '04:00')` → `'2025-05-30'`.
   - `wholeFolderName('2025-05-30 - Trip', ['2025-05-31','2025-06-01'])` → `'2025-05-31 - Trip'`; `'Untitled'` unchanged.
-- [ ] **Step 2: Dialog.** Entry points: the SelectionBar's `Shift times…` and a header button `Shift all times…` (selects every file of the folder). Two modes (radio, ≥ 44 px):
+- [ ] **Step 2: Dialog.** Entry points: the SelectionBar's `Shift times…` and a header button `Shift all times…`, which sends **every** staged file of the folder whatever the kind chips show (so the server sees a whole-folder shift). With more than 20000 files it is disabled with the hint `Folders over 20,000 files can't be shifted whole; select fewer files.` The preview is a preview only (Decision 27); the server's answer decides. Two modes (radio, ≥ 44 px):
   - **By an amount:** sign toggle `+`/`−`, inputs Days, Hours, Minutes, Seconds (`inputmode="numeric"`).
   - **So that a file reads:** the first selected file (by capture time) is named with its current time, and a `datetime-local` input (`step="1"`) sets its correct time; the amount is `secondsBetween`.
   - Preview: the first and last file's new name, and — when `day_starts_at` loaded — for a whole folder the new folder name, else how many files leave this folder. Explanation text: "Only names and capture times change; the files' contents stay as they are. Files whose new date isn't one of this folder's dates move to the folder for that date."
   - Submit → `POST /api/staging/shift`; success toast `Shifted N files` (+ `; M moved to other folders`, `; K had no capture time`), plus `wanted_name` → `Kept the name <name>: <wanted> is taken. Merge them if they belong together.`; when `removed`, navigate to `/staging`; else reload. Errors in the dialog via `describeError`.
-- [ ] **Step 3:** `cd web && npm test && npm run build`; commit `Add the shift times dialog`. Controller: browser check (phone bottom sheet, desktop centred).
+- [ ] **Step 3:** `cd web && npm test && npm run build`; commit `Add the shift times dialog`. Controller: browser check at 375×812 (bottom sheet) and desktop (centred): no sideways scroll, every control ≥ 44 px.
 
 ### Task 10: Settings page
 
@@ -671,11 +698,12 @@ docs/PLAN.md                                                                    
 - [ ] **Step 1: Node tests (RED)** `settings.test.js`:
   - `changedKeys({a:'1',b:'2'}, {a:'1',b:'3'})` → `{b:'3'}`; nothing changed → `{}`.
   - `fieldOfError('Setting staging_notice_at: want HH:MM, 00:00 to 23:59.')` → `'staging_notice_at'`; `'Setting backup_dir: pick a folder outside Archive/ and Staging/.'` → `'backup_dir'`; `'Unknown setting x.'` → `'x'`; anything else → `''`.
-  - `checkField`: the HH:MM keys reject `9:00`/`24:00`; `staging_warn_days` 0–3650 digits only; `free_space_reserve_gb` digits only; `backup_dir` empty or starting with `/`; others accept — mirroring the Go reasons (the server stays the judge).
+  - `checkField`: the HH:MM keys reject `9:00`/`24:00`; `staging_warn_days` 0–3650 digits only; `free_space_reserve_gb` digits only; `backup_dir` empty, starting with `/`, or matching `^[A-Za-z]:\\` (Windows dev); others accept. It is **advisory** (Decision 27): its message shows under the field but never disables Save; the server's 400 sentence wins.
+  - Rule cases: read the `settings` section of `src/lib/testdata/rules-cases.json` and check `checkField(key, value)` agrees with each case's `ok` (the same table the Go `TestSettingsCases` uses).
 - [ ] **Step 2: Page.** Cards following the mockup's `card`/`form2` style:
   - **Imports:** Day starts at (`day_starts_at`, `type="time"`), Check known files (`verify_known`: Quick / Full), Free-space reserve in GB.
   - **Staging:** Flag folders older than N days (`staging_warn_days`, 0 = off), Daily notice at (`staging_notice_at`).
-  - **Archive index:** Nightly scan and backup at (`archive_rescan_at`), Backup folder (`backup_dir`; placeholder = the default, a "Use default" button sets `""`), Skip in the archive (`archive_skip`, a textarea).
+  - **Archive index:** Nightly scan and backup at (`archive_rescan_at`), Backup folder (`backup_dir`; `GET` returns the resolved path, never `""`, so the field shows `(default)` beside it when `settings.backup_dir === defaults.backup_dir`; a "Use default" button sends `""`), Skip in the archive (`archive_skip`, a textarea).
   - Each field shows its default ("Default 09:00") and a per-field error. One **Save changes** button (disabled when `changedKeys` is empty) sends only changed keys; **Discard** restores. A 400 marks the field `fieldOfError` names and shows the sentence; success toasts `Settings saved` and reloads.
   - **This device:** Default promote pattern (validated with `promoteTarget`, saved to `PATTERN_KEY`, applied by the Staging promote dialog) and, when `GET /api/auth` says `required`, **Sign out on this device** → `POST /api/logout` → reload.
 - [ ] **Step 3: Nav and routes.** `App.svelte` maps `/settings` → `{tab: 'settings', view: 'settings'}`; `Nav.svelte` gains a fourth tab with a gear icon (phone bar: four tabs, each ≥ 44 px).
@@ -684,7 +712,7 @@ docs/PLAN.md                                                                    
   summary { cursor: pointer; min-height: 44px; box-sizing: border-box; padding: 10px 0; margin: -10px 0; }
   details[open] > summary { margin-bottom: 0; }
   ```
-- [ ] **Step 5:** `cd web && npm test && npm run build`; commit `Add the settings page`. Controller: browser check, including the Archive page's problems `<details>` and the four-tab phone bar.
+- [ ] **Step 5:** `cd web && npm test && npm run build`; commit `Add the settings page`. Controller: browser check at 375×812 and desktop (no sideways scroll, ≥ 44 px), including the Archive page's problems `<details>` and the four-tab phone bar.
 
 ### Task 11: Login page and token handling in the UI
 
@@ -693,10 +721,11 @@ docs/PLAN.md                                                                    
 
 - [ ] **Step 1: Node tests (RED)** `api.test.js`: a 401 with `code: 'token_required'` calls the registered handler once and still throws `ApiError` (status 401); a 401 `bad_token` and other errors don't call it.
 - [ ] **Step 2: Implement.**
-  - `App.svelte`: on mount `await checkAuth()`; when `required && !authorized`, render only `<Login />` (no Nav, no `connectEvents`); otherwise as today. The unauthorized handler sets `auth.authorized = false` (cookie expired, token changed), which closes the `EventSource` (export a `disconnectEvents()` from `live.svelte.js`) and shows Login.
+  - `App.svelte`: on mount `await checkAuth()`; when `required && !authorized`, render only `<Login />` (no Nav, no `connectEvents`); otherwise as today. The unauthorized handler sets `auth.authorized = false` (cookie expired, token changed), which closes the `EventSource` and shows Login.
+  - `live.svelte.js` (in this task's files): export `disconnectEvents()`, which sets a `stopped` flag, closes the source and clears the 5 s retry timer; `connectEvents()` clears `stopped`; the `onerror` retry and the `visibilitychange` listener do nothing while `stopped`. Otherwise the Login screen would loop 401s on `/api/events` every 5 s and on every return to the tab. An `EventSource` 401 never reaches the api.js handler: an expired cookie is noticed at the next `api()` call (every page loads through it).
   - `Login.svelte`: heading `SD2NAS`, text "This SD2NAS is protected by a token. Enter it once; this browser remembers it for a year.", a password input (`autocomplete="current-password"`, Enter submits), **Sign in**. 401 → `That token is not right.`; success → `location.reload()`. Centred card on desktop, full width with 16 px gutters on a phone.
   - A `GET /api/auth` failure (network) shows the app as today (the API's own errors surface).
-- [ ] **Step 3:** `cd web && npm test && npm run build`; commit `Ask for the token in the web UI`. Controller: run with `SD2NAS_TOKEN` set and check login, reload, sign out, phone and desktop; and without it (no login screen).
+- [ ] **Step 3:** `cd web && npm test && npm run build`; commit `Ask for the token in the web UI`. Controller: run with `SD2NAS_TOKEN` set and check login, reload, sign out, at 375×812 and desktop (no sideways scroll, ≥ 44 px), and that the network log shows no repeating `/api/events` 401s on the Login screen; and without a token (no login screen).
 
 ### Task 12: Ingest UI: live copy detail, re-import missing
 
@@ -711,7 +740,7 @@ docs/PLAN.md                                                                    
   - In the missing `<details>`, when `forget.restorable > forget.restore_requested`: **Re-import N missing files…** → a dialog: "SD2NAS copies these files from the card into Staging again. If an array disk dropped out, fix that first: its files come back by themselves at the next archive scan." → `POST /api/ingest/{id}/reimport-missing` → toast with the server's `message`, reload.
   - When `forget.restore_requested > 0`: `N files will be imported again the next time you insert the card.`
   - The forget dialog lists `N files whose archive copy is missing stay known` when `forget.missing > 0`.
-- [ ] **Step 4:** `cd web && npm test && npm run build`; commit `Show copy progress detail and offer to re-import missing files`. Controller: browser check with a long fake copy (or a large file in `testdata`-like temp card) and the missing flow from the smoke run.
+- [ ] **Step 4:** `cd web && npm test && npm run build`; commit `Show copy progress detail and offer to re-import missing files`. Controller: browser check at 375×812 and desktop (no sideways scroll; the new button and the dialog's buttons ≥ 44 px) with a long fake copy (a large file on a temp card) and the missing flow from the smoke run.
 
 ### Task 13: Release prep: pinned images, `:latest`, README
 
@@ -724,9 +753,9 @@ docs/PLAN.md                                                                    
   - **Optional access token** (after Card script): generate and install it on Unraid without a placeholder —
     ```
     TOKEN=$(openssl rand -hex 24); echo "$TOKEN"
-    echo "SD2NAS_TOKEN=$TOKEN" >> /boot/config/plugins/unassigned.devices/sd2nas.cfg
+    printf "\nSD2NAS_TOKEN='%s'\n" "$TOKEN" >> /boot/config/plugins/unassigned.devices/sd2nas.cfg
     ```
-    then Docker → SD2NAS → Edit: a new install has the **Token** field (Advanced View); an existing container gets **Add another Path, Port, Variable…** → Variable, Key `SD2NAS_TOKEN`, Value = the printed token. The web UI asks once per browser (the home-screen app on iOS asks once too); Settings → This device → Sign out. `/healthz` stays open. Changing the token signs every browser out.
+    (the leading `\n` keeps it off the last line of a cfg without a final newline; the single quotes keep bash from reading anything into it). A hand-picked token may use only letters, digits and `. _ ~ + / = -`, or SD2NAS refuses to start and logs `SD2NAS_TOKEN may use only letters, digits and . _ ~ + / = -`. Then Docker → SD2NAS → Edit: a new install has the **Token** field (Advanced View); an existing container gets **Add another Path, Port, Variable…** → Variable, Key `SD2NAS_TOKEN`, Value = the printed token. The web UI asks once per browser (the home-screen app on iOS asks once too); Settings → This device → Sign out. `/healthz` stays open. Changing the token signs every browser out.
   - **Settings:** the Settings page replaces the terminal `curl` (keep the curl as a fallback example).
   - **Updating:** `:latest` follows releases; `:edge` follows `main`; switching = Edit → Repository. Existing installs keep their saved repository.
   - Remove any remaining "until M7" wording.
