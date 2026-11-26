@@ -12,6 +12,7 @@
   import Staging from './pages/Staging.svelte';
   import Folder from './pages/Folder.svelte';
   import Archive from './pages/Archive.svelte';
+  import Settings from './pages/Settings.svelte';
 
   let health = $state(null);
   let healthError = $state('');
@@ -53,6 +54,7 @@
     m = match('/staging/:id', p);
     if (m) return { tab: 'staging', view: 'folder', id: m.id };
     if (p === '/archive') return { tab: 'archive', view: 'archive' };
+    if (p === '/settings') return { tab: 'settings', view: 'settings' };
     return { tab: '', view: 'not-found' };
   });
 </script>
@@ -73,6 +75,8 @@
       {#key page.id}<Folder id={page.id} />{/key}
     {:else if page.view === 'archive'}
       <Archive />
+    {:else if page.view === 'settings'}
+      <Settings />
     {:else}
       <h1>Page not found</h1>
       <p class="sub">Nothing lives at <span class="mono">{route.path}</span>. <a href="/">Go to Card ingest</a></p>
