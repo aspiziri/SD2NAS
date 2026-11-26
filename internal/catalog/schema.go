@@ -2,7 +2,7 @@ package catalog
 
 // migrations[i] upgrades a database from user_version i to i+1. Append only;
 // never edit a migration that has shipped.
-var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4}
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
 
 const schemaV1 = `
 CREATE TABLE ingests (
@@ -191,4 +191,16 @@ CREATE TABLE notifications (
   taken_at   TEXT              -- NULL = waiting for the card script
 );
 CREATE INDEX notifications_pending ON notifications(taken_at, id);
+`
+
+// schemaV5 (M7): "Re-import missing files". A row asks the next import of
+// a card holding this content to copy it into Staging again. No foreign
+// key: a request counts only while its asset is missing and was marked
+// missing before the request; RequestRestore and RestoreRequested clear
+// the rest.
+const schemaV5 = `
+CREATE TABLE restore_requests (
+  sha256       BLOB PRIMARY KEY CHECK (length(sha256) = 32),
+  requested_at TEXT NOT NULL
+);
 `

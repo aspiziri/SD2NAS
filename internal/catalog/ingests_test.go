@@ -523,8 +523,8 @@ func TestMigrateV3ToV4(t *testing.T) {
 	}
 	defer d.Close()
 	ctx := t.Context()
-	if v, err := d.Version(ctx); err != nil || v != 4 {
-		t.Fatalf("version = %d, %v; want 4", v, err)
+	if v, err := d.Version(ctx); err != nil || v != SchemaVersion {
+		t.Fatalf("version = %d, %v; want %d", v, err, SchemaVersion)
 	}
 	var val string
 	if err := d.db.QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'staging_warn_days'").Scan(&val); err != nil || val != "7" {

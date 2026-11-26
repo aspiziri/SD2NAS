@@ -25,7 +25,12 @@ type ForgetSummary struct {
 	Culled       int   `json:"culled"`       // culled files of this import (the card brings them back after a forget)
 	Archived     int   `json:"archived"`     // already in the archive: stay known
 	Reimportable int   `json:"reimportable"` // its "seen before" files whose asset is culled ("Re-import anyway")
-	Forgotten    bool  `json:"forgotten"`
+	Missing      int   `json:"missing"`      // missing from the archive: stay known
+	// Restorable are its files whose archive copy was missing and still is
+	// ("Re-import missing files"); RestoreRequested of them are asked for.
+	Restorable       int  `json:"restorable"`
+	RestoreRequested int  `json:"restore_requested"`
+	Forgotten        bool `json:"forgotten"`
 }
 
 // ForgetResult is what Forget did.
@@ -33,6 +38,7 @@ type ForgetResult struct {
 	Forgotten    int     `json:"forgotten"` // asset rows deleted
 	DeletedFiles int     `json:"deleted_files"`
 	KeptArchived int     `json:"kept_archived"`
+	KeptMissing  int     `json:"kept_missing"`
 	Removed      []int64 `json:"removed"` // staging folders left empty and removed
 }
 
@@ -60,7 +66,12 @@ func (s *Service) ForgetSummary(ctx context.Context, ingestID int64) (ForgetSumm
 			out.Culled++
 		case catalog.StateArchived:
 			out.Archived++
+		case catalog.StateMissing:
+			out.Missing++
 		}
+	}
+	if out.Restorable, out.RestoreRequested, err = s.db.RestorableMissing(ctx, ingestID); err != nil {
+		return ForgetSummary{}, err
 	}
 	return out, nil
 }
@@ -119,11 +130,17 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 	}
 	res := ForgetResult{Removed: []int64{}}
 	for _, a := range forget {
-		if a.State == catalog.StateArchived {
+		switch a.State {
+		case catalog.StateArchived:
 			res.KeptArchived++
+		case catalog.StateMissing:
+			res.KeptMissing++
 		}
 	}
-	forget = slices.DeleteFunc(forget, func(a catalog.Asset) bool { return a.State == catalog.StateArchived })
+	// Archived and missing assets are never forgotten (ForgetAssets refuses them too).
+	forget = slices.DeleteFunc(forget, func(a catalog.Asset) bool {
+		return a.State == catalog.StateArchived || a.State == catalog.StateMissing
+	})
 	// Files first, then the catalog (global rule): a delete that fails half
 	// way leaves the import unforgotten, so Forget can simply run again
 	// (a file already gone counts as deleted); the rescan meanwhile culls
@@ -179,7 +196,7 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 var forgetAfterRead func()
 
 // forgetPlan reads import ingestID's assets: those to forget (staged and
-// culled) and archived ones (kept) in forget, the staged ones in staged,
+// culled) and archived and missing ones (kept) in forget, the staged ones in staged,
 // and the ids of the folders holding the staged ones. A staged asset that
 // is not inside a known staging folder is ErrChanged.
 func (s *Service) forgetPlan(ctx context.Context, ingestID int64) (forget, staged []catalog.Asset, ids []int64, err error) {
@@ -210,7 +227,7 @@ func (s *Service) forgetPlan(ctx context.Context, ingestID int64) (forget, stage
 				seen[r.ID] = true
 				ids = append(ids, r.ID)
 			}
-		case catalog.StateCulled, catalog.StateArchived:
+		case catalog.StateCulled, catalog.StateArchived, catalog.StateMissing:
 			forget = append(forget, a)
 		}
 	}

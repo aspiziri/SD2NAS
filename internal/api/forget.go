@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/ingest"
@@ -12,20 +14,24 @@ import (
 )
 
 type forgetHandlers struct {
-	m    *ingest.Manager
-	db   *catalog.DB
-	svc  *staging.Service
-	feed *ingestFeed // MountIngest's; nil when it wasn't mounted
-	log  *slog.Logger
+	m   *ingest.Manager
+	db  *catalog.DB
+	svc *staging.Service
+	// submit queues an import and makes the ingest feed watch it
+	// (Server.SubmitIngest, the one submit + watch path).
+	submit func(context.Context, ingest.Request) (*ingest.Job, error)
+	log    *slog.Logger
 }
 
-// MountForget registers "Forget this import" and "Re-import anyway" (§8,
-// §10, Decisions 10 and 11). Call it after MountIngest.
+// MountForget registers "Forget this import", "Re-import anyway" and
+// "Re-import missing files" (§8, §10, Decisions 10 and 11, M7). Call it
+// after MountIngest.
 func (s *Server) MountForget(m *ingest.Manager, db *catalog.DB, svc *staging.Service) {
-	h := &forgetHandlers{m: m, db: db, svc: svc, feed: s.feed, log: s.log}
+	h := &forgetHandlers{m: m, db: db, svc: svc, submit: s.SubmitIngest, log: s.log}
 	s.mux.HandleFunc("GET /api/ingest/{id}/forget", h.summary)
 	s.mux.HandleFunc("POST /api/ingest/{id}/forget", h.forget)
 	s.mux.HandleFunc("POST /api/ingest/{id}/reimport-culled", h.reimport)
+	s.mux.HandleFunc("POST /api/ingest/{id}/reimport-missing", h.reimportMissing)
 }
 
 func (h *forgetHandlers) id(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -108,26 +114,57 @@ func (h *forgetHandlers) reimport(w http.ResponseWriter, r *http.Request) {
 		writeOpError(w, h.log, "import", "re-import culled files", err)
 		return
 	}
-	name := ingest.CardName(row)
 	resp := map[string]any{"forgotten": n, "started": nil}
 	if n == 0 {
 		resp["message"] = "Nothing to re-import: none of this import's skipped files is still marked as culled."
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	job, err := h.m.Submit(ctx, ingest.Request{Path: row.CardPath, Label: row.CardLabel, UUID: row.CardUUID})
+	h.startAgain(ctx, w, row, n, resp)
+}
+
+// reimportMissing asks the next import of this import's card to copy again
+// the files whose archive copy is still missing (a restore request, kept
+// in the catalog until honoured), and starts that import now when the card
+// is mounted.
+func (h *forgetHandlers) reimportMissing(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.id(w, r)
+	if !ok {
+		return
+	}
+	ctx := opContext(r)
+	row, err := h.db.Ingest(ctx, id)
+	if err != nil {
+		writeOpError(w, h.log, "import", "re-import missing files", err)
+		return
+	}
+	n, err := h.db.RequestRestore(ctx, id, time.Now())
+	if err != nil {
+		writeOpError(w, h.log, "import", "re-import missing files", err)
+		return
+	}
+	resp := map[string]any{"requested": n, "started": nil}
+	if n == 0 {
+		resp["message"] = "Nothing to re-import: none of this import's files is still missing from the archive."
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	h.startAgain(ctx, w, row, n, resp)
+}
+
+// startAgain submits an import of row's card, which will copy n of its
+// files again, and answers with resp plus "started" and "message".
+func (h *forgetHandlers) startAgain(ctx context.Context, w http.ResponseWriter, row catalog.Ingest, n int, resp map[string]any) {
+	name := ingest.CardName(row)
+	job, err := h.submit(ctx, ingest.Request{Path: row.CardPath, Label: row.CardLabel, UUID: row.CardUUID})
 	switch {
 	case err == nil:
-		if h.feed != nil {
-			h.feed.watch(job)
-		}
-		v := viewOf(job.Result(), job)
-		resp["started"] = v
+		resp["started"] = viewOf(job.Result(), job)
 		resp["message"] = fmt.Sprintf("Importing %d %s again from %s.", n, plural(n, "file", "files"), name)
 	case errors.Is(err, ingest.ErrBadCardPath):
 		resp["message"] = fmt.Sprintf("%d %s will be imported again the next time you insert %s.", n, plural(n, "file", "files"), name)
 	default:
-		h.log.Error("start re-import", "ingest", id, "err", err)
+		h.log.Error("start re-import", "ingest", row.ID, "err", err)
 		resp["message"] = fmt.Sprintf("%d %s will be imported again the next time you insert %s (starting an import now failed: %v).",
 			n, plural(n, "file", "files"), name, err)
 	}

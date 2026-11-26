@@ -85,8 +85,9 @@ type ingestRun struct {
 	now         time.Time   // r.now(), taken once
 	rules       media.Rules // media.DefaultRules()
 	settings    catalog.Settings
-	stagingRoot string       // filepath.Join(PhotosRoot, StagingDir)
-	log         *slog.Logger // r.log().With("ingest", id, "card", CardName(in))
+	restore     map[string]bool // RestoreRequested, read once: missing assets to copy again
+	stagingRoot string          // filepath.Join(PhotosRoot, StagingDir)
+	log         *slog.Logger    // r.log().With("ingest", id, "card", CardName(in))
 	p           *Progress
 	counts      catalog.Counts
 	exts        []string // distinct extensions of the recorded unsupported files
@@ -156,6 +157,9 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 		return catalog.StatusFailed, "settings: " + err.Error()
 	}
 	j.settings = settings
+	if j.restore, err = j.cat().RestoreRequested(j.dbctx); err != nil {
+		return catalog.StatusFailed, "restore requests: " + err.Error()
+	}
 	scan, err := Scan(j.card, j.rules)
 	j.scanDur = time.Since(start)
 	if err != nil {
@@ -360,7 +364,14 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 		c.outcome, c.err = catalog.OutcomeFailed, err
 		return c
 	}
-	known := func(a catalog.Asset) classified {
+	// known gives the outcome of a match with a. mayRestore: a is this
+	// file's content as far as classifying can tell, so a restore request
+	// for it makes the file new (importOne checks the copy's hash).
+	known := func(a catalog.Asset, mayRestore bool) classified {
+		if mayRestore && a.State == catalog.StateMissing && j.restore[a.SHA256] {
+			c.outcome = catalog.OutcomeNew
+			return c
+		}
 		o, err := knownOutcome(a.State)
 		if err != nil {
 			return fail(err)
@@ -395,7 +406,7 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 				best, bestRank = a, rank
 			}
 		}
-		return known(best)
+		return known(best, true)
 	}
 	h, err := r.hashFile(f.Path)
 	if err != nil {
@@ -403,7 +414,7 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 	}
 	for _, a := range matches {
 		if a.SHA256 == h {
-			return known(a)
+			return known(a, true)
 		}
 	}
 	a, err := j.cat().AssetBySHA(j.dbctx, h)
@@ -412,7 +423,7 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 		if err := j.cat().AddFingerprint(j.dbctx, fp, a.SHA256); err != nil {
 			return fail(fmt.Errorf("catalog update: %w", err))
 		}
-		return known(a)
+		return known(a, a.SHA256 == h) // not through an alias: older content is not the asset's
 	case errors.Is(err, catalog.ErrNotFound):
 		c.outcome = catalog.OutcomeNew
 		return c
@@ -578,9 +589,13 @@ func (j *ingestRun) importOne(f newFile, base int64) fileResult {
 		return fail(fmt.Errorf("copied to %s but could not sync its folder: %w", rel, err))
 	}
 	existing, err := j.cat().AssetBySHA(j.dbctx, sum)
+	restore := false
 	switch {
 	case err == nil:
-		return j.dropCopy(f, dst, rel, existing) // fingerprint collision or alias (§6)
+		if existing.State != catalog.StateMissing || !j.restore[sum] {
+			return j.dropCopy(f, dst, rel, existing) // fingerprint collision or alias (§6)
+		}
+		restore = true // a copy of content missing from the archive, asked for again
 	case !errors.Is(err, catalog.ErrNotFound):
 		return fail(fmt.Errorf("copied to %s but the catalog lookup failed: %w", rel, err))
 	}
@@ -594,14 +609,44 @@ func (j *ingestRun) importOne(f newFile, base int64) fileResult {
 	if f.Kind == media.KindVideo && meta == nil {
 		row.Error = "named without video metadata: " + c.Fallback.Error() // imported, but not silently (Decision 25)
 	}
+	if restore {
+		return j.restoreMissing(f, dst, c, a, row)
+	}
 	if err := j.cat().RecordNew(j.dbctx, j.id, a, f.fp, row); err != nil {
 		return fail(fmt.Errorf("copied to %s but not recorded: %w", a.RelPath, err))
 	}
+	return j.recordedNew(f, c, row)
+}
+
+// recordedNew is the result of a new file whose row is written, with the
+// clock warnings for its capture time c.
+func (j *ingestRun) recordedNew(f newFile, c media.Capture, row catalog.IngestFile) fileResult {
 	ws := CheckClock(c, j.now)
 	for i := range ws {
-		ws[i].CardPath, ws[i].SHA256 = f.Rel, sum
+		ws[i].CardPath, ws[i].SHA256 = f.Rel, row.SHA256
 	}
 	return fileResult{row: row, recorded: true, warnings: ws}
+}
+
+// restoreMissing records the copy at dst as the content of missing asset
+// a.SHA256 again, staged as a (row: its new file row), honouring a restore
+// request. If the asset is no longer missing (the indexer found the
+// archive copy meanwhile), the copy is a duplicate and goes.
+func (j *ingestRun) restoreMissing(f newFile, dst string, c media.Capture, a catalog.Asset, row catalog.IngestFile) fileResult {
+	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
+	err := j.cat().RestoreMissing(j.dbctx, j.id, a, f.fp, row)
+	switch {
+	case err == nil:
+		j.log.Info("imported again a file missing from the archive", "file", f.Rel, "path", a.RelPath)
+		return j.recordedNew(f, c, row)
+	case errors.Is(err, catalog.ErrWrongState):
+		current, err := j.cat().AssetBySHA(j.dbctx, a.SHA256)
+		if err != nil {
+			return fail(fmt.Errorf("copied to %s but the catalog lookup failed: %w", a.RelPath, err))
+		}
+		return j.dropCopy(f, dst, a.RelPath, current)
+	}
+	return fail(fmt.Errorf("copied to %s but not recorded: %w", a.RelPath, err))
 }
 
 func failedRow(f newFile, err error) catalog.IngestFile {
