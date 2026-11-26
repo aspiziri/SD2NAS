@@ -227,7 +227,10 @@
 
 <style>
   .form2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
-  .plain { border: 0; padding: 0; margin: 0; min-width: 0; }
+  .plain { border: 0; padding: 0; margin: 0; min-width: 0; max-width: 100%; inline-size: auto; }
+  .form2 > div { min-width: 0; }
+  .form2 .small, .field-error, label.f { overflow-wrap: anywhere; }
+  input, textarea, select { width: 100%; min-width: 0; box-sizing: border-box; }
   .wide { grid-column: 1 / -1; }
   .nowrap { flex-wrap: nowrap; }
   .nowrap input { flex: 1; min-width: 0; }
