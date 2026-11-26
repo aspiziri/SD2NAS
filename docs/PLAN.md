@@ -35,8 +35,8 @@ The UI mockup is in [`ui-mockup.html`](ui-mockup.html).
 - Delete or modify anything on a card. Never.
 - Edit photos or write metadata. Files are copied byte for byte.
 - Create or touch Capture One session files (§8).
-- Have user accounts. It's reachable only on the LAN or Tailscale, with an
-  optional shared token (§10).
+- Have user accounts. It's reachable only on the LAN, with an optional shared
+  token (§10).
 - Replace CameraImport, which stays as the desktop tool.
 
 ---
@@ -114,7 +114,7 @@ neither imports nor ignores, turn it into a warning instead.
   if the share would drop below a reserve (default 50 GB). The card stays
   mounted and a notification explains why.
 - Staging shows a warning banner, plus a daily notification, when a folder has
-  been in staging longer than 30 days. The threshold is a setting. It is `staging_warn_days` (default 30, 0 turns it off); SD2NAS queues a notice once a day after 09:00 (container time) listing the stale folders; the card script delivers it (§11).
+  been in staging longer than 30 days. The threshold is a setting. It is `staging_warn_days` (default 30, 0 turns it off); SD2NAS queues a notice once a day, at the first check at or after `staging_notice_at` (default 09:00, container time), listing the stale folders; the card script delivers it (§11).
 
 **Catalog backup:** the database is the only record of what you culled, and
 that can't be rebuilt from the archive. Nightly, just before the rescan (so a paused scan can't hold it up), SD2NAS writes
@@ -268,7 +268,7 @@ identical first and last 64 KB is a safe match for camera files. A
 path, new hash), it stores the new hash and keeps the old one in `aliases` and
 the old fingerprint in `fingerprints`. The untouched original on the card still
 matches.
-Schema version 3 adds the `missing` ingest outcome (`ingests.missing`), `archive_copies` (other archive paths holding an asset's content), `archive_changes` ("changed since indexed"), `archive_scans` (the indexer's passes and backups), and `assets.checked_at` / `promoted_at`. A change in place moves the old fingerprints (their values are kept), aliases and ingest history to the new hash. Schema version 4 adds `notifications` (the notices queue: unique key, taken_at).
+Schema version 3 adds the `missing` ingest outcome (`ingests.missing`), `archive_copies` (other archive paths holding an asset's content), `archive_changes` ("changed since indexed"), `archive_scans` (the indexer's passes and backups), and `assets.checked_at` / `promoted_at`. A change in place moves the old fingerprints (their values are kept), aliases and ingest history to the new hash. Schema version 4 adds `notifications` (the notices queue: unique key, taken_at). Schema version 5 adds `restore_requests` (the owner's "re-import missing files" requests, §10).
 
 **Culled stays remembered:** culling or discarding deletes the file and sets
 `state = culled`, `rel_path = NULL`. The row and fingerprint stay, so it's
@@ -440,6 +440,7 @@ CameraImport's polling. Event types: `ingest.current` and `ingest.finished` (M3)
 POST   /api/ingest                       {path,label,uuid}  ?wait=1 blocks until done
 GET    /api/ingest/current
 POST   /api/ingest/{id}/reimport-culled
+POST   /api/ingest/{id}/reimport-missing  re-import the files whose archive copy is missing (M7)
 GET    /api/ingest/{id}/forget           what forgetting would do (M4)
 POST   /api/ingest/{id}/forget           {deleteFiles}  (M4)
 GET    /api/ingests                      history
@@ -451,6 +452,7 @@ PATCH  /api/staging/{id}                 {name | title}  (name: the whole folder
 POST   /api/staging/merge                {ids[], name | title}  (name: the whole folder name; title: earliest date + title)
 POST   /api/staging/move                 {fileShas[], toId | newTitle | newName}  (newName: the new folder's whole name)
 POST   /api/staging/cull                 {fileShas[]}
+POST   /api/staging/shift                {fileShas[], seconds}  shift capture times, one folder (M7)
 DELETE /api/staging/{id}                 discard folder
 POST   /api/staging/promote              {ids[], pattern} → 202, queues a job
 GET    /api/staging/promote              the running job, the queue and the last finished job
@@ -471,10 +473,13 @@ GET    /api/settings
 PUT    /api/settings
 GET    /api/notifications                notices waiting for the card script (M6)
 POST   /api/notifications/take           hand them out once; ?format=text for the script
+GET    /api/auth                         {required, authorized} (M7)
+POST   /api/login                        {token} sets the session cookie (M7)
+POST   /api/logout                       clears it (M7)
 GET    /healthz
 ```
 
-`GET/PUT /api/settings` (M5) read and change the catalog settings as strings; no settings page until M7.
+`GET/PUT /api/settings` (M5) read and change the catalog settings as strings; `GET` also returns the defaults. The web UI's Settings page (M7) uses them.
 
 **Request guard (always on):** without a login, any webpage open in a browser
 on your network could otherwise send requests to `tower:8080` and cull files.
@@ -484,9 +489,12 @@ another site add a custom header without a CORS check, and SD2NAS answers no
 CORS requests, so those requests fail. The UI and the card script send the
 header automatically.
 
-**Optional token:** `SD2NAS_TOKEN`; when set, every request needs it, the UI
-asks once and remembers it, and the script sends it. Never port-forward. Remote
-access (VPN or tunnel) is out of scope for now.
+**Optional token:** `SD2NAS_TOKEN` (environment only, no flag, so it never shows in a process list; the UI calls it the password). When set:
+- The card script sends `Authorization: Bearer <token>`. Browsers sign in on a login page: `POST /api/login` checks the token and sets the cookie `sd2nas_session` (the HMAC of the token, `HttpOnly`, `SameSite=Strict`, 400 days), because `EventSource` and `<img>` can't send headers and a `?token=` URL would leak into history and logs. No server-side sessions: changing the token signs every browser out, and "Sign out" in Settings clears one.
+- Open without the token: `/healthz`, the UI's static files, `GET /api/auth`, `POST /api/login` and `POST /api/logout`. Every other `/api/` request answers 401 (`token_required`; with `?format=text` two lines the card script prints).
+- The token may use only letters, digits and `. _ ~ + / = -` (it sits in the bash-sourced `sd2nas.cfg`), or SD2NAS refuses to start. One shorter than 16 characters adds a `/healthz` warning. There is no login rate limit: it is LAN only and the README tells the owner to generate 48 random hex characters.
+
+Never port-forward. Remote access (VPN or tunnel) is out of scope for now.
 
 ---
 
@@ -576,10 +584,14 @@ share the same clock. A few cases **can** be caught:
 summary and the affected staging folders. Show the camera's time zone, when
 known, in the folder details.
 
-**M7: "Shift times" tool** in staging: pick files or a folder and shift them by
-±H:MM. It renames the files and re-files them into the right date folders. Only
-filenames change, never file contents, so hashes and duplicate detection are
-unaffected.
+**M7: "Shift times" tool** on the Folder page (`POST /api/staging/shift`): pick
+files, or shift all of the folder's staged files, by ±H:MM:SS.
+- Staged files only, one folder per request. Archived files belong to the indexer and to Capture One sessions that name them.
+- If the request covers every staged file of the folder, the files stay and the folder's dates become their new dates (a name starting with a date takes the earliest new date, the title kept). Otherwise a file stays when its new folder date is one of the folder's dates and is re-filed like an import when not: into the folder whose dates contain it, else the folder named exactly that date, else a new `YYYY-MM-DD` folder.
+- Only the leading `YYYY-MM-DD HH.mm.ss` stamp of a name is renamed, and only when it equals the file's old capture time; the rest of the name (video details, `-1` burst suffixes) is kept. Names without the stamp keep their name.
+- It adds seconds to the naive wall clock, never through time-zone rules; at most ±100 years, results within 1970–2099.
+- Shifted files lose their clock warnings (shifting is the answer to them); the import's warning count stays as history.
+- Only filenames and catalog entries change, never file contents, so hashes and duplicate detection are unaffected.
 
 ---
 
@@ -609,7 +621,7 @@ unaffected.
 
 ## 14. Container, CI and Unraid install
 
-**Dockerfile** (multi-stage): node builds `web/dist` → Go builds a static binary
+**Dockerfile** (multi-stage; the three base images are pinned as `name:<exact tag>@sha256:<digest>`, which `deploy/dockerfile_test.go` checks): node builds `web/dist` → Go builds a static binary
 with the UI embedded → final `alpine` image containing the binary plus
 `tzdata`, `exiftool` (~20 MB, RAW previews for every format including CR3) and
 `ffmpeg` (video poster frames), both installed with `apk`. The M0 image is
@@ -637,8 +649,9 @@ runs SD2NAS as `PUID:PGID` (default `99:100`) using `su-exec`. It never chowns
   container automatically, so the template doesn't set it; `/healthz` shows the
   value and warns if it's missing.
 - The template has `--restart=unless-stopped` (Extra Parameters), an icon and
-  the Card poller variable (`SD2NAS_POLL_CARDS`, default `false`), and no token
-  variable until M7. The install steps are in `README.md`.
+  the Card poller variable (`SD2NAS_POLL_CARDS`, default `false`) and, from M7,
+  the **Password (SD2NAS_TOKEN)** variable (empty, masked). It installs
+  `ghcr.io/aspiziri/sd2nas:latest`; `:edge` follows `main`. The install steps are in `README.md`.
 - Startup takes `/config/sd2nas.lock`; a second instance exits with code 3.
 - Install by adding the repo URL (`https://github.com/aspiziri/SD2NAS`) under
   Docker → Template repositories, or by pasting the values into Add Container. Updates show up in
@@ -890,13 +903,45 @@ Implementation plan: `docs/plans/m6-unraid-integration.md`.
 8. Optional: `curl -s -X PUT -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' http://localhost:4040/api/settings -d '{"backup_dir":"/proc/sd2nas-test","archive_rescan_at":"<the next minute>"}'`. At that minute SD2NAS runs its nightly sequence: the failing backup **and then an archive pass**. After the M5 backfill, that pass is a quick stat-only rescan. If the backfill hasn't run yet, this pass **is** the backfill (hours of array reads): let it run as the backfill, or Pause it from the Archive index page. Wait 2 minutes and run the User Scripts entry → an Alert `Nightly catalog backup failed: …`. Then restore `backup_dir` to `""` and `archive_rescan_at` to `03:00`.
 
 ### M7: Polish
-- [ ] Extra staging views (timeline, list)
-- [ ] "Shift times" tool for wrong camera clocks
-- [ ] Optional token auth (add `SD2NAS_TOKEN` back to the template; the card script already sends it)
-- [ ] Setting for the time of the daily stale-staging notice (fixed at 09:00 in M6)
-- [ ] Settings page: `staging_warn_days`, the default promote pattern (now remembered per device), `day_starts_at`, `archive_rescan_at`, `backup_dir`, `archive_skip`
-- [ ] Offer to re-import files whose archive copy is missing (imports now list them and refuse safe to format)
-- [ ] Cache thumbnail render failures per file so a corrupt file isn't re-rendered on every view
-- [ ] Byte-level copy progress for long videos (progress currently updates once per file)
-- [ ] Keep one `exiftool -stay_open` process for RAW thumbnails instead of one process per file
-- [ ] `v0.1.0` tag → `:latest`
+- [x] Extra staging views (timeline, list): Staging has Cards | List | Timeline and Folder has Grid | List, remembered per device
+- [x] "Shift times" tool for wrong camera clocks (§12)
+- [x] Optional token auth (add `SD2NAS_TOKEN` back to the template; the card script already sends it): a login page and a cookie for browsers, Bearer for the script (§10)
+- [x] Setting for the time of the daily stale-staging notice (fixed at 09:00 in M6): `staging_notice_at`
+- [x] Settings page: all eight catalog settings, with "Use default"; the default promote pattern stays per device
+- [x] Offer to re-import files whose archive copy is missing (imports now list them and refuse safe to format)
+- [x] Cache thumbnail render failures per file so a corrupt file isn't re-rendered on every view
+- [x] Byte-level copy progress for long videos (progress currently updates once per file)
+- [x] Keep one `exiftool -stay_open` process for RAW thumbnails instead of one process per file
+- [ ] `v0.1.0` tag → `:latest`. Code side done (pinned images, template on `:latest`). Owner's step below.
+
+Implementation plan: `docs/plans/m7-polish.md`.
+
+**What M7 delivers.** An optional password: `SD2NAS_TOKEN` (env only) makes every `/api/` request need it, except login, logout, `GET /api/auth` and `/healthz`; the card script sends it as a Bearer header and browsers sign in once and keep an `HttpOnly` cookie (Decisions 1-5, 5a). A Settings page (all eight catalog settings, "Use default", sign out) and the new `staging_notice_at` setting, which moves the daily stale-staging notice and applies at once (Decisions 6, 8, 9). The missing-files notice now comes from a catalog watermark (`missing:<newest updated_at>`), not a pass's count (Decision 7). Re-import missing records a request (schema version 5, `restore_requests`) that applies to the next import of a card holding that content, or at once when the card is still mounted; the restored file becomes an ordinary staged file counted as new (Decisions 14-16). Shift times works on staged files of one folder, keeps or re-files them by the folder's dates, renames only the leading stamp and clears clock warnings (Decisions 17-22; Task 7's `shiftWall` returns the shifted wall clock in UTC, which keeps spring-forward gaps from skewing it). Staging gets Cards | List | Timeline views and Folder gets Grid | List (Decision 23). Thumbnail failures (undecodable, too large, no image) are remembered in memory until restart, and one `exiftool -stay_open` process serves RAW thumbnails (Decisions 11, 12); stay_open requests omit `--` because exiftool ignores `-execute` after it, and an unreadable file maps to a permission error and isn't remembered. Copy progress reports the file's bytes and which folder an import waits on (Decision 13). Open-path checks judge both the decoded and the escaped path, and RequestRestore clears stale requests. Base images are pinned by digest, the template installs `:latest` (Decisions 24, 25). The owner approved every plan decision as written.
+
+**Deferred follow-ups** (Decision 26, plus what review found):
+- F6, F7, F8, F12, F14 (unchanged code or not cheap).
+- The SSE write deadline; duplicate `ingest.finished` events.
+- A 500 answer carrying paths (only token holders see them now).
+- Client routes with a dot; history truncation at 1000; duplicate clock-warning strings.
+- The dropped-disk threshold (indexer core); the poller's repeated Warn; the open-rows panic hang; the shutdown log line.
+- The M5 indexer progress/logging details and missing tests; the Archive page load nits.
+- A shifted capture time inside the spring-forward DST gap is read back an hour earlier: the catalog reader should read `capture_time` as a naive wall clock.
+- The thumbnail lock-wait timeout is still logged at Error by `internal/api`.
+- The exiftool post-kill 5 s cap doesn't work on Windows (production is Linux).
+- A re-import-missing request made while that card's import is already running answers "Importing…" but only takes effect at the next insert.
+- Identical content already at the restore target is recorded missing until the staging reconcile.
+
+**On the NAS (the owner's).** These can't be done from the repository:
+1. Merge the M7 PR, then tag at once from an up-to-date `main`:
+   ```
+   git checkout main && git pull --ff-only
+   git tag -a v0.1.0 -m "SD2NAS 0.1.0"
+   git push origin v0.1.0
+   gh run list --repo aspiziri/SD2NAS --workflow release.yml --limit 1
+   docker buildx imagetools inspect ghcr.io/aspiziri/sd2nas:latest
+   ```
+   The run must succeed and `:latest`, `:0.1.0` and `:0.1` must exist. Then tick the `v0.1.0` item with the date.
+2. On Unraid: Docker → SD2NAS → Edit → Repository `ghcr.io/aspiziri/sd2nas:latest` → Apply. `/healthz` shows `"version": "0.1.0"`.
+3. Optional: the password, as the README says (the template's **Password (SD2NAS_TOKEN)** variable and `SD2NAS_TOKEN` in `sd2nas.cfg`); then insert a card and check the notice still arrives (the script sends the token).
+4. Open Settings; set "Daily notice at" if 09:00 doesn't suit.
+5. With a real card: Shift times on a staged folder (+1 h, then −1 h back), and the List/Timeline views on the phone.
