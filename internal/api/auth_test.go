@@ -4,9 +4,14 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -132,6 +137,111 @@ func TestTokenRequired(t *testing.T) {
 	}
 	wantAuth(t, f.s, `{"required":true,"authorized":false}`)
 	wantAuth(t, f.s, `{"required":true,"authorized":true}`, "Authorization", "Bearer "+testToken)
+}
+
+// registeredRoutes returns the mux pattern of every route this package
+// registers, read from its non-test sources (http.ServeMux can't list its
+// routes): the string literal passed to each mux.HandleFunc or mux.Handle,
+// in server.go and every Mount* function. A registration whose pattern is
+// not a literal fails the test, so that no route can escape the list.
+func registeredRoutes(t *testing.T) []string {
+	t.Helper()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var routes []string
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || (sel.Sel.Name != "HandleFunc" && sel.Sel.Name != "Handle") {
+				return true
+			}
+			if recv, ok := sel.X.(*ast.SelectorExpr); !ok || recv.Sel.Name != "mux" {
+				return true
+			}
+			lit, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				t.Fatalf("%s: a route whose pattern is not a string literal; list it here by hand", fset.Position(call.Pos()))
+			}
+			p, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			routes = append(routes, p)
+			return true
+		})
+	}
+	return routes
+}
+
+// TestTokenRequiredEveryRoute: with a token set, every registered /api/
+// route but the open ones answers 401 token_required without credentials.
+func TestTokenRequiredEveryRoute(t *testing.T) {
+	f := authServer(t, testToken)
+	n, err := notices.New(notices.Config{DB: f.db, Log: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s.MountNotifications(n) // f.s.Close closes n
+	open := map[string]bool{"GET /api/auth": true, "POST /api/login": true, "POST /api/logout": true}
+	fill := strings.NewReplacer("{id}", "1", "{jobId}", "1", "{sha}", strings.Repeat("ab", 32))
+	routes := registeredRoutes(t)
+	tested := map[string]bool{}
+	for _, route := range routes {
+		method, p, ok := strings.Cut(route, " ")
+		if !ok || !strings.HasPrefix(p, "/api/") {
+			continue // "/" (the web UI) and GET /healthz are open by design
+		}
+		if open[route] {
+			continue
+		}
+		tested[route] = true
+		if strings.Contains(fill.Replace(p), "{") {
+			t.Fatalf("%s: no value for its wildcard; add one to fill", route)
+		}
+		methods := []string{method}
+		if method == http.MethodGet {
+			methods = append(methods, http.MethodHead) // the mux serves HEAD for a GET route
+		}
+		for _, m := range methods {
+			t.Run(m+" "+p, func(t *testing.T) {
+				rec := do(t, f.s, m, fill.Replace(p), "{}", "X-SD2NAS", "1")
+				if m == http.MethodHead {
+					if rec.Code != http.StatusUnauthorized {
+						t.Errorf("status %d, want 401", rec.Code)
+					}
+					return
+				}
+				wantTokenRequired(t, rec)
+			})
+		}
+	}
+	for _, route := range []string{
+		"POST /api/staging/shift", "POST /api/ingest/{id}/reimport-missing", "PUT /api/settings",
+		"POST /api/archive/rescan", "GET /api/archive/stats", "GET /api/notifications",
+		"POST /api/notifications/take", "GET /api/events", "GET /api/thumbs/{sha}", "GET /api/preview/{sha}",
+	} {
+		if !tested[route] {
+			t.Errorf("%s was not found among the registered routes %q", route, routes)
+		}
+	}
+	// HEAD /api/auth is open too: the mux serves it from GET /api/auth.
+	if rec := do(t, f.s, http.MethodHead, "/api/auth", ""); rec.Code != http.StatusOK {
+		t.Errorf("HEAD /api/auth: status %d, want 200", rec.Code)
+	}
 }
 
 func TestTokenBearer(t *testing.T) {
