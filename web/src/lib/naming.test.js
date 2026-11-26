@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitName, folderName, folderDate, earliestDate, nameProblem, checkTitle, promoteTarget, MAX_NAME_BYTES } from './naming.js';
+import { splitName, folderName, folderDate, earliestDate, nameProblem, checkTitle, checkFolderName, promoteTarget, MAX_NAME_BYTES } from './naming.js';
 
 test('splitName reads the archive convention as text', () => {
   assert.deepEqual(splitName('2025-05-30 - Trip'), { date: '2025-05-30', title: 'Trip' });
@@ -47,6 +47,16 @@ test('checkTitle also checks the whole name with its date', () => {
   assert.match(checkTitle(fits + 'x', '2025-05-30').error, /longer than 200 bytes/);
   // multi-byte titles count in UTF-8 bytes, not characters
   assert.match(checkTitle('é'.repeat(94), '2025-05-30').error, /longer than 200 bytes/);
+});
+
+test('checkFolderName trims and drops a dangling separator like CleanName', () => {
+  assert.deepEqual(checkFolderName(' 2025-06-02 - Trip '), { name: '2025-06-02 - Trip', error: '' });
+  assert.deepEqual(checkFolderName('2025-06-02 - '), { name: '2025-06-02', error: '' });
+  assert.deepEqual(checkFolderName('2025-06-02 -'), { name: '2025-06-02', error: '' });
+  assert.deepEqual(checkFolderName('2025-06-02 - A-'), { name: '2025-06-02 - A-', error: '' });
+  assert.deepEqual(checkFolderName('   '), { name: '', error: '' });
+  assert.match(checkFolderName('2025-06-02 - a/b').error, /^The folder name contains "\/"/);
+  assert.match(checkFolderName('x'.repeat(MAX_NAME_BYTES + 1)).error, /longer than 200 bytes/);
 });
 
 test('promoteTarget expands the tokens like the server', () => {

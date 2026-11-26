@@ -59,6 +59,16 @@ export function checkTitle(raw, date = '') {
   return { title, error: '' };
 }
 
+// A whole folder name as typed, cleaned as CleanName in names.go does: a
+// dangling " -" (the separator left when the title is cleared) is dropped.
+export function checkFolderName(raw) {
+  let name = raw.trim();
+  if (name.endsWith(' -')) name = name.slice(0, -1).trim();
+  if (name === '') return { name, error: '' }; // nothing typed yet: no complaint, but nothing to send
+  const p = nameProblem(name);
+  return { name, error: p ? `The folder name ${p}.` : '' };
+}
+
 export function promoteTarget(folder, pattern) {
   const p = pattern.trim() || DEFAULT_PATTERN;
   const date = folderDate(folder);
