@@ -67,6 +67,23 @@ func CleanTitle(title string) (string, error) {
 	return t, nil
 }
 
+// CleanName trims a whole folder name the user typed and checks it. A
+// dangling " -" (the separator left when the title part is cleared, as in
+// "2025-05-30 - ") is dropped, so that name is just the date.
+func CleanName(name string) (string, error) {
+	n := strings.TrimSpace(name)
+	if strings.HasSuffix(n, " -") {
+		n = strings.TrimSpace(strings.TrimSuffix(n, "-"))
+	}
+	if n == "" {
+		return "", fmt.Errorf("%w: the folder needs a name", ErrBadTitle)
+	}
+	if err := checkName(n); err != nil {
+		return "", fmt.Errorf("%w: the folder name %v", ErrBadTitle, err)
+	}
+	return n, nil
+}
+
 // FolderName joins a date and a title the archive's way (§8):
 // "2007-11-10 - SMU Homecoming", or just the date, or just the title.
 func FolderName(date, title string) string {

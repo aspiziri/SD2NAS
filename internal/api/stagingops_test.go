@@ -274,6 +274,29 @@ func TestStagingMergeAPI(t *testing.T) {
 	wantCode(t, send(t, f.s, http.MethodPost, "/api/staging/merge", fmt.Sprintf(`{"ids":[%d]}`, a.ID)), http.StatusBadRequest, "")
 }
 
+func TestStagingMergeAPIWholeName(t *testing.T) {
+	f := newFullServer(t)
+	a := ingested(t, f)
+	writeJPEG(t, filepath.Join(f.photos, "Staging", "2025-06-01 - Beach", "a.JPG"), 40, 30)
+	if _, err := f.svc.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{}
+	for _, fo := range listing(t, f).Folders {
+		ids = append(ids, fmt.Sprint(fo.ID))
+	}
+	body := fmt.Sprintf(`{"ids":[%s],"title":"ignored","name":"2025-06-01 - Trip"}`, strings.Join(ids, ","))
+	rec := send(t, f.s, http.MethodPost, "/api/staging/merge", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body)
+	}
+	if got := folderIn(t, rec); got.Name != "2025-06-01 - Trip" || got.Files != 3 {
+		t.Errorf("folder %+v", got)
+	}
+	_ = a
+	wantCode(t, send(t, f.s, http.MethodPost, "/api/staging/merge", fmt.Sprintf(`{"ids":[%s],"name":"  "}`, strings.Join(ids, ","))), http.StatusBadRequest, "")
+}
+
 func TestStagingMoveAndCullAPI(t *testing.T) {
 	f := newFullServer(t)
 	a := ingested(t, f)

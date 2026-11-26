@@ -455,6 +455,47 @@ func TestMergePicksFolderWithFinalName(t *testing.T) {
 	e.nameKeyFree(t, got.Name)
 }
 
+func TestMergeAsUsesTheWholeName(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMergeFixture(t, e)
+	got, err := e.svc.MergeAs(t.Context(), []int64{m.a.ID, m.b.ID}, "2025-05-31 - Trip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The earliest-dated folder is still the one kept, renamed to the later date.
+	if got.ID != m.a.ID || got.Name != "2025-05-31 - Trip" || got.Files != 4 {
+		t.Fatalf("result = %d %q %d files", got.ID, got.Name, got.Files)
+	}
+	if p := e.relPath(t, m.bMP4); p != "Staging/2025-05-31 - Trip/Videos/v.MP4" {
+		t.Errorf("rel_path = %q", p)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30", "Staging/2025-05-31")
+	e.lockFree(t, m.a.ID, m.b.ID)
+	e.nameKeyFree(t, got.Name)
+}
+
+func TestMergeAsKeepsFolderWithThatName(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMergeFixture(t, e)
+	got, err := e.svc.MergeAs(t.Context(), []int64{m.a.ID, m.b.ID}, "2025-05-31 - ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != m.b.ID || got.Name != "2025-05-31" {
+		t.Fatalf("result = %d %q", got.ID, got.Name)
+	}
+	e.mustNotExist(t, "Staging/2025-05-30")
+}
+
+func TestMergeAsBadName(t *testing.T) {
+	e := newOpsEnv(t)
+	m := newMergeFixture(t, e)
+	if _, err := e.svc.MergeAs(t.Context(), []int64{m.a.ID, m.b.ID}, "a/b"); !errors.Is(err, ErrBadTitle) {
+		t.Fatalf("err = %v, want ErrBadTitle", err)
+	}
+	e.lockFree(t, m.a.ID, m.b.ID)
+}
+
 func TestMergeIdenticalFile(t *testing.T) {
 	e := newOpsEnv(t)
 	a := e.folder(t, "2025-05-30", "2025-05-30")

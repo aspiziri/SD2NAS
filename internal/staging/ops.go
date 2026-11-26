@@ -265,25 +265,47 @@ func mergeTarget(rows []catalog.StagingFolder, name string) catalog.StagingFolde
 // earliest date among them and title, then removes the emptied sources
 // (§8). Files keep their path inside the folder; clashes get -1, -2.
 func (s *Service) Merge(ctx context.Context, ids []int64, title string) (Folder, error) {
-	ids = uniqueIDs(ids)
-	if len(ids) < 2 {
-		return Folder{}, fmt.Errorf("%w: merging needs at least two folders", ErrBadRequest)
-	}
 	t, err := CleanTitle(title)
 	if err != nil {
 		return Folder{}, err
+	}
+	return s.merge(ctx, ids, func(rows []catalog.StagingFolder) (string, error) {
+		name := FolderName(earliestDate(rows), t)
+		if name == "" {
+			return "", fmt.Errorf("%w: these folders have no date, so the merged folder needs a title", ErrBadTitle)
+		}
+		if err := checkName(name); err != nil {
+			return "", fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+		}
+		return name, nil
+	})
+}
+
+// MergeAs is Merge into a folder with the whole name the user typed
+// (CleanName), so its date need not be the earliest one.
+func (s *Service) MergeAs(ctx context.Context, ids []int64, name string) (Folder, error) {
+	n, err := CleanName(name)
+	if err != nil {
+		return Folder{}, err
+	}
+	return s.merge(ctx, ids, func([]catalog.StagingFolder) (string, error) { return n, nil })
+}
+
+// merge is Merge and MergeAs once the folders are locked; nameOf picks the
+// merged folder's name from them.
+func (s *Service) merge(ctx context.Context, ids []int64, nameOf func([]catalog.StagingFolder) (string, error)) (Folder, error) {
+	ids = uniqueIDs(ids)
+	if len(ids) < 2 {
+		return Folder{}, fmt.Errorf("%w: merging needs at least two folders", ErrBadRequest)
 	}
 	rows, release, err := s.lockFolders(ctx, ids)
 	if err != nil {
 		return Folder{}, err
 	}
 	defer release()
-	name := FolderName(earliestDate(rows), t)
-	if name == "" {
-		return Folder{}, fmt.Errorf("%w: these folders have no date, so the merged folder needs a title", ErrBadTitle)
-	}
-	if err := checkName(name); err != nil {
-		return Folder{}, fmt.Errorf("%w: %q %v", ErrBadTitle, name, err)
+	name, err := nameOf(rows)
+	if err != nil {
+		return Folder{}, err
 	}
 	releaseName, err := s.lockName(name)
 	if err != nil {

@@ -212,12 +212,19 @@ func (h *stagingHandlers) merge(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		IDs   []int64 `json:"ids"`
 		Title string  `json:"title"`
+		Name  *string `json:"name"` // the whole name; wins over title
 	}
 	if err := decodeBody(w, r, &body, smallBody); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	f, err := h.svc.Merge(opContext(r), body.IDs, body.Title)
+	var f staging.Folder
+	var err error
+	if body.Name != nil {
+		f, err = h.svc.MergeAs(opContext(r), body.IDs, *body.Name)
+	} else {
+		f, err = h.svc.Merge(opContext(r), body.IDs, body.Title)
+	}
 	if err != nil {
 		writeOpError(w, h.log, "folder", "merge staging folders", err)
 		return
