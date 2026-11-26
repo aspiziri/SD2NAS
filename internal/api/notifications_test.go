@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/aspiziri/SD2NAS/internal/ingest"
 	"github.com/aspiziri/SD2NAS/internal/media/mediatest"
 	"github.com/aspiziri/SD2NAS/internal/notices"
+	"github.com/aspiziri/SD2NAS/internal/staging"
 )
 
 func newNoticeServer(t *testing.T, queued int) (*Server, *notices.Service) {
@@ -47,6 +49,41 @@ func newNoticeServer(t *testing.T, queued int) (*Server, *notices.Service) {
 	s.MountNotifications(n)
 	t.Cleanup(s.Close)
 	return s, n
+}
+
+func TestSettingsPutNudgesNotices(t *testing.T) {
+	f := newFullServer(t)
+	listed := make(chan struct{}, 10)
+	var days atomic.Int64
+	noon := time.Date(2026, 11, 23, 12, 0, 0, 0, time.Local)
+	n, err := notices.New(notices.Config{DB: f.db, Log: slog.New(slog.DiscardHandler), Every: time.Hour,
+		// every check falls on a new day, after the notice time, so every check lists staging
+		Now: func() time.Time { return noon.AddDate(0, 0, int(days.Add(1))) },
+		Staging: func(context.Context) (staging.Listing, error) {
+			select {
+			case listed <- struct{}{}:
+			default:
+			}
+			return staging.Listing{}, nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s.MountNotifications(n) // f.s.Close closes n
+	n.Start()
+	select {
+	case <-listed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first check did not list staging within 10 s")
+	}
+	if rec := send(t, f.s, http.MethodPut, "/api/settings", `{"staging_notice_at":"00:00"}`); rec.Code != http.StatusOK {
+		t.Fatalf("put: %d %s", rec.Code, rec.Body)
+	}
+	select {
+	case <-listed: // within an hour no tick could have caused it
+	case <-time.After(10 * time.Second):
+		t.Fatal("PUT /api/settings did not make the notices loop check within 10 s")
+	}
 }
 
 func noticeReq(s *Server, method, target string, guarded bool) *httptest.ResponseRecorder {
