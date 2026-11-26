@@ -216,7 +216,7 @@ func TestArchiveChangedAndAccept(t *testing.T) {
 		`{}`:               "upTo must be a positive whole number.",
 		`{"upTo":null}`:    "upTo must be a positive whole number.",
 		`{"upTo":0}`:       "upTo must be a positive whole number.",
-		`{"upTo":"x"}`:     "The request body is not valid JSON.",
+		`{"upTo":"x"}`:     "upTo must be a positive whole number.",
 		`{"upTo":1,"x":1}`: "The request has a field this server does not know.",
 	} {
 		e := wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/changed/accept", body), http.StatusBadRequest, "")
@@ -339,4 +339,22 @@ func TestIndexerSnapshotDuringPublishes(t *testing.T) {
 	wg.Wait()
 	f.busy.Store(false)
 	waitIdle(t, f)
+}
+
+func TestAcceptUpToNotWhole(t *testing.T) {
+	f := newFullServer(t)
+	const sentence = "upTo must be a positive whole number."
+	for _, body := range []string{`{"upTo":1.5}`, `{"upTo":"3"}`, `{"upTo":true}`, `{"upTo":0}`, `{"upTo":null}`, `{}`} {
+		e := wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/changed/accept", body), http.StatusBadRequest, "")
+		if e.Error != sentence {
+			t.Errorf("%s: error %q, want %q", body, e.Error, sentence)
+		}
+	}
+	if rec := send(t, f.s, http.MethodPost, "/api/archive/changed/accept", `{"upTo":2}`); rec.Code != http.StatusOK {
+		t.Errorf("upTo 2: %d %s", rec.Code, rec.Body)
+	}
+	e := wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/changed/accept", `{"upTo":`), http.StatusBadRequest, "")
+	if e.Error != "The request body is not valid JSON." {
+		t.Errorf("bad JSON: error %q", e.Error)
+	}
 }

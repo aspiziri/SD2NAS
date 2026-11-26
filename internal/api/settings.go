@@ -18,11 +18,12 @@ type settingsHandlers struct {
 	idx        *indexer.Service
 	photosRoot string
 	log        *slog.Logger
+	srv        *Server
 }
 
 // MountSettings registers GET/PUT /api/settings.
 func (s *Server) MountSettings(db *catalog.DB, idx *indexer.Service, photosRoot string) {
-	h := &settingsHandlers{db: db, idx: idx, photosRoot: photosRoot, log: s.log}
+	h := &settingsHandlers{db: db, idx: idx, photosRoot: photosRoot, log: s.log, srv: s}
 	s.mux.HandleFunc("GET /api/settings", h.get)
 	s.mux.HandleFunc("PUT /api/settings", h.put)
 }
@@ -41,7 +42,10 @@ func (h *settingsHandlers) write(w http.ResponseWriter, ctx context.Context) {
 	}
 	out := set.Strings()
 	out[catalog.KeyBackupDir] = h.idx.BackupDir(set)
-	writeJSON(w, http.StatusOK, map[string]any{"settings": out})
+	defaults := catalog.DefaultSettings()
+	def := defaults.Strings()
+	def[catalog.KeyBackupDir] = h.idx.BackupDir(defaults)
+	writeJSON(w, http.StatusOK, map[string]any{"settings": out, "defaults": def})
 }
 
 func (h *settingsHandlers) put(w http.ResponseWriter, r *http.Request) {
@@ -83,5 +87,8 @@ func (h *settingsHandlers) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.idx.SettingsChanged()
+	for _, fn := range h.srv.settingsHooks() {
+		fn()
+	}
 	h.write(w, context.WithoutCancel(r.Context()))
 }

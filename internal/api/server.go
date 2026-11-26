@@ -54,6 +54,9 @@ type Server struct {
 	feed         *ingestFeed   // set by MountIngest
 	hookMu       sync.Mutex
 	finished     []func(catalog.Ingest)
+
+	settingsMu  sync.Mutex
+	settingsFns []func() // run after every saved settings change
 }
 
 // New builds the server and probes writable mounts once. Probing on every
@@ -115,6 +118,20 @@ func (s *Server) finishedHooks() []func(catalog.Ingest) {
 	s.hookMu.Lock()
 	defer s.hookMu.Unlock()
 	return append([](func(catalog.Ingest))(nil), s.finished...)
+}
+
+// onSettingsChanged registers fn to run after every saved settings change.
+// fn must not block.
+func (s *Server) onSettingsChanged(fn func()) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	s.settingsFns = append(s.settingsFns, fn)
+}
+
+func (s *Server) settingsHooks() []func() {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	return append([]func(){}, s.settingsFns...)
 }
 
 // AddProblem adds a permanent /healthz problem (for example, the catalog

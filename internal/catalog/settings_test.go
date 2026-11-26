@@ -2,7 +2,9 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -16,7 +18,7 @@ func TestSettingsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Settings{DayStartsAt: 4 * time.Hour, VerifyKnown: VerifyQuick, ReserveBytes: 50_000_000_000, StagingWarnDays: 30, ArchiveRescanAt: 3 * time.Hour, ArchiveSkip: DefaultArchiveSkip}
+	want := Settings{DayStartsAt: 4 * time.Hour, VerifyKnown: VerifyQuick, ReserveBytes: 50_000_000_000, StagingWarnDays: 30, ArchiveRescanAt: 3 * time.Hour, ArchiveSkip: DefaultArchiveSkip, StagingNoticeAt: 9 * time.Hour}
 	if got != want || got != DefaultSettings() {
 		t.Errorf("Settings = %+v, want %+v", got, want)
 	}
@@ -215,9 +217,6 @@ func TestSettingsStrings(t *testing.T) {
 	def := DefaultSettings()
 	m := def.Strings()
 	keys := SettingKeys()
-	if len(keys) != 7 || len(m) != 7 {
-		t.Fatalf("%d keys, %d strings; want 7", len(keys), len(m))
-	}
 	for _, k := range keys {
 		if _, ok := m[k]; !ok {
 			t.Errorf("Strings() lacks %s", k)
@@ -226,6 +225,10 @@ func TestSettingsStrings(t *testing.T) {
 	want := map[string]string{
 		KeyDayStartsAt: "04:00", KeyVerifyKnown: "quick", KeyFreeSpaceReserveGB: "50",
 		KeyStagingWarnDays: "30", KeyArchiveRescanAt: "03:00", KeyBackupDir: "", KeyArchiveSkip: DefaultArchiveSkip,
+		KeyStagingNoticeAt: "09:00",
+	}
+	if len(keys) != len(want) || len(m) != len(want) || keys[len(keys)-1] != "staging_notice_at" {
+		t.Fatalf("%d keys, %d strings; want %d, ending staging_notice_at: %v", len(keys), len(m), len(want), keys)
 	}
 	if !reflect.DeepEqual(m, want) {
 		t.Errorf("Strings() = %v, want %v", m, want)
@@ -255,5 +258,60 @@ func TestSetSettingsIsAtomic(t *testing.T) {
 	}
 	if err := d.SetSettings(ctx, map[string]string{"nope": "1"}); err == nil {
 		t.Error("unknown key: want error")
+	}
+}
+
+func TestStagingNoticeAt(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	if err := d.SetSetting(ctx, KeyStagingNoticeAt, "18:30"); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := d.Settings(ctx); err != nil || s.StagingNoticeAt != 18*time.Hour+30*time.Minute {
+		t.Errorf("StagingNoticeAt = %v, %v; want 18h30m", s.StagingNoticeAt, err)
+	}
+	for _, bad := range []string{"24:00", "9:00", ""} {
+		var se *SettingError
+		err := d.SetSetting(ctx, KeyStagingNoticeAt, bad)
+		if !errors.As(err, &se) || se.Reason != "want HH:MM, 00:00 to 23:59" {
+			t.Errorf("SetSetting %q: %v", bad, err)
+		}
+	}
+}
+
+// TestSettingsCases checks the shared rules fixture the web tests also read:
+// one valid and one invalid value for every setting key.
+func TestSettingsCases(t *testing.T) {
+	raw, err := os.ReadFile("../../web/src/lib/testdata/rules-cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases struct {
+		Settings []struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+			OK    bool   `json:"ok"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(raw, &cases); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, c := range cases.Settings {
+		seen[c.Key]++
+		d := openTest(t)
+		err := d.SetSetting(t.Context(), c.Key, c.Value)
+		var se *SettingError
+		switch {
+		case c.OK && err != nil:
+			t.Errorf("%s = %q: want accepted, got %v", c.Key, c.Value, err)
+		case !c.OK && !errors.As(err, &se):
+			t.Errorf("%s = %q: want a *SettingError, got %v", c.Key, c.Value, err)
+		}
+	}
+	for _, k := range SettingKeys() {
+		if seen[k] != 2 {
+			t.Errorf("%s has %d cases, want 2", k, seen[k])
+		}
 	}
 }

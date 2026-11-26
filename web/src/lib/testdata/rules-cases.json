@@ -1,0 +1,24 @@
+{
+  "settings": [
+    { "key": "day_starts_at", "value": "04:00", "ok": true },
+    { "key": "day_starts_at", "value": "24:00", "ok": false },
+    { "key": "verify_known", "value": "full", "ok": true },
+    { "key": "verify_known", "value": "fast", "ok": false },
+    { "key": "free_space_reserve_gb", "value": "50", "ok": true },
+    { "key": "free_space_reserve_gb", "value": "1.5", "ok": false },
+    { "key": "staging_warn_days", "value": "30", "ok": true },
+    { "key": "staging_warn_days", "value": "3651", "ok": false },
+    { "key": "archive_rescan_at", "value": "03:00", "ok": true },
+    { "key": "archive_rescan_at", "value": "3:00", "ok": false },
+    { "key": "backup_dir", "value": "", "ok": true },
+    { "key": "backup_dir", "value": "relative/dir", "ok": false },
+    { "key": "archive_skip", "value": "Output/, *.xmp", "ok": true },
+    { "key": "archive_skip", "value": "a/b", "ok": false },
+    { "key": "staging_notice_at", "value": "09:00", "ok": true },
+    { "key": "staging_notice_at", "value": "9:00", "ok": false }
+  ],
+  "shiftWall": [],
+  "shiftedName": [],
+  "folderDate": [],
+  "wholeName": []
+}
