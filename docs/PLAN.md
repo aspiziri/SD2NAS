@@ -485,8 +485,8 @@ CORS requests, so those requests fail. The UI and the card script send the
 header automatically.
 
 **Optional token:** `SD2NAS_TOKEN`; when set, every request needs it, the UI
-asks once and remembers it, and the script sends it. Never port-forward; use
-Tailscale for remote access.
+asks once and remembers it, and the script sends it. Never port-forward. Remote
+access (VPN or tunnel) is out of scope for now.
 
 ---
 
@@ -731,7 +731,7 @@ the staged copy instead of the card is the follow-up.
   (exiftool, ffmpeg), since culling RAWs on a phone needs them
 - [x] Phone layout: bottom tab bar, one-column cards, full-screen preview
 - [x] PWA manifest and icon (Add to Home Screen)
-- [ ] Check on the phone over Tailscale: Add to Home Screen, iOS safe-area insets in the home-screen app, swipe and back in the preview, a folder with thousands of files
+- [ ] Check on the phone (home Wi-Fi): Add to Home Screen, iOS safe-area insets in the home-screen app, swipe and back in the preview, a folder with thousands of files
 - [ ] Check RAW thumbnails from real Sony, GoPro and Canon cards (orientation)
 
 Implementation plan: `docs/plans/m3-web-ui.md`. The UI is embedded from
@@ -744,9 +744,8 @@ files are the `staged` assets under `Staging/<name>/`. Directories in
 `Staging/` without a row are reported as untracked until M4's reconcile
 adopts them. Thumbnails (400 px) and previews (1600 px) are cached under
 `/config/thumbs/<sha[:2]>/<sha>-<size>.jpg` and warmed after each import.
-There is no service worker. A full PWA install needs HTTPS (for example
-`tailscale serve`); over plain `http://tower:8080`, phones add a home-screen
-shortcut.
+There is no service worker; phones add a home-screen shortcut. HTTPS and
+remote access are out of scope for now.
 
 The UI is responsive: it has to work well on both desktop and phone, so it
 is not a phone-only UI. Images over 120 megapixels are refused from the
@@ -900,5 +899,4 @@ Implementation plan: `docs/plans/m6-unraid-integration.md`.
 - [ ] Cache thumbnail render failures per file so a corrupt file isn't re-rendered on every view
 - [ ] Byte-level copy progress for long videos (progress currently updates once per file)
 - [ ] Keep one `exiftool -stay_open` process for RAW thumbnails instead of one process per file
-- [ ] HTTPS (e.g. `tailscale serve`) so the PWA installs fully
 - [ ] `v0.1.0` tag → `:latest`
