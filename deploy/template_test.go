@@ -46,7 +46,7 @@ func TestUnraidTemplate(t *testing.T) {
 
 	const raw_ = "https://raw.githubusercontent.com/aspiziri/SD2NAS/main/"
 	equal := map[string][2]string{
-		"Repository":  {tpl.Repository, "ghcr.io/aspiziri/sd2nas:edge"},
+		"Repository":  {tpl.Repository, "ghcr.io/aspiziri/sd2nas:latest"},
 		"TemplateURL": {tpl.TemplateURL, raw_ + "deploy/unraid/sd2nas.xml"},
 		"Icon":        {tpl.Icon, raw_ + "web/public/icon-512.png"},
 		"ExtraParams": {tpl.ExtraParams, "--restart=unless-stopped"},

@@ -1,8 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>SD2NAS</Name>
-  <!-- :edge tracks main until v0.1.0; switch to :latest after the first release -->
-  <Repository>ghcr.io/aspiziri/sd2nas:edge</Repository>
+  <Repository>ghcr.io/aspiziri/sd2nas:latest</Repository>
   <Registry>https://github.com/aspiziri/SD2NAS/pkgs/container/sd2nas</Registry>
   <Network>bridge</Network>
   <MyIP/>

@@ -54,6 +54,31 @@ The script runs when Unassigned Devices mounts a card. It imports the card, unmo
    Unassigned Devices names each slot's script file after the device and doesn't let you change its path, so this wrapper hands the card to `sd2nas.sh`. Its settings are per slot, so repeat this for every slot. Updating `sd2nas.sh` updates every slot.
 5. Insert a card. You get `<card>: N new, M already known. Card safe to format.` and the card is unmounted.
 
+## Optional password (`SD2NAS_TOKEN`)
+
+Without a password, anyone who can reach SD2NAS's port can use it. To set one, generate it and add it to `sd2nas.cfg`, so the card script sends it too:
+
+```
+TOKEN=$(openssl rand -hex 24); echo "$TOKEN"
+printf "\nSD2NAS_TOKEN='%s'\n" "$TOKEN" >> /boot/config/plugins/unassigned.devices/sd2nas.cfg
+```
+
+The leading `\n` keeps the line off the end of a cfg that has no final newline, and the single quotes keep bash from reading anything into the value. A password you pick yourself may use only letters, digits and `. _ ~ + / = -`, or SD2NAS refuses to start and logs `SD2NAS_TOKEN may use only letters, digits and . _ ~ + / = -`.
+
+Then give the container the same value: Docker → SD2NAS → Edit. A new install has the **Password (SD2NAS_TOKEN)** field in Advanced View. An existing container needs **Add another Path, Port, Variable…** → Variable, with Key `SD2NAS_TOKEN` and Value the printed password.
+
+- The web UI asks for the password once per browser (the home-screen app on iOS asks once too). Settings → This device → Sign out forgets it.
+- `/healthz` stays open.
+- Changing the password signs every browser out.
+
+## Settings
+
+Open the web UI's Settings page to change the day cutoff, verification, free-space reserve, staging warning, archive scan time, backup folder and skip list, and the time of the daily stale-staging notice. It replaces the terminal `curl`, which still works as a fallback (add `-H "Authorization: Bearer $SD2NAS_TOKEN"` if you set a password):
+
+```
+curl -s -X PUT -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' http://localhost:4040/api/settings -d '{"archive_skip":"Output/, CaptureOne/, *.cosessiondb, Exports/"}'
+```
+
 ## Notifications
 
 - Settings → Notification Settings: enable your agent (Pushover, ntfy, Telegram...) and tick **Agents** for **Notices, Warnings and Alerts**. Successful imports are Notices.
@@ -70,7 +95,7 @@ The script runs when Unassigned Devices mounts a card. It imports the card, unmo
   0 * * * * ACTION=NOTIFY bash /boot/config/plugins/unassigned.devices/sd2nas.sh >/dev/null 2>&1
   ```
 
-- To see what is waiting: `curl -s http://localhost:<port>/api/notifications`.
+- To see what is waiting: `. /boot/config/plugins/unassigned.devices/sd2nas.cfg; curl -s -H "Authorization: Bearer $SD2NAS_TOKEN" "$SD2NAS_URL/api/notifications"` (the header is needed only if you set a password).
 
 ## Without the host script (card poller)
 
@@ -82,6 +107,7 @@ Set the template's **Card poller** to `true` (`SD2NAS_POLL_CARDS`).
 
 ## Updating
 
+- `:latest` follows releases and is what the template installs. `:edge` follows `main`, with changes before they are released. To switch, edit the container and change Repository to `ghcr.io/aspiziri/sd2nas:latest` or `ghcr.io/aspiziri/sd2nas:edge`. Existing installs keep the repository they saved.
 - Docker → Check for Updates → Apply Update. This restarts the container, so wait for running imports, promotes and archive scans first.
 - Re-run the script `curl` above when the release notes say the script changed. `sd2nas.cfg` keeps your settings.
 - Existing installs: edit the container → Advanced View → Extra Parameters: `--restart=unless-stopped`.
@@ -94,10 +120,11 @@ Set the template's **Card poller** to `true` (`SD2NAS_POLL_CARDS`).
 - A container that exits with code 3 found another SD2NAS using the same appdata folder. The log line names it:
   `/config is in use by another SD2NAS (pid ... on ... since ...); stop it first`.
   With `--restart=unless-stopped`, Docker keeps restarting that container and the line repeats. That is harmless, but stop the duplicate container.
-- An import can be started by hand:
+- An import can be started by hand (replace `MYCARD` with the card's folder name under `/mnt/disks`; the `Authorization` header is needed only if you set a password):
 
   ```
-  curl -s -X POST -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' 'http://localhost:<port>/api/ingest?wait=1&format=text' -d '{"path":"/cards/<folder under /mnt/disks>"}'
+  . /boot/config/plugins/unassigned.devices/sd2nas.cfg
+  curl -s -X POST -H "Authorization: Bearer $SD2NAS_TOKEN" -H 'X-SD2NAS: 1' -H 'Content-Type: application/json' "$SD2NAS_URL/api/ingest?wait=1&format=text" -d '{"path":"/cards/MYCARD"}'
   ```
 
 ## Development
