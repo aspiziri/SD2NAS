@@ -82,6 +82,20 @@ func thumbFailure(err error) (code int, msg string, logIt bool) {
 	return http.StatusInternalServerError, err.Error(), true
 }
 
+// thumbWarning is the warning to log for a file that can't be rendered, or
+// "" for none. A remembered failure was logged when it happened.
+func thumbWarning(err error) string {
+	switch {
+	case errors.Is(err, thumbs.ErrRemembered):
+		return ""
+	case errors.Is(err, thumbs.ErrTooLarge):
+		return "thumbnail refused"
+	case errors.Is(err, thumbs.ErrUndecodable):
+		return "cannot decode for a thumbnail"
+	}
+	return ""
+}
+
 func (h *thumbHandlers) serve(size int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sha := r.PathValue("sha")
@@ -113,10 +127,8 @@ func (h *thumbHandlers) serve(size int) http.HandlerFunc {
 			code, msg, logIt := thumbFailure(err)
 			if logIt {
 				h.log.Error("thumbnail failed", "sha", sha, "size", size, "path", src.Path, "err", err)
-			} else if errors.Is(err, thumbs.ErrTooLarge) {
-				h.log.Warn("thumbnail refused", "sha", sha, "path", src.Path, "err", err)
-			} else if errors.Is(err, thumbs.ErrUndecodable) {
-				h.log.Warn("cannot decode for a thumbnail", "sha", sha, "path", src.Path, "err", err)
+			} else if warning := thumbWarning(err); warning != "" {
+				h.log.Warn(warning, "sha", sha, "path", src.Path, "err", err)
 			}
 			writeError(w, code, msg)
 			return
