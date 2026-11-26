@@ -18,6 +18,8 @@ type templateConfig struct {
 	Required string `xml:"Required,attr"`
 	Mask     string `xml:"Mask,attr"`
 	Value    string `xml:",chardata"`
+
+	Description string `xml:"Description,attr"`
 }
 
 type template struct {
@@ -44,7 +46,7 @@ func TestUnraidTemplate(t *testing.T) {
 
 	const raw_ = "https://raw.githubusercontent.com/aspiziri/SD2NAS/main/"
 	equal := map[string][2]string{
-		"Repository":  {tpl.Repository, "ghcr.io/aspiziri/sd2nas:edge"},
+		"Repository":  {tpl.Repository, "ghcr.io/aspiziri/sd2nas:latest"},
 		"TemplateURL": {tpl.TemplateURL, raw_ + "deploy/unraid/sd2nas.xml"},
 		"Icon":        {tpl.Icon, raw_ + "web/public/icon-512.png"},
 		"ExtraParams": {tpl.ExtraParams, "--restart=unless-stopped"},
@@ -77,7 +79,7 @@ func TestUnraidTemplate(t *testing.T) {
 			t.Errorf("%s: value %q != default %q", c.Target, c.Value, c.Default)
 		}
 	}
-	wantTargets := []string{"8080", "/cards", "/photos", "/config", "PUID", "PGID", "UMASK", "SD2NAS_POLL_CARDS"}
+	wantTargets := []string{"8080", "/cards", "/photos", "/config", "PUID", "PGID", "UMASK", "SD2NAS_POLL_CARDS", "SD2NAS_TOKEN"}
 	if !slices.Equal(targets, wantTargets) {
 		t.Fatalf("config targets = %v, want %v", targets, wantTargets)
 	}
@@ -105,4 +107,18 @@ func TestUnraidTemplate(t *testing.T) {
 	check("PGID", "Variable", "", "100", "")
 	check("UMASK", "Variable", "", "000", "")
 	check("SD2NAS_POLL_CARDS", "Variable", "", "false", "advanced")
+	check("SD2NAS_TOKEN", "Variable", "", "", "advanced")
+
+	tok := byTarget["SD2NAS_TOKEN"]
+	if tok.Mask != "true" {
+		t.Errorf("SD2NAS_TOKEN: Mask %q, want true", tok.Mask)
+	}
+	if tok.Name != "Password (SD2NAS_TOKEN)" {
+		t.Errorf("SD2NAS_TOKEN: Name %q", tok.Name)
+	}
+	for _, want := range []string{"sd2nas.cfg", "openssl rand -hex 24"} {
+		if !strings.Contains(tok.Description, want) {
+			t.Errorf("SD2NAS_TOKEN: description %q does not mention %q", tok.Description, want)
+		}
+	}
 }

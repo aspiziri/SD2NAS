@@ -2,8 +2,9 @@
   import { onMount } from 'svelte';
   import { route, navigate } from './lib/router.svelte.js';
   import { match } from './lib/paths.js';
-  import { connectEvents } from './lib/live.svelte.js';
+  import { connectEvents, disconnectEvents } from './lib/live.svelte.js';
   import { getHealth } from './lib/api.js';
+  import { auth, checkAuth } from './lib/auth.svelte.js';
   import Toast from './components/Toast.svelte';
   import Nav from './components/Nav.svelte';
   import HealthBanner from './components/HealthBanner.svelte';
@@ -12,6 +13,8 @@
   import Staging from './pages/Staging.svelte';
   import Folder from './pages/Folder.svelte';
   import Archive from './pages/Archive.svelte';
+  import Settings from './pages/Settings.svelte';
+  import Login from './pages/Login.svelte';
 
   let health = $state(null);
   let healthError = $state('');
@@ -26,6 +29,19 @@
   }
 
   onMount(() => {
+    checkAuth();
+  });
+
+  const locked = $derived(auth.required && !auth.authorized);
+
+  // The live stream and the health poll run only while the app is shown; the
+  // Login screen makes no further requests.
+  $effect(() => {
+    if (!auth.checked) return;
+    if (locked) {
+      disconnectEvents();
+      return;
+    }
     connectEvents();
     refreshHealth();
     const timer = setInterval(refreshHealth, 60_000);
@@ -53,12 +69,18 @@
     m = match('/staging/:id', p);
     if (m) return { tab: 'staging', view: 'folder', id: m.id };
     if (p === '/archive') return { tab: 'archive', view: 'archive' };
+    if (p === '/settings') return { tab: 'settings', view: 'settings' };
     return { tab: '', view: 'not-found' };
   });
 </script>
 
 <svelte:document {onclick} />
 
+{#if !auth.checked}
+  <!-- asking GET /api/auth -->
+{:else if locked}
+  <Login />
+{:else}
 <div class="app">
   <Nav tab={page.tab} version={health?.version ?? ''} />
   <main>
@@ -73,12 +95,15 @@
       {#key page.id}<Folder id={page.id} />{/key}
     {:else if page.view === 'archive'}
       <Archive />
+    {:else if page.view === 'settings'}
+      <Settings />
     {:else}
       <h1>Page not found</h1>
       <p class="sub">Nothing lives at <span class="mono">{route.path}</span>. <a href="/">Go to Card ingest</a></p>
     {/if}
   </main>
 </div>
+{/if}
 <Toast />
 
 <style>

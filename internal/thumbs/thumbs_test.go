@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -545,8 +546,10 @@ func hugePNG(w, h uint32) []byte {
 
 func TestGetRejectsHugeImage(t *testing.T) {
 	c := newCache(t, Config{})
-	for _, d := range [][2]uint32{{20000, 20000}, {2000000000, 2}} {
-		src := Source{shaN(20), writeSource(t, t.TempDir(), "huge.png", hugePNG(d[0], d[1])), media.KindImage}
+	for i, d := range [][2]uint32{{20000, 20000}, {2000000000, 2}} {
+		// One sha per file: the second would otherwise get the first's
+		// remembered failure.
+		src := Source{shaN(20 + i), writeSource(t, t.TempDir(), "huge.png", hugePNG(d[0], d[1])), media.KindImage}
 		start := time.Now()
 		_, err := c.Get(context.Background(), src, ThumbSize)
 		if !errors.Is(err, ErrTooLarge) {
@@ -677,5 +680,185 @@ func TestRemove(t *testing.T) {
 	}
 	if err := c.Remove("xyz"); !errors.Is(err, ErrBadSHA) {
 		t.Errorf("Remove(xyz) = %v, want ErrBadSHA", err)
+	}
+}
+
+// failFirst makes c's render fail with err on its first call and succeed
+// afterwards, and returns the number of calls made so far.
+func failFirst(c *Cache, err error) *atomic.Int32 {
+	var n atomic.Int32
+	c.render = func(ctx context.Context, src Source) (image.Image, error) {
+		if n.Add(1) == 1 {
+			return nil, err
+		}
+		return redBlueImage(10, 10), nil
+	}
+	return &n
+}
+
+func TestFailureRemembered(t *testing.T) {
+	for i, fault := range []error{ErrUndecodable, ErrNoImage, ErrTooLarge} {
+		t.Run(fault.Error(), func(t *testing.T) {
+			c := newCache(t, Config{})
+			n := failFirst(c, fmt.Errorf("decode: %w", fault))
+			src := Source{shaN(200 + i), writeSource(t, t.TempDir(), "a.bin", []byte("x")), media.KindImage}
+			_, err := c.Get(context.Background(), src, ThumbSize)
+			if !errors.Is(err, fault) || errors.Is(err, ErrRemembered) {
+				t.Fatalf("first Get err = %v, want %v and not ErrRemembered", err, fault)
+			}
+			for _, size := range []int{ThumbSize, PreviewSize} {
+				_, err := c.Get(context.Background(), src, size)
+				if !errors.Is(err, ErrRemembered) || !errors.Is(err, fault) {
+					t.Fatalf("size %d: err = %v, want ErrRemembered and %v", size, err, fault)
+				}
+			}
+			if got := n.Load(); got != 1 {
+				t.Fatalf("renders = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestFailureNotRemembered(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"missing tool", &exec.Error{Name: "exiftool", Err: exec.ErrNotFound}},
+		{"missing file", fmt.Errorf("open: %w", fs.ErrNotExist)},
+		{"plain", errors.New("broken")},
+		{"undecodable but cancelled", errors.Join(ErrUndecodable, context.Canceled)},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCache(t, Config{})
+			n := failFirst(c, tc.err)
+			src := Source{shaN(210 + i), writeSource(t, t.TempDir(), "a.bin", []byte("x")), media.KindImage}
+			if _, err := c.Get(context.Background(), src, ThumbSize); err == nil {
+				t.Fatal("first Get succeeded")
+			}
+			if _, err := c.Get(context.Background(), src, ThumbSize); err != nil {
+				t.Fatalf("second Get: %v", err)
+			}
+			if got := n.Load(); got != 2 {
+				t.Fatalf("renders = %d, want 2", got)
+			}
+		})
+	}
+	t.Run("timeout", func(t *testing.T) {
+		c := newCache(t, Config{Timeout: 50 * time.Millisecond})
+		var n atomic.Int32
+		c.render = func(ctx context.Context, src Source) (image.Image, error) {
+			if n.Add(1) == 1 {
+				<-ctx.Done()
+				return nil, fmt.Errorf("exiftool: %w", ctx.Err())
+			}
+			return redBlueImage(10, 10), nil
+		}
+		src := Source{shaN(220), writeSource(t, t.TempDir(), "a.bin", []byte("x")), media.KindImage}
+		if _, err := c.Get(context.Background(), src, ThumbSize); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("first Get err = %v, want DeadlineExceeded", err)
+		}
+		if _, err := c.Get(context.Background(), src, ThumbSize); err != nil {
+			t.Fatalf("second Get: %v", err)
+		}
+		if got := n.Load(); got != 2 {
+			t.Fatalf("renders = %d, want 2", got)
+		}
+	})
+	t.Run("cancelled caller", func(t *testing.T) {
+		c := newCache(t, Config{})
+		started := make(chan struct{})
+		var n atomic.Int32
+		c.render = func(ctx context.Context, src Source) (image.Image, error) {
+			if n.Add(1) == 1 {
+				close(started)
+				<-ctx.Done()
+				// What a decoder interrupted half-way might report.
+				return nil, errors.Join(ErrUndecodable, ctx.Err())
+			}
+			return redBlueImage(10, 10), nil
+		}
+		src := Source{shaN(221), writeSource(t, t.TempDir(), "a.bin", []byte("x")), media.KindImage}
+		ctx, cancel := context.WithCancel(context.Background())
+		getErr := make(chan error, 1)
+		go func() {
+			_, err := c.Get(ctx, src, ThumbSize)
+			getErr <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for the render to start")
+		}
+		cancel()
+		if err := <-getErr; !errors.Is(err, context.Canceled) {
+			t.Fatalf("first Get err = %v, want context.Canceled", err)
+		}
+		c.wg.Wait() // the cancelled render has finished and recorded what it would
+		if _, err := c.Get(context.Background(), src, ThumbSize); err != nil {
+			t.Fatalf("second Get: %v", err)
+		}
+		if got := n.Load(); got != 2 {
+			t.Fatalf("renders = %d, want 2", got)
+		}
+	})
+}
+
+func TestRemoveForgetsFailure(t *testing.T) {
+	c := newCache(t, Config{})
+	n := failFirst(c, ErrUndecodable)
+	src := Source{shaN(230), writeSource(t, t.TempDir(), "a.bin", []byte("x")), media.KindImage}
+	if _, err := c.Get(context.Background(), src, ThumbSize); !errors.Is(err, ErrUndecodable) {
+		t.Fatalf("first Get err = %v, want ErrUndecodable", err)
+	}
+	if _, err := c.Get(context.Background(), src, ThumbSize); !errors.Is(err, ErrRemembered) {
+		t.Fatalf("second Get err = %v, want ErrRemembered", err)
+	}
+	if err := c.Remove(src.SHA256); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Get(context.Background(), src, ThumbSize); err != nil {
+		t.Fatalf("Get after Remove: %v", err)
+	}
+	if got := n.Load(); got != 2 {
+		t.Fatalf("renders = %d, want 2", got)
+	}
+}
+
+func TestFailureCap(t *testing.T) {
+	old := maxFailures
+	maxFailures = 3
+	t.Cleanup(func() { maxFailures = old })
+	c := newCache(t, Config{})
+	var n atomic.Int32
+	c.render = func(context.Context, Source) (image.Image, error) {
+		n.Add(1)
+		return nil, ErrUndecodable
+	}
+	path := writeSource(t, t.TempDir(), "a.bin", []byte("x"))
+	get := func(i int) error {
+		_, err := c.Get(context.Background(), Source{shaN(240 + i), path, media.KindImage}, ThumbSize)
+		return err
+	}
+	for i := range 4 {
+		if err := get(i); !errors.Is(err, ErrUndecodable) || errors.Is(err, ErrRemembered) {
+			t.Fatalf("file %d: err = %v, want a fresh ErrUndecodable", i, err)
+		}
+	}
+	c.mu.Lock()
+	kept := len(c.failed)
+	c.mu.Unlock()
+	if kept != 1 {
+		t.Fatalf("%d failures kept, want 1 (the map is cleared when full)", kept)
+	}
+	if err := get(3); !errors.Is(err, ErrRemembered) {
+		t.Fatalf("file 3: err = %v, want ErrRemembered", err)
+	}
+	if err := get(0); errors.Is(err, ErrRemembered) {
+		t.Fatalf("file 0: err = %v, want a fresh render", err)
+	}
+	if got := n.Load(); got != 5 {
+		t.Fatalf("renders = %d, want 5", got)
 	}
 }

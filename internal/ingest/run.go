@@ -40,9 +40,9 @@ type Runner struct {
 	locks *staging.Locks
 	// Seams, set by NewRunner to the media functions; package tests replace
 	// them to inject failures or block.
-	fingerprint func(path string) (string, error)                          // media.QuickFingerprint
-	hashFile    func(path string) (string, error)                          // media.HashFile
-	copyFile    func(ctx context.Context, src, dst string) (string, error) // media.CopyHashed
+	fingerprint func(path string) (string, error)                                         // media.QuickFingerprint
+	hashFile    func(path string) (string, error)                                         // media.HashFile
+	copyFile    func(ctx context.Context, src, dst string, _ func(int64)) (string, error) // media.CopyHashedProgress
 }
 
 // NewRunner returns a Runner for cfg.
@@ -51,7 +51,7 @@ func NewRunner(cfg Config) *Runner {
 	if locks == nil {
 		locks = staging.NewLocks()
 	}
-	return &Runner{cfg: cfg, locks: locks, fingerprint: media.QuickFingerprint, hashFile: media.HashFile, copyFile: media.CopyHashed}
+	return &Runner{cfg: cfg, locks: locks, fingerprint: media.QuickFingerprint, hashFile: media.HashFile, copyFile: media.CopyHashedProgress}
 }
 
 func (r *Runner) now() time.Time {
@@ -85,8 +85,9 @@ type ingestRun struct {
 	now         time.Time   // r.now(), taken once
 	rules       media.Rules // media.DefaultRules()
 	settings    catalog.Settings
-	stagingRoot string       // filepath.Join(PhotosRoot, StagingDir)
-	log         *slog.Logger // r.log().With("ingest", id, "card", CardName(in))
+	restore     map[string]bool // RestoreRequested, read once: missing assets to copy again
+	stagingRoot string          // filepath.Join(PhotosRoot, StagingDir)
+	log         *slog.Logger    // r.log().With("ingest", id, "card", CardName(in))
 	p           *Progress
 	counts      catalog.Counts
 	exts        []string // distinct extensions of the recorded unsupported files
@@ -156,6 +157,9 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 		return catalog.StatusFailed, "settings: " + err.Error()
 	}
 	j.settings = settings
+	if j.restore, err = j.cat().RestoreRequested(j.dbctx); err != nil {
+		return catalog.StatusFailed, "restore requests: " + err.Error()
+	}
 	scan, err := Scan(j.card, j.rules)
 	j.scanDur = time.Since(start)
 	if err != nil {
@@ -242,8 +246,10 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 		if j.ctx.Err() != nil {
 			return catalog.StatusCancelled, ""
 		}
-		res := j.importOne(f)
+		base := j.p.Snapshot().BytesDone // only this goroutine writes BytesDone while copying
+		res := j.importOne(f, base)
 		if res.canceled {
+			j.p.update(func(s *ProgressSnapshot) { s.Current, s.CurrentSize, s.CurrentDone = "", 0, 0 })
 			return catalog.StatusCancelled, ""
 		}
 		if !res.recorded {
@@ -253,7 +259,11 @@ func (j *ingestRun) pipeline() (catalog.IngestStatus, string) {
 		}
 		j.addOutcome(res.row.Outcome)
 		j.warnings = append(j.warnings, res.warnings...)
-		j.p.update(func(s *ProgressSnapshot) { s.FilesDone++; s.BytesDone += f.Size })
+		j.p.update(func(s *ProgressSnapshot) {
+			s.FilesDone++
+			s.BytesDone = base + f.Size
+			s.Current, s.CurrentSize, s.CurrentDone = "", 0, 0
+		})
 		if res.row.Outcome == catalog.OutcomeFailed {
 			if err := j.cardErr(); err != nil {
 				return catalog.StatusFailed, "card removed during import: " + err.Error()
@@ -354,7 +364,14 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 		c.outcome, c.err = catalog.OutcomeFailed, err
 		return c
 	}
-	known := func(a catalog.Asset) classified {
+	// known gives the outcome of a match with a. mayRestore: a is this
+	// file's content as far as classifying can tell, so a restore request
+	// for it makes the file new (importOne checks the copy's hash).
+	known := func(a catalog.Asset, mayRestore bool) classified {
+		if mayRestore && a.State == catalog.StateMissing && j.restore[a.SHA256] {
+			c.outcome = catalog.OutcomeNew
+			return c
+		}
 		o, err := knownOutcome(a.State)
 		if err != nil {
 			return fail(err)
@@ -389,7 +406,7 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 				best, bestRank = a, rank
 			}
 		}
-		return known(best)
+		return known(best, true)
 	}
 	h, err := r.hashFile(f.Path)
 	if err != nil {
@@ -397,7 +414,7 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 	}
 	for _, a := range matches {
 		if a.SHA256 == h {
-			return known(a)
+			return known(a, true)
 		}
 	}
 	a, err := j.cat().AssetBySHA(j.dbctx, h)
@@ -406,7 +423,7 @@ func (j *ingestRun) classifyOne(f CardFile) classified {
 		if err := j.cat().AddFingerprint(j.dbctx, fp, a.SHA256); err != nil {
 			return fail(fmt.Errorf("catalog update: %w", err))
 		}
-		return known(a)
+		return known(a, a.SHA256 == h) // not through an alias: older content is not the asset's
 	case errors.Is(err, catalog.ErrNotFound):
 		c.outcome = catalog.OutcomeNew
 		return c
@@ -489,7 +506,13 @@ func (j *ingestRun) folderFor(date string) (catalog.StagingFolder, error) {
 		if _, ok := j.held[f.ID]; ok {
 			return f, nil
 		}
-		release, err := j.r.locks.Lock(j.ctx, staging.HolderIngest, f.ID)
+		release, err := j.r.locks.TryLock(staging.HolderIngest, f.ID)
+		var busy *staging.BusyError
+		if errors.As(err, &busy) {
+			j.p.update(func(s *ProgressSnapshot) { s.WaitingFolder, s.WaitingHolder = f.Name, string(busy.Holder) })
+			release, err = j.r.locks.Lock(j.ctx, staging.HolderIngest, f.ID)
+			j.p.update(func(s *ProgressSnapshot) { s.WaitingFolder, s.WaitingHolder = "", "" })
+		}
 		if err != nil {
 			return catalog.StagingFolder{}, err
 		}
@@ -508,7 +531,9 @@ func (j *ingestRun) releaseFolders() {
 	}
 }
 
-func (j *ingestRun) importOne(f newFile) fileResult {
+// importOne imports one new file. base is the progress' BytesDone before it:
+// the file's copy reports base plus its own bytes.
+func (j *ingestRun) importOne(f newFile, base int64) fileResult {
 	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
 	start := time.Now()
 	c, meta, err := captureOf(f.Path, f.Kind) // meta is nil unless f is a video whose metadata was read
@@ -534,8 +559,15 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 		return fail(err)
 	}
 	name := media.DestFileName(c.Time, f.Kind, meta, filepath.Ext(f.Path))
+	j.p.update(func(s *ProgressSnapshot) { s.Current, s.CurrentSize, s.CurrentDone = f.Rel, f.Size, 0 })
+	progress := func(done int64) {
+		j.p.update(func(s *ProgressSnapshot) {
+			s.CurrentDone = min(done, f.Size)
+			s.BytesDone = base + s.CurrentDone
+		})
+	}
 	start = time.Now()
-	dst, sum, dup, err := j.copyNew(f, dir, name)
+	dst, sum, dup, err := j.copyNew(f, dir, name, progress)
 	j.copyDur += time.Since(start)
 	if err != nil {
 		if media.ClassifyCopyError(err, f.Path, dst) == media.CopyFailCanceled {
@@ -557,9 +589,13 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 		return fail(fmt.Errorf("copied to %s but could not sync its folder: %w", rel, err))
 	}
 	existing, err := j.cat().AssetBySHA(j.dbctx, sum)
+	restore := false
 	switch {
 	case err == nil:
-		return j.dropCopy(f, dst, rel, existing) // fingerprint collision or alias (§6)
+		if existing.State != catalog.StateMissing || !j.restore[sum] {
+			return j.dropCopy(f, dst, rel, existing) // fingerprint collision or alias (§6)
+		}
+		restore = true // a copy of content missing from the archive, asked for again
 	case !errors.Is(err, catalog.ErrNotFound):
 		return fail(fmt.Errorf("copied to %s but the catalog lookup failed: %w", rel, err))
 	}
@@ -573,14 +609,44 @@ func (j *ingestRun) importOne(f newFile) fileResult {
 	if f.Kind == media.KindVideo && meta == nil {
 		row.Error = "named without video metadata: " + c.Fallback.Error() // imported, but not silently (Decision 25)
 	}
+	if restore {
+		return j.restoreMissing(f, dst, c, a, row)
+	}
 	if err := j.cat().RecordNew(j.dbctx, j.id, a, f.fp, row); err != nil {
 		return fail(fmt.Errorf("copied to %s but not recorded: %w", a.RelPath, err))
 	}
+	return j.recordedNew(f, c, row)
+}
+
+// recordedNew is the result of a new file whose row is written, with the
+// clock warnings for its capture time c.
+func (j *ingestRun) recordedNew(f newFile, c media.Capture, row catalog.IngestFile) fileResult {
 	ws := CheckClock(c, j.now)
 	for i := range ws {
-		ws[i].CardPath, ws[i].SHA256 = f.Rel, sum
+		ws[i].CardPath, ws[i].SHA256 = f.Rel, row.SHA256
 	}
 	return fileResult{row: row, recorded: true, warnings: ws}
+}
+
+// restoreMissing records the copy at dst as the content of missing asset
+// a.SHA256 again, staged as a (row: its new file row), honouring a restore
+// request. If the asset is no longer missing (the indexer found the
+// archive copy meanwhile), the copy is a duplicate and goes.
+func (j *ingestRun) restoreMissing(f newFile, dst string, c media.Capture, a catalog.Asset, row catalog.IngestFile) fileResult {
+	fail := func(err error) fileResult { return fileResult{row: failedRow(f, err)} }
+	err := j.cat().RestoreMissing(j.dbctx, j.id, a, f.fp, row)
+	switch {
+	case err == nil:
+		j.log.Info("imported again a file missing from the archive", "file", f.Rel, "path", a.RelPath)
+		return j.recordedNew(f, c, row)
+	case errors.Is(err, catalog.ErrWrongState):
+		current, err := j.cat().AssetBySHA(j.dbctx, a.SHA256)
+		if err != nil {
+			return fail(fmt.Errorf("copied to %s but the catalog lookup failed: %w", a.RelPath, err))
+		}
+		return j.dropCopy(f, dst, a.RelPath, current)
+	}
+	return fail(fmt.Errorf("copied to %s but not recorded: %w", a.RelPath, err))
 }
 
 func failedRow(f newFile, err error) catalog.IngestFile {
@@ -602,15 +668,17 @@ func (j *ingestRun) rel(dst string) (string, error) {
 
 // copyNew picks a free name in dir and copies f there, retrying the
 // failures a retry can fix (Decision 13). dup reports identical content
-// already at dst, so nothing was copied.
-func (j *ingestRun) copyNew(f newFile, dir, name string) (dst, sum string, dup bool, err error) {
+// already at dst, so nothing was copied. progress reports the bytes copied
+// so far; each attempt starts again from 0.
+func (j *ingestRun) copyNew(f newFile, dir, name string, progress func(int64)) (dst, sum string, dup bool, err error) {
 	const attempts = 3
 	for range attempts {
 		dst, dup, err = media.FreeName(f.Path, dir, name)
 		if err != nil || dup {
 			return dst, "", dup, err
 		}
-		sum, err = j.r.copyFile(j.ctx, f.Path, dst)
+		progress(0)
+		sum, err = j.r.copyFile(j.ctx, f.Path, dst, progress)
 		if err == nil {
 			return dst, sum, false, nil
 		}

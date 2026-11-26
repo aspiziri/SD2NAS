@@ -18,8 +18,12 @@
   </a>
   <a href="/archive" class="tab" class:active={tab === 'archive'} aria-current={tab === 'archive' ? 'page' : undefined}>
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="4" rx="1" /><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" /><path d="M10 12h4" /></svg>
-    <span class="label">Archive index</span>
+    <span class="label">Archive<span class="only-desktop"> index</span></span>
     {#if live.indexer.changed}<span class="pill warn">{live.indexer.changed}</span>{/if}
+  </a>
+  <a href="/settings" class="tab" class:active={tab === 'settings'} aria-current={tab === 'settings' ? 'page' : undefined}>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1" /></svg>
+    <span class="label">Settings</span>
   </a>
   <div class="foot">
     {live.connected ? 'Live updates on' : 'Reconnecting…'}
@@ -41,8 +45,9 @@
   @media (max-width: 760px) {
     .nav { position: fixed; top: auto; left: 0; right: 0; bottom: 0; height: auto; z-index: 10; flex-direction: row; justify-content: space-around; gap: 0; padding: 6px calc(8px + env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom)) calc(8px + env(safe-area-inset-left)); border-right: 0; border-top: 1px solid var(--line); }
     .brand, .foot { display: none; }
-    .tab { flex: 1; max-width: 160px; flex-direction: column; justify-content: center; gap: 2px; padding: 6px 4px; min-height: 52px; font-size: 11px; position: relative; }
-    .label { flex: none; }
+    .nav { width: auto; max-width: 100vw; overflow: hidden; }
+    .tab { flex: 1 1 0; min-width: 0; max-width: 160px; flex-direction: column; justify-content: center; gap: 2px; padding: 6px 4px; min-height: 52px; font-size: 11px; position: relative; }
+    .label { flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .tab.active { background: none; color: var(--accent); }
     .pill { position: absolute; top: 2px; left: calc(50% + 8px); }
   }

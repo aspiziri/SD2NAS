@@ -259,6 +259,50 @@ func (d *DB) MoveAsset(ctx context.Context, sha, relPath string, at time.Time) e
 	return d.changeAsset(ctx, "move", sha, onlyStaged, "rel_path = ?, updated_at = ?", relPath, formatTime(at))
 }
 
+// ShiftAsset records that staged asset sha now has capture time capture (a
+// wall clock, CaptureLayout) and lives at relPath, and deletes its clock
+// warnings (M7 Decision 22), in one transaction. An asset in another state
+// is a *WrongStateError (ErrWrongState); an unknown hash ErrNotFound.
+func (d *DB) ShiftAsset(ctx context.Context, sha, relPath string, capture, at time.Time) error {
+	b, err := hexToBlob(sha)
+	if err != nil {
+		return err
+	}
+	var c any
+	if !capture.IsZero() {
+		c = capture.Format(CaptureLayout)
+	}
+	err = d.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, "UPDATE assets SET capture_time = ?, rel_path = ?, updated_at = ? WHERE sha256 = ? AND state = 'staged'",
+			c, relPath, formatTime(at), b)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			var state string
+			err := tx.QueryRowContext(ctx, "SELECT state FROM assets WHERE sha256 = ?", b).Scan(&state)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			if err != nil {
+				return err
+			}
+			return &WrongStateError{Verb: "shift", SHA256: sha, State: AssetState(state)}
+		}
+		_, err = tx.ExecContext(ctx, "DELETE FROM clock_warnings WHERE sha256 = ?", b)
+		return err
+	})
+	var ws *WrongStateError
+	if err != nil && !errors.As(err, &ws) {
+		return fmt.Errorf("shift %s: %w", sha, err)
+	}
+	return err
+}
+
 // CullAsset records that staged asset sha was deleted on purpose (§6
 // "Culled stays remembered"): state culled, no path; fingerprints stay.
 func (d *DB) CullAsset(ctx context.Context, sha string, at time.Time) error {

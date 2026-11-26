@@ -6,7 +6,10 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/aspiziri/SD2NAS/internal/catalog"
 )
 
 func getSettings(t *testing.T, f fullServer) map[string]string {
@@ -25,8 +28,8 @@ func getSettings(t *testing.T, f fullServer) map[string]string {
 func TestSettingsAPI(t *testing.T) {
 	f := newFullServer(t)
 	set := getSettings(t, f)
-	if len(set) != 7 {
-		t.Errorf("want 7 settings, got %v", set)
+	if len(set) != len(catalog.SettingKeys()) {
+		t.Errorf("want %d settings, got %v", len(catalog.SettingKeys()), set)
 	}
 	if set["archive_rescan_at"] != "03:00" || set["archive_skip"] != "Output/, CaptureOne/, *.cosessiondb" {
 		t.Errorf("defaults: %v", set)
@@ -46,7 +49,7 @@ func TestSettingsAPI(t *testing.T) {
 		Settings map[string]string `json:"settings"`
 	}
 	decodeInto(t, rec, &put)
-	if put.Settings["archive_rescan_at"] != "04:45" || len(put.Settings) != 7 {
+	if put.Settings["archive_rescan_at"] != "04:45" || len(put.Settings) != len(catalog.SettingKeys()) {
 		t.Errorf("PUT body %s", rec.Body)
 	}
 	if got := getSettings(t, f)["archive_rescan_at"]; got != "04:45" {
@@ -105,5 +108,54 @@ func TestSettingsAPIErrors(t *testing.T) {
 		if after[k] != v {
 			t.Errorf("%s changed from %q to %q after rejected PUTs", k, v, after[k])
 		}
+	}
+}
+
+func TestSettingsGetDefaults(t *testing.T) {
+	f := newFullServer(t)
+	rec := send(t, f.s, http.MethodGet, "/api/settings", "")
+	var body struct {
+		Defaults map[string]string `json:"defaults"`
+	}
+	decodeInto(t, rec, &body)
+	if len(body.Defaults) != len(catalog.SettingKeys()) {
+		t.Errorf("defaults has %d keys: %v", len(body.Defaults), body.Defaults)
+	}
+	if want := filepath.Join(f.photos, "Management", "SD2NAS"); body.Defaults["backup_dir"] != want {
+		t.Errorf("defaults.backup_dir = %q, want %q", body.Defaults["backup_dir"], want)
+	}
+	if body.Defaults["staging_notice_at"] != "09:00" {
+		t.Errorf("defaults.staging_notice_at = %q", body.Defaults["staging_notice_at"])
+	}
+}
+
+func TestSettingsPutNoticeAt(t *testing.T) {
+	f := newFullServer(t)
+	rec := send(t, f.s, http.MethodPut, "/api/settings", `{"staging_notice_at":"18:30"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put: %d %s", rec.Code, rec.Body)
+	}
+	if got := getSettings(t, f)["staging_notice_at"]; got != "18:30" {
+		t.Errorf("staging_notice_at = %q", got)
+	}
+	e := wantCode(t, send(t, f.s, http.MethodPut, "/api/settings", `{"staging_notice_at":"25:00"}`), http.StatusBadRequest, "")
+	if want := "Setting staging_notice_at: want HH:MM, 00:00 to 23:59."; e.Error != want {
+		t.Errorf("error %q, want %q", e.Error, want)
+	}
+}
+
+func TestSettingsHooks(t *testing.T) {
+	f := newFullServer(t)
+	var n atomic.Int32
+	f.s.onSettingsChanged(func() { n.Add(1) }) // after MountSettings: hooks are read per request
+	if rec := send(t, f.s, http.MethodPut, "/api/settings", `{"staging_notice_at":"10:00"}`); rec.Code != http.StatusOK {
+		t.Fatalf("put: %d %s", rec.Code, rec.Body)
+	}
+	if got := n.Load(); got != 1 {
+		t.Errorf("hook ran %d times after a 200, want 1", got)
+	}
+	wantCode(t, send(t, f.s, http.MethodPut, "/api/settings", `{"staging_notice_at":"25:00"}`), http.StatusBadRequest, "")
+	if got := n.Load(); got != 1 {
+		t.Errorf("hook ran %d times after a 400, want 1", got)
 	}
 }

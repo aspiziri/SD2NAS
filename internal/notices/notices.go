@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/catalog"
@@ -22,9 +23,8 @@ import (
 )
 
 const (
-	CheckEvery     = 30 * time.Second
-	StagingCheckAt = 9 * time.Hour  // container local time (Decision 4)
-	MaxAge         = 24 * time.Hour // older archive events are not notified (Decision 7)
+	CheckEvery = 30 * time.Second
+	MaxAge     = 24 * time.Hour // older archive events are not notified (Decision 7)
 )
 
 // ErrClosed is what Pending and Take return once the service has been closed.
@@ -63,6 +63,18 @@ type Service struct {
 	stagingDay   string               // the local day whose stale-staging check is done
 	stagingRetry time.Time            // no stale-staging check before this
 	adds         int                  // add calls, for tests
+
+	nudge  chan struct{} // cap 1; SettingsChanged sends without blocking
+	reread atomic.Bool   // set by SettingsChanged (any goroutine)
+	at     time.Duration // staging_notice_at; -1 until read
+
+	missingSeen  int       // Status.Missing at the last missing check; -1 before the first
+	lastFinished time.Time // Status.Last.FinishedAt at that check
+	watermark    time.Time // rows marked missing at or before it are notified or too old
+
+	// test-only counters, like adds
+	settingsReads  int // DB.Settings calls made by noticeAt
+	missingQueries int // MissingSince calls made by checkMissing
 }
 
 // New returns a stopped service. Its only error is a nil DB.
@@ -70,7 +82,8 @@ func New(cfg Config) (*Service, error) {
 	if cfg.DB == nil {
 		return nil, errors.New("notices: no catalog")
 	}
-	s := &Service{cfg: cfg, log: cfg.Log, now: cfg.Now, every: cfg.Every, known: map[string]time.Time{}}
+	s := &Service{cfg: cfg, log: cfg.Log, now: cfg.Now, every: cfg.Every, known: map[string]time.Time{},
+		at: -1, missingSeen: -1, nudge: make(chan struct{}, 1)}
 	if s.log == nil {
 		s.log = slog.Default()
 	}
@@ -84,8 +97,8 @@ func New(cfg Config) (*Service, error) {
 	return s, nil
 }
 
-// Start checks now and then every Every. It does nothing after Close or a
-// second call.
+// Start checks now and then every Every (and at once after
+// SettingsChanged). It does nothing after Close or a second call.
 func (s *Service) Start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -107,8 +120,47 @@ func (s *Service) loop() {
 		case <-s.ctx.Done():
 			return
 		case <-t.C:
+		case <-s.nudge:
 		}
 	}
+}
+
+// SettingsChanged makes the loop re-read staging_notice_at and check now.
+// It never blocks (PUT /api/settings calls it).
+func (s *Service) SettingsChanged() {
+	s.reread.Store(true)
+	select {
+	case s.nudge <- struct{}{}:
+	default:
+	}
+}
+
+// noticeAt returns staging_notice_at, read once and again after
+// SettingsChanged or a failed read. A failed read logs and keeps the last
+// value (the default before any read succeeded).
+func (s *Service) noticeAt(ctx context.Context) time.Duration {
+	if s.at >= 0 && !s.reread.Swap(false) {
+		return s.at
+	}
+	s.settingsReads++
+	set, err := s.cfg.DB.Settings(ctx)
+	if err != nil {
+		s.reread.Store(true) // try again at the next check
+		if s.at < 0 {
+			s.at = catalog.DefaultSettings().StagingNoticeAt
+		}
+		if ctx.Err() == nil { // not shutting down
+			s.log.Error("could not read staging_notice_at; using the last value", "at", hhmm(s.at), "err", err)
+		}
+		return s.at
+	}
+	s.at = set.StagingNoticeAt
+	return s.at
+}
+
+// hhmm formats a time since midnight as HH:MM, as Settings.Strings does.
+func hhmm(d time.Duration) string {
+	return fmt.Sprintf("%02d:%02d", int(d/time.Hour), int(d%time.Hour/time.Minute))
 }
 
 // Close stops the loop and waits for it and for any Pending or Take. It is
@@ -171,9 +223,55 @@ func (s *Service) checkArchive(ctx context.Context) {
 		s.addOnce(ctx, "backup:"+b.At.UTC().Format(time.RFC3339Nano), b.At, catalog.NoticeAlert,
 			"Nightly catalog backup failed: "+strings.TrimRight(b.Error, ". ")+". Older backups were kept.")
 	}
-	if l := st.Last; l != nil && l.Missing > 0 && fresh(now, l.FinishedAt) {
-		s.addOnce(ctx, "missing:"+l.FinishedAt.UTC().Format(time.RFC3339Nano), l.FinishedAt, catalog.NoticeAlert, missingText(l.Missing))
+	s.checkMissing(ctx, st, now)
+}
+
+// checkMissing notices the files marked missing since the watermark: the
+// newest row of the last missing notice (so a restart repeats nothing), or
+// MaxAge ago if that is later. It counts rows, not Status.Last.Missing, so
+// two passes before one check, or a pass that crashed, are counted too. It
+// queries only when the indexer's missing count or last pass changed.
+func (s *Service) checkMissing(ctx context.Context, st indexer.Status, now time.Time) {
+	if st.Running != nil {
+		return // a pass may still be marking rows
 	}
+	var finished time.Time
+	if st.Last != nil {
+		finished = st.Last.FinishedAt
+	}
+	if !s.watermark.IsZero() && st.Missing == s.missingSeen && finished.Equal(s.lastFinished) {
+		return
+	}
+	if s.watermark.IsZero() {
+		w, err := s.cfg.DB.LatestNotificationTime(ctx, "missing:")
+		if err != nil {
+			if ctx.Err() == nil { // not shutting down
+				s.log.Error("could not read the last missing-files notice", "err", err)
+			}
+			return
+		}
+		s.watermark = w
+	}
+	// Before every query, not only the first: a pass that ran longer than
+	// MaxAge may have marked rows that are too old to notify by now.
+	if floor := now.Add(-MaxAge); s.watermark.Before(floor) {
+		s.watermark = floor
+	}
+	s.missingQueries++
+	n, latest, err := s.cfg.DB.MissingSince(ctx, s.watermark)
+	if err != nil {
+		if ctx.Err() == nil { // not shutting down
+			s.log.Error("could not count files marked missing", "err", err)
+		}
+		return
+	}
+	if n > 0 {
+		if err := s.add(ctx, "missing:"+latest.UTC().Format(time.RFC3339Nano), catalog.NoticeAlert, missingText(n)); err != nil {
+			return // add logged it; the next check retries
+		}
+		s.watermark = latest
+	}
+	s.missingSeen, s.lastFinished = st.Missing, finished
 }
 
 // addOnce adds a notice unless this service already stored or found its
@@ -213,9 +311,13 @@ func (s *Service) checkStaging(ctx context.Context) {
 	}
 	now := s.now() // time.Now is in time.Local, the container's TZ
 	day := now.Format("2006-01-02")
+	if day == s.stagingDay {
+		return
+	}
+	at := s.noticeAt(ctx)
 	y, m, d := now.Date()
-	due := time.Date(y, m, d, int(StagingCheckAt/time.Hour), int(StagingCheckAt%time.Hour/time.Minute), 0, 0, now.Location())
-	if day == s.stagingDay || now.Before(due) || now.Before(s.stagingRetry) {
+	due := time.Date(y, m, d, int(at/time.Hour), int(at%time.Hour/time.Minute), 0, 0, now.Location())
+	if now.Before(due) || now.Before(s.stagingRetry) {
 		return
 	}
 	if s.cfg.StagingReady != nil && !s.cfg.StagingReady() {

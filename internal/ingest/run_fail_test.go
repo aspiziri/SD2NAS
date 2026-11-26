@@ -85,7 +85,7 @@ func TestRunZeroByteFileFails(t *testing.T) {
 func TestRunCopyFailureLeavesNothing(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		if strings.HasSuffix(src, ".ARW") {
 			return "", errors.New("I/O error")
 		}
@@ -96,7 +96,7 @@ func TestRunCopyFailureLeavesNothing(t *testing.T) {
 	wantStaged(t, e, sonyJPEG)
 	wantNoPartials(t, e)
 
-	e.r.copyFile = media.CopyHashed
+	e.r.copyFile = media.CopyHashedProgress
 	out = e.run(t, card)
 	wantDone(t, out, catalog.Counts{Seen: 2, New: 1, InStaging: 1}, true)
 	wantStaged(t, e, sonyJPEG, sonyARW)
@@ -111,7 +111,7 @@ func TestRunCardRemovedMidCopy(t *testing.T) {
 			t.Errorf("copyFile calls = %d, want 2 (a missing source must not be retried)", calls)
 		}
 	}()
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		calls++
 		if calls == 2 {
 			if err := os.RemoveAll(card); err != nil {
@@ -139,7 +139,7 @@ func TestRunCancelledMidCopy(t *testing.T) {
 	card := e.fixtureCard(t, "SONY_A7IV")
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	e.r.copyFile = func(_ context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(_ context.Context, src, dst string, _ func(int64)) (string, error) {
 		cancel()
 		return media.CopyHashed(ctx, src, dst)
 	}
@@ -162,7 +162,7 @@ func TestRunCancelledBeforeCopy(t *testing.T) {
 	card := e.fixtureCard(t, "SONY_A7IV")
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	e.r.copyFile = func(context.Context, string, string) (string, error) {
+	e.r.copyFile = func(context.Context, string, string, func(int64)) (string, error) {
 		t.Error("copyFile called")
 		return "", errors.New("unexpected")
 	}
@@ -177,7 +177,7 @@ func TestRunRetriesTakenName(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
 	first := true
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		if first {
 			first = false
 			if err := os.WriteFile(dst, []byte("someone else"), 0o666); err != nil {
@@ -203,7 +203,7 @@ func TestRunRetriesStalePartial(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
 	first := true
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		if first {
 			first = false
 			if err := os.WriteFile(dst+media.PartialSuffix, []byte("junk"), 0o666); err != nil {
@@ -221,7 +221,7 @@ func TestRunRetriesMissingDestDir(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
 	first := true
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		if first {
 			first = false
 			if err := os.RemoveAll(filepath.Dir(dst)); err != nil {
@@ -239,7 +239,7 @@ func TestRunGivesUpAfterThreeAttempts(t *testing.T) {
 	e := newEnv(t)
 	card := e.fixtureCard(t, "SONY_A7IV")
 	arwCalls := 0
-	e.r.copyFile = func(ctx context.Context, src, dst string) (string, error) {
+	e.r.copyFile = func(ctx context.Context, src, dst string, _ func(int64)) (string, error) {
 		if strings.HasSuffix(src, ".ARW") {
 			arwCalls++
 			if err := os.WriteFile(dst, []byte("someone else"), 0o666); err != nil {
@@ -308,7 +308,7 @@ func TestRunLogsCancelledCopyError(t *testing.T) {
 	card := e.fixtureCard(t, "SONY_A7IV")
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	e.r.copyFile = func(context.Context, string, string) (string, error) {
+	e.r.copyFile = func(context.Context, string, string, func(int64)) (string, error) {
 		cancel()
 		return "", errors.Join(context.Canceled, errors.New("remove partial: boom"))
 	}

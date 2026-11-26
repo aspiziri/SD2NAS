@@ -45,7 +45,15 @@ var (
 	// corrupt, truncated or in an unsupported form. It is a property of the
 	// file, not a fault of the server.
 	ErrUndecodable = errors.New("thumbs: the file could not be decoded")
+	// ErrRemembered wraps the error of an earlier render of the same file
+	// (ErrUndecodable, ErrTooLarge or ErrNoImage), returned without trying
+	// again until Remove forgets it.
+	ErrRemembered = errors.New("thumbs: an earlier render of this file failed")
 )
+
+// maxFailures caps the remembered failures; the map is cleared when full.
+// It is a var so a test can lower it.
+var maxFailures = 10000
 
 // maxPixels caps the pixels of any image decoded in Go (120 megapixels).
 const maxPixels = 120_000_000
@@ -84,8 +92,10 @@ type Cache struct {
 	wg     sync.WaitGroup // running renders
 	mu     sync.Mutex
 	calls  map[string]*call // by destination path
+	failed map[string]error // by sha: renders that failed for a reason of the file
 	closed bool
 	render func(ctx context.Context, src Source) (image.Image, error) // renderSource; tests replace it
+	exif   *exifServer                                                // RAW previews; its process starts on first use
 }
 
 // New creates the cache directory and removes unfinished files a crash
@@ -120,8 +130,9 @@ func New(cfg Config) (*Cache, error) {
 		return nil, fmt.Errorf("thumbnail cache: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Cache{cfg: cfg, sem: make(chan struct{}, cfg.Workers), ctx: ctx, cancel: cancel, calls: map[string]*call{}}
+	c := &Cache{cfg: cfg, sem: make(chan struct{}, cfg.Workers), ctx: ctx, cancel: cancel, calls: map[string]*call{}, failed: map[string]error{}}
 	c.render = c.renderSource
+	c.exif = newExifServer(cfg.Exiftool, cfg.Log)
 	return c, nil
 }
 
@@ -165,12 +176,16 @@ func (c *Cache) path(sha string, size int) string {
 }
 
 // Remove deletes sha's cached thumbnail and preview (a culled or forgotten
-// file, Decision 12). A render still running for sha may write its file
-// afterwards; that one stays until the cache is cleared.
+// file, Decision 12) and forgets a failed render of it. A render still
+// running for sha may write its file afterwards; that one stays until the
+// cache is cleared.
 func (c *Cache) Remove(sha string) error {
 	if !ValidSHA(sha) {
 		return ErrBadSHA
 	}
+	c.mu.Lock()
+	delete(c.failed, sha)
+	c.mu.Unlock()
 	var errs []error
 	for _, size := range []int{ThumbSize, PreviewSize} {
 		if err := os.Remove(c.path(sha, size)); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -183,7 +198,11 @@ func (c *Cache) Remove(sha string) error {
 // Get returns the path of src's cached JPEG at size, rendering it first
 // when needed. Concurrent calls for the same file and size share one
 // render, which is cancelled only once every caller has gone. At most
-// Workers renders run at once.
+// Workers renders run at once. A render that failed for a reason of the
+// file is remembered by sha, for both sizes: later calls return its error
+// wrapped in ErrRemembered until Remove(sha). A render that failed because
+// the file moved away meanwhile is answered as fs.ErrNotExist instead, and
+// not remembered.
 func (c *Cache) Get(ctx context.Context, src Source, size int) (string, error) {
 	if !ValidSHA(src.SHA256) {
 		return "", fmt.Errorf("%w: %q", ErrBadSHA, src.SHA256)
@@ -202,6 +221,10 @@ func (c *Cache) Get(ctx context.Context, src Source, size int) (string, error) {
 	if c.closed {
 		c.mu.Unlock()
 		return "", ErrClosed
+	}
+	if err := c.failed[src.SHA256]; err != nil {
+		c.mu.Unlock()
+		return "", fmt.Errorf("%w: %w", ErrRemembered, err)
 	}
 	cl := c.calls[dst]
 	if cl == nil {
@@ -246,9 +269,25 @@ func (c *Cache) run(ctx context.Context, cl *call, src Source, size int, dst str
 	if c.calls[dst] == cl {
 		delete(c.calls, dst)
 	}
+	if fileFault(err) {
+		if len(c.failed) >= maxFailures {
+			clear(c.failed)
+		}
+		c.failed[src.SHA256] = err
+	}
 	c.mu.Unlock()
 	cl.err = err
 	close(cl.done)
+}
+
+// fileFault reports whether err is a property of the file, which another
+// render would only repeat: ErrUndecodable, ErrTooLarge or ErrNoImage, and
+// not cut short by a timeout or a cancel.
+func fileFault(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(err, ErrUndecodable) || errors.Is(err, ErrTooLarge) || errors.Is(err, ErrNoImage)
 }
 
 // generateRecovered runs generate and turns a panic into an error, so that a
@@ -266,7 +305,8 @@ func (c *Cache) generateRecovered(ctx context.Context, src Source, size int, dst
 }
 
 func (c *Cache) generate(ctx context.Context, src Source, size int, dst string) error {
-	if _, err := os.Stat(src.Path); err != nil {
+	before, err := os.Stat(src.Path)
+	if err != nil {
 		return err // fs.ErrNotExist reaches the caller as is
 	}
 	select {
@@ -279,12 +319,37 @@ func (c *Cache) generate(ctx context.Context, src Source, size int, dst string) 
 	defer cancel()
 	img, err := c.render(ctx, src)
 	if err != nil {
-		return fmt.Errorf("%s: %w", src.Path, err)
+		err = fmt.Errorf("%s: %w", src.Path, err)
+		if fileFault(err) {
+			// Shift, Move or Promote may have renamed the file while the
+			// render waited for a slot, so that the tool failed on a path
+			// that is gone. That is no fault of the file: answer as a
+			// missing file, which run doesn't remember.
+			if moveErr := moved(src.Path, before); moveErr != nil {
+				return moveErr
+			}
+		}
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err // cancelled or timed out while decoding in Go
 	}
 	return writeJPEG(dst, imaging.Fit(img, size, size, imaging.Lanczos), quality(size))
+}
+
+// moved returns nil while path still names the file that was there
+// (before). Otherwise it returns an error that wraps fs.ErrNotExist when
+// the file is gone or another file has taken its place, or the error of
+// a stat that failed for another reason.
+func moved(path string, before fs.FileInfo) error {
+	now, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(before, now) || now.Size() != before.Size() || !now.ModTime().Equal(before.ModTime()) {
+		return fmt.Errorf("%s: %w (another file took its place while its thumbnail was rendering)", path, fs.ErrNotExist)
+	}
+	return nil
 }
 
 func quality(size int) int {
@@ -376,12 +441,13 @@ func checkPixels(r io.ReadSeeker) error {
 	return err
 }
 
-// Close cancels running renders, waits for them, and makes later Gets fail
-// with ErrClosed.
+// Close cancels running renders, waits for them, stops exiftool (at most
+// 1 s, then it is killed), and makes later Gets fail with ErrClosed.
 func (c *Cache) Close() {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
 	c.cancel()
 	c.wg.Wait()
+	c.exif.close()
 }

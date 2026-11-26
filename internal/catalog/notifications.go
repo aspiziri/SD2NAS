@@ -112,6 +112,28 @@ func (d *DB) HasNotification(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
+// LatestNotificationTime returns the time in the key of the newest (highest
+// id) notification whose key starts with prefix, the rest of the key read
+// as RFC 3339; zero when there is none. A key whose rest is no time is an
+// error naming the key.
+func (d *DB) LatestNotificationTime(ctx context.Context, prefix string) (time.Time, error) {
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+	var key string
+	err := d.db.QueryRowContext(ctx, `SELECT key FROM notifications WHERE key LIKE ? ESCAPE '\' ORDER BY id DESC LIMIT 1`,
+		esc+"%").Scan(&key)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("latest notification %q: %w", prefix, err)
+	}
+	t, err := time.Parse(time.RFC3339Nano, strings.TrimPrefix(key, prefix))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("latest notification %q: %w", key, err)
+	}
+	return t, nil
+}
+
 // PendingNotifications: not taken yet, oldest (lowest id) first, at most MaxTake. Never nil.
 func (d *DB) PendingNotifications(ctx context.Context) ([]Notification, error) {
 	out := []Notification{}

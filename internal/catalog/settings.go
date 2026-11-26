@@ -34,6 +34,7 @@ const (
 	KeyArchiveRescanAt    = "archive_rescan_at"
 	KeyBackupDir          = "backup_dir"
 	KeyArchiveSkip        = "archive_skip"
+	KeyStagingNoticeAt    = "staging_notice_at"
 )
 
 // DefaultArchiveSkip is the archive indexer's default skip list, as the
@@ -50,7 +51,7 @@ func (e *SettingError) Error() string {
 // settingKeys is every known key, in the order Settings and Strings use.
 var settingKeys = []string{
 	KeyDayStartsAt, KeyVerifyKnown, KeyFreeSpaceReserveGB, KeyStagingWarnDays,
-	KeyArchiveRescanAt, KeyBackupDir, KeyArchiveSkip,
+	KeyArchiveRescanAt, KeyBackupDir, KeyArchiveSkip, KeyStagingNoticeAt,
 }
 
 // SettingKeys returns every known setting key, in a fixed order.
@@ -65,12 +66,13 @@ type Settings struct {
 	ArchiveRescanAt time.Duration // nightly archive pass, since local midnight
 	BackupDir       string        // "" = <photos>/Management/SD2NAS (the indexer resolves it)
 	ArchiveSkip     string        // canonical archive_skip text
+	StagingNoticeAt time.Duration // daily stale-staging check, since local midnight
 }
 
 // DefaultSettings returns the values used when a key is unset.
 func DefaultSettings() Settings {
 	return Settings{DayStartsAt: 4 * time.Hour, VerifyKnown: VerifyQuick, ReserveBytes: 50_000_000_000, StagingWarnDays: 30,
-		ArchiveRescanAt: 3 * time.Hour, ArchiveSkip: DefaultArchiveSkip}
+		ArchiveRescanAt: 3 * time.Hour, ArchiveSkip: DefaultArchiveSkip, StagingNoticeAt: 9 * time.Hour}
 }
 
 var dayStartRE = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9]$`)
@@ -84,6 +86,8 @@ func parseClock(value string) (time.Duration, bool) {
 	m, _ := strconv.Atoi(value[3:])
 	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute, true
 }
+
+const clockReason = "want HH:MM, 00:00 to 23:59"
 
 func hasControl(s string) bool {
 	return strings.IndexFunc(s, unicode.IsControl) >= 0
@@ -130,13 +134,19 @@ func (s *Settings) apply(key, value string) error {
 		if d, ok := parseClock(value); ok {
 			s.DayStartsAt = d
 		} else {
-			reason = "want HH:MM, 00:00 to 23:59"
+			reason = clockReason
 		}
 	case KeyArchiveRescanAt:
 		if d, ok := parseClock(value); ok {
 			s.ArchiveRescanAt = d
 		} else {
-			reason = "want HH:MM, 00:00 to 23:59"
+			reason = clockReason
+		}
+	case KeyStagingNoticeAt:
+		if d, ok := parseClock(value); ok {
+			s.StagingNoticeAt = d
+		} else {
+			reason = clockReason
 		}
 	case KeyVerifyKnown:
 		switch VerifyMode(value) {
@@ -195,6 +205,7 @@ func (s Settings) Strings() map[string]string {
 		KeyArchiveRescanAt:    clock(s.ArchiveRescanAt),
 		KeyBackupDir:          s.BackupDir,
 		KeyArchiveSkip:        s.ArchiveSkip,
+		KeyStagingNoticeAt:    clock(s.StagingNoticeAt),
 	}
 }
 

@@ -233,3 +233,32 @@ func TestStagingFolderIDsNeverReused(t *testing.T) {
 		t.Fatalf("new folder id %d, want above every earlier id (%d)", f.ID, top)
 	}
 }
+
+func TestStagingFolderWithDate(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	trip := insertFolder(t, d, "2025-05-30 - Trip", `["2025-05-30","2025-05-31"]`)
+	insertFolder(t, d, "2025-05-31", `["2025-05-31"]`)
+	named := insertFolder(t, d, "2025-06-02", `[]`)
+
+	f, ok, err := d.StagingFolderWithDate(ctx, "2025-05-31")
+	if err != nil || !ok || f.ID != trip || f.Name != "2025-05-30 - Trip" {
+		t.Errorf("covering folder = %+v, %v, %v; want id %d", f, ok, err, trip)
+	}
+	f, ok, err = d.StagingFolderWithDate(ctx, "2025-06-02")
+	if err != nil || !ok || f.ID != named || len(f.Dates) != 0 {
+		t.Errorf("folder named for the date = %+v, %v, %v; want id %d with its dates unchanged", f, ok, err, named)
+	}
+	if row, err := d.StagingFolderByID(ctx, named); err != nil || len(row.Dates) != 0 {
+		t.Errorf("the lookup wrote dates: %+v, %v", row, err)
+	}
+	if f, ok, err := d.StagingFolderWithDate(ctx, "2025-06-03"); err != nil || ok {
+		t.Errorf("no folder: %+v, %v, %v; want false", f, ok, err)
+	}
+	if _, _, err := d.StagingFolderWithDate(ctx, "2025-6-3"); err == nil {
+		t.Error("a bad date was accepted")
+	}
+	if all, _ := d.StagingFolders(ctx); len(all) != 3 {
+		t.Errorf("folders = %d, want 3 (the lookup must not create one)", len(all))
+	}
+}

@@ -38,7 +38,16 @@ const PartialSuffix = ".partial"
 // ClassifyCopyError tells these apart, and also a missing source from a
 // missing destination folder (both wrap fs.ErrNotExist).
 func CopyHashed(ctx context.Context, src, dst string) (string, error) {
-	return copyHashed(ctx, src, dst, openSource)
+	return CopyHashedProgress(ctx, src, dst, nil)
+}
+
+// CopyHashedProgress is CopyHashed that calls progress (when not nil) with
+// the number of bytes read from src so far, after every read that returned
+// data. It is called on the calling goroutine, with strictly increasing
+// values ending at the source's size on success, and not at all once ctx is
+// done.
+func CopyHashedProgress(ctx context.Context, src, dst string, progress func(done int64)) (string, error) {
+	return copyHashedProgress(ctx, src, dst, openSource, progress)
 }
 
 // sourceFile is the part of *os.File CopyHashed uses; tests substitute it.
@@ -58,6 +67,10 @@ func openSource(name string) (sourceFile, error) {
 }
 
 func copyHashed(ctx context.Context, src, dst string, open func(string) (sourceFile, error)) (string, error) {
+	return copyHashedProgress(ctx, src, dst, open, nil)
+}
+
+func copyHashedProgress(ctx context.Context, src, dst string, open func(string) (sourceFile, error), progress func(int64)) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -76,7 +89,7 @@ func copyHashed(ctx context.Context, src, dst string, open func(string) (sourceF
 		return "", errors.Join(err, in.Close())
 	}
 	partial := dst + PartialSuffix
-	sum, err := copyToPartial(ctxReader{ctx, in}, partial)
+	sum, err := copyToPartial(&ctxReader{ctx: ctx, r: in, progress: progress}, partial)
 	// Close the card file before the partial becomes dst: nothing may fail
 	// after the rename, so that any error means no dst.
 	if cerr := in.Close(); cerr != nil {
@@ -94,18 +107,29 @@ func copyHashed(ctx context.Context, src, dst string, open func(string) (sourceF
 	return sum, nil
 }
 
-// ctxReader stops a copy at the next read once ctx is done. It has no
-// WriteTo, so io.Copy reads through it chunk by chunk.
+// ctxReader stops a copy at the next read once ctx is done, and reports the
+// bytes read so far to progress (when not nil). It has no WriteTo, so
+// io.Copy reads through it chunk by chunk. It is used by pointer, so done
+// keeps counting across reads.
 type ctxReader struct {
-	ctx context.Context
-	r   io.Reader
+	ctx      context.Context
+	r        io.Reader
+	progress func(int64)
+	done     int64
 }
 
-func (c ctxReader) Read(p []byte) (int, error) {
+func (c *ctxReader) Read(p []byte) (int, error) {
 	if err := c.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return c.r.Read(p)
+	n, err := c.r.Read(p)
+	if n > 0 {
+		c.done += int64(n)
+		if c.progress != nil {
+			c.progress(c.done)
+		}
+	}
+	return n, err
 }
 
 // CopyFailure says why CopyHashed failed, so a caller can choose to retry.

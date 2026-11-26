@@ -4,6 +4,8 @@
   import { live } from '../lib/live.svelte.js';
   import { navigate } from '../lib/router.svelte.js';
   import { formatBytes, formatCount, dateRange } from '../lib/format.js';
+  import { sortFolders, groupByMonth, folderLine, needsReload } from '../lib/views.js';
+  import { loadPref, savePref, PATTERN_KEY, STAGING_VIEW_KEY } from '../lib/prefs.js';
   import { clickAction, toggleKey, selectRange, prune, isTextEntry } from '../lib/selection.js';
   import { splitName, folderName, folderDate, earliestDate, checkFolderName, promoteTarget, DEFAULT_PATTERN } from '../lib/naming.js';
   import { describeError, rescanSummary, plural, promoteStates, promoteToast } from '../lib/messages.js';
@@ -13,13 +15,23 @@
   import Dialog from '../components/Dialog.svelte';
   import SelectionBar from '../components/SelectionBar.svelte';
   import PromoteProgress from '../components/PromoteProgress.svelte';
+  import ViewSwitch from '../components/ViewSwitch.svelte';
 
-  const PATTERN_KEY = 'sd2nas.promotePattern';
+  const VIEWS = [{ value: 'cards', label: 'Cards' }, { value: 'list', label: 'List' }, { value: 'timeline', label: 'Timeline' }];
+  const SORTS = [{ value: 'name', label: 'Name' }, { value: 'age', label: 'Oldest' }, { value: 'size', label: 'Largest' }, { value: 'files', label: 'Most files' }];
   const RECENT_MS = 10 * 60_000; // how long a finished promote stays on screen
 
   let data = $state(null);
   let error = $state('');
   let ctl = null; // the load in flight; a newer one aborts it
+  let reloadedOnce = false; // F10: one extra load when a load returns a version other than the live one
+
+  let view = $state(loadPref(STAGING_VIEW_KEY, VIEWS.map((v) => v.value), 'cards'));
+  let sortBy = $state('name'); // the list view's order
+  function setView(v) {
+    view = v;
+    savePref(STAGING_VIEW_KEY, v);
+  }
 
   let selected = $state(new Set()); // folder ids as strings
   let anchor = null; // the last clicked id, for Shift-click ranges
@@ -46,6 +58,14 @@
       data = res;
       error = '';
       selected = prune(selected, res.folders.map((f) => String(f.id)));
+      // The event that announced this version may have arrived while the
+      // request ran: if the stream is ahead of what we got, load once more.
+      if (needsReload(res.version, live.staging.version, live.connected)) {
+        if (!reloadedOnce) {
+          reloadedOnce = true;
+          load();
+        }
+      } else reloadedOnce = false;
     } catch (err) {
       if (err.name === 'AbortError' || mine.signal.aborted) return;
       error = err.message;
@@ -99,7 +119,11 @@
   const queue = $derived(live.promote);
   const held = $derived(promoteStates(queue));
   const folders = $derived(data?.folders ?? []);
-  const order = $derived(folders.filter((f) => !held.has(f.id)).map((f) => String(f.id)));
+  // Folders in the order the current view shows them (Shift-click ranges follow it).
+  const sorted = $derived(sortFolders(folders, sortBy));
+  const months = $derived(groupByMonth(folders));
+  const shown = $derived(view === 'list' ? sorted : view === 'timeline' ? months.flatMap((g) => g.folders) : folders);
+  const order = $derived(shown.filter((f) => !held.has(f.id)).map((f) => String(f.id)));
   const chosen = $derived(folders.filter((f) => selected.has(String(f.id))));
   const totals = $derived({ files: folders.reduce((s, f) => s + f.files, 0), bytes: folders.reduce((s, f) => s + f.bytes, 0) });
   const showLast = $derived(!!queue?.last && queue.last.id !== dismissedJob && Date.now() - Date.parse(queue.last.finished_at) < RECENT_MS);
@@ -154,21 +178,6 @@
     }
   }
 
-  function loadPattern() {
-    try {
-      return localStorage.getItem(PATTERN_KEY) || DEFAULT_PATTERN;
-    } catch {
-      return DEFAULT_PATTERN; // storage unavailable (private mode): use the default
-    }
-  }
-  function savePattern(p) {
-    try {
-      localStorage.setItem(PATTERN_KEY, p);
-    } catch {
-      // storage unavailable (private mode): the next promote starts from the default again
-    }
-  }
-
   function openDialog(kind) {
     dialogError = '';
     // Rename and merge edit one whole name: the date, then the title (or an
@@ -180,7 +189,7 @@
     } else if (kind === 'merge') {
       nameRaw = editable(earliestDate(chosen), mergeSorted.map(titleOf).find(Boolean) ?? '');
     } else if (kind === 'promote') {
-      pattern = loadPattern();
+      pattern = loadPref(PATTERN_KEY, null, DEFAULT_PATTERN);
     }
     dialog = kind;
     if (kind === 'rename' || kind === 'merge') {
@@ -271,7 +280,7 @@
     run(async () => {
       const before = live.promote; // the queue as it was, to tell whether anything is ahead
       const res = await api('/api/staging/promote', { method: 'POST', body: { ids: chosen.map((f) => f.id), pattern: p } });
-      savePattern(p);
+      savePref(PATTERN_KEY, p); // a failure only means the next promote starts from the default
       clear();
       toast(promoteToast(res.job, before));
       // Show the queue now; promote.progress events take over.
@@ -320,7 +329,7 @@
 {:else if !data}
   <p class="muted">Loading…</p>
 {:else}
-  <p class="sub">{plural(folders.length, 'folder', 'folders')} · {formatCount(totals.files)} files · {formatBytes(totals.bytes)}</p>
+  <p class="sub">{plural(folders.length, 'folder', 'folders')} · {plural(totals.files, 'file', 'files')} · {formatBytes(totals.bytes)}</p>
   {#if showQueue}
     <PromoteProgress {queue} {showLast} {cancelling} oncancel={cancelPromote} ondismiss={(j) => (dismissedJob = j.id)} />
   {/if}
@@ -361,54 +370,133 @@
       </SelectionBar>
     {:else}
       <div class="toolbar row">
+        <ViewSwitch label="View" options={VIEWS} value={view} onchange={setView} />
+        {#if view === 'list'}
+          <select class="sortby" aria-label="Sort folders by" bind:value={sortBy}>
+            {#each SORTS as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+          </select>
+        {/if}
         <span class="muted only-desktop">Select folders to merge, rename, discard or promote them.</span>
         <span class="muted only-phone">Long-press a folder to select it.</span>
         <span class="spacer"></span>
         <button class="btn link only-desktop" onclick={selectAll}>Select all</button>
       </div>
     {/if}
-    <div class="folders selectable" use:longPressSelect={press}>
-      {#each folders as f (f.id)}
-        {@const key = String(f.id)}
-        <!-- The name link is the keyboard path; a click anywhere on the card is a mouse/touch shortcut. -->
-        {@const hold = held.get(f.id)}
-        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-        <div class="folder" class:sel={selected.has(key)} class:held={!!hold} data-key={key} onclick={(e) => onFolderClick(e, f)}>
-          <div class="top">
-            <label class="check" title={hold ? 'Waiting for its promote' : 'Select'}>
-              <input type="checkbox" checked={selected.has(key)} disabled={!!hold} onchange={() => toggle(key)} aria-label="Select {f.name}" />
-            </label>
-            <div class="title">
-              <a class="name" href="/staging/{f.id}">{f.name}</a>
-              <div class="muted small">{dateRange(f.dates)}</div>
-            </div>
-            {#if f.stale}<span class="pill warn" title="In staging for {f.age_days} days">{f.age_days} days</span>{/if}
-          </div>
-          {#if hold}
-            <div class="row small hold">
-              <span class="pill live">{hold.state === 'moving' ? 'Promoting…' : 'Waiting to promote'}</span>
-              {#if hold.cancellable}
-                <button class="btn" disabled={cancelling === hold.job} onclick={(e) => { e.stopPropagation(); cancelPromote(queue.queued.find((j) => j.id === hold.job)); }}>Cancel</button>
+
+    {#snippet checkbox(f, hold)}
+      <label class="check" title={hold ? 'Waiting for its promote' : 'Select'}>
+        <input type="checkbox" checked={selected.has(String(f.id))} disabled={!!hold} onchange={() => toggle(String(f.id))} aria-label="Select {f.name}" />
+      </label>
+    {/snippet}
+    {#snippet tags(f)}
+      {#if f.counts.raw}<span class="tag">{f.counts.raw} RAW</span>{/if}
+      {#if f.counts.jpg}<span class="tag">{f.counts.jpg} JPG</span>{/if}
+      {#if f.counts.video}<span class="tag">{f.counts.video} video</span>{/if}
+    {/snippet}
+    {#snippet badges(f, hold)}
+      {#if hold}<span class="pill live">{hold.state === 'moving' ? 'Promoting…' : 'Waiting to promote'}</span>{/if}
+      {#if f.stale}<span class="pill warn" title="In staging for {f.age_days} days">{f.age_days} days</span>{/if}
+      {#if f.warnings.length}<span class="pill warn" title={f.warnings.join('; ')}>⚠ {f.warnings.length === 1 ? 'Warning' : `${f.warnings.length} warnings`}</span>{/if}
+      {#if f.in_archive}<span class="pill ok" title="{plural(f.in_archive, 'file is', 'files are')} already in the archive">{f.in_archive} in archive</span>{/if}
+    {/snippet}
+    {#snippet cancelBtn(hold)}
+      {#if hold?.cancellable}
+        <button class="btn" disabled={cancelling === hold.job} onclick={(e) => { e.stopPropagation(); cancelPromote(queue.queued.find((j) => j.id === hold.job)); }}>Cancel</button>
+      {/if}
+    {/snippet}
+
+    <!-- The name link is the keyboard path; a click anywhere on a card, row or entry is a mouse/touch shortcut. -->
+    <div class="selectable" use:longPressSelect={press}>
+      {#if view === 'cards'}
+        <div class="folders">
+          {#each folders as f (f.id)}
+            {@const key = String(f.id)}
+            {@const hold = held.get(f.id)}
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <div class="folder" class:sel={selected.has(key)} class:held={!!hold} data-key={key} onclick={(e) => onFolderClick(e, f)}>
+              <div class="top">
+                {@render checkbox(f, hold)}
+                <div class="title">
+                  <a class="name" href="/staging/{f.id}">{f.name}</a>
+                  <div class="muted small">{dateRange(f.dates)}</div>
+                </div>
+                {#if f.stale}<span class="pill warn" title="In staging for {f.age_days} days">{f.age_days} days</span>{/if}
+              </div>
+              {#if hold}
+                <div class="row small hold">
+                  <span class="pill live">{hold.state === 'moving' ? 'Promoting…' : 'Waiting to promote'}</span>
+                  {@render cancelBtn(hold)}
+                </div>
               {/if}
+              {#if f.samples.length}
+                <div class="strip">
+                  {#each f.samples as s (s.sha256)}<Thumb sha={s.sha256} kind={s.kind} />{/each}
+                </div>
+              {/if}
+              <div class="row small">
+                <span>{@render tags(f)}</span>
+                <span class="spacer"></span>
+                <span class="muted">{folderLine(f)}</span>
+              </div>
+              {#each f.warnings as w}<div class="warn small">⚠ {w}</div>{/each}
             </div>
-          {/if}
-          {#if f.samples.length}
-            <div class="strip">
-              {#each f.samples as s (s.sha256)}<Thumb sha={s.sha256} kind={s.kind} />{/each}
-            </div>
-          {/if}
-          <div class="row small">
-            <span>
-              {#if f.counts.raw}<span class="tag">{f.counts.raw} RAW</span>{/if}
-              {#if f.counts.jpg}<span class="tag">{f.counts.jpg} JPG</span>{/if}
-              {#if f.counts.video}<span class="tag">{f.counts.video} video</span>{/if}
-            </span>
-            <span class="spacer"></span>
-            <span class="muted">{plural(f.files, 'file', 'files')} · {formatBytes(f.bytes)}</span>
-          </div>
-          {#each f.warnings as w}<div class="warn small">⚠ {w}</div>{/each}
+          {/each}
         </div>
-      {/each}
+      {:else if view === 'list'}
+        <div class="rows">
+          {#each sorted as f (f.id)}
+            {@const key = String(f.id)}
+            {@const hold = held.get(f.id)}
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <div class="item" class:sel={selected.has(key)} class:held={!!hold} data-key={key} onclick={(e) => onFolderClick(e, f)}>
+              {@render checkbox(f, hold)}
+              <div class="main">
+                <a class="name" href="/staging/{f.id}">{f.name}</a>
+                <div class="muted small">{dateRange(f.dates)}</div>
+              </div>
+              <div class="meta small">
+                <span class="muted">{folderLine(f)}</span>
+                <span>{@render tags(f)}</span>
+                <span class="muted">{f.age_days === 1 ? '1 day' : `${f.age_days} days`} old</span>
+                {@render badges(f, hold)}
+                {@render cancelBtn(hold)}
+              </div>
+            </div>
+          {/each}
+        </div>
+      {:else}
+        {#each months as g (g.key)}
+          <section class="month">
+            <h2>{g.label}</h2>
+            <div class="tl">
+              {#each g.folders as f (f.id)}
+                {@const key = String(f.id)}
+                {@const hold = held.get(f.id)}
+                <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+                <div class="entry" class:sel={selected.has(key)} class:held={!!hold} data-key={key} onclick={(e) => onFolderClick(e, f)}>
+                  <div class="top">
+                    {@render checkbox(f, hold)}
+                    <div class="title">
+                      <div class="muted small mono">{dateRange(f.dates) || 'No date'}</div>
+                      <a class="name" href="/staging/{f.id}">{f.name}</a>
+                      <div class="muted small">{folderLine(f)}</div>
+                    </div>
+                  </div>
+                  {#if f.samples.length}
+                    <div class="strip">
+                      {#each f.samples.slice(0, 5) as s (s.sha256)}<Thumb sha={s.sha256} kind={s.kind} />{/each}
+                    </div>
+                  {/if}
+                  <div class="row small">
+                    {@render badges(f, hold)}
+                    {@render cancelBtn(hold)}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          </section>
+        {/each}
+      {/if}
     </div>
   {/if}
 {/if}
@@ -493,9 +581,35 @@
   .top .pill { margin-top: 12px; }
   .strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; margin: 6px 0; }
   .warn { color: var(--warn); }
+  .sortby { width: auto; min-width: 0; max-width: 100%; }
+  /* List view: one row per folder; the details wrap onto a second line on a phone. */
+  .rows { display: flex; flex-direction: column; gap: 8px; }
+  .item { display: grid; grid-template-columns: 44px minmax(0, 1fr) minmax(0, 1.6fr); column-gap: 4px; align-items: center; min-height: 56px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 4px 12px 4px 2px; cursor: pointer; transition: border-color .1s; min-width: 0; }
+  .item:hover { border-color: #41567a; }
+  .item.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .item.held, .entry.held { opacity: .75; }
+  .item .check { margin: 0; }
+  .item .main { min-width: 0; padding: 6px 0; }
+  .meta { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; justify-content: flex-end; min-width: 0; }
+  /* Timeline view: a vertical rule per month with one entry per folder. */
+  .month h2 { font-size: 15px; margin: 18px 0 8px; color: var(--muted); font-weight: 600; }
+  .tl { border-left: 2px solid var(--line); margin-left: 8px; padding-left: 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .entry { position: relative; display: flex; flex-direction: column; gap: 4px; min-width: 0; min-height: 56px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--r); padding: 4px 12px 10px; cursor: pointer; transition: border-color .1s; }
+  .entry::before { content: ''; position: absolute; left: -24px; top: 22px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg); box-sizing: content-box; }
+  .entry:hover { border-color: #41567a; }
+  .entry.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .entry .title { padding-top: 4px; }
+  .entry .strip { max-width: 380px; margin: 4px 0 4px 38px; }
+  .entry > .row { margin-left: 38px; }
   .list { margin: 0; padding-left: 18px; }
   .problems { margin: 6px 0 0; padding-left: 18px; overflow-wrap: anywhere; }
   @media (max-width: 760px) {
     .folders { grid-template-columns: minmax(0, 1fr); }
+    .item { grid-template-columns: 44px minmax(0, 1fr); }
+    .meta { grid-column: 2; justify-content: flex-start; padding: 0 0 8px; }
+    .entry .strip { margin-left: 0; }
+    .entry > .row { margin-left: 0; }
   }
 </style>

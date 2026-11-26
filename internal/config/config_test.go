@@ -100,3 +100,30 @@ func TestLoadBadFlag(t *testing.T) {
 		t.Error("expected an error for an unknown flag")
 	}
 }
+
+func TestTokenEnv(t *testing.T) {
+	c, err := Load(nil, env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Token != "" {
+		t.Errorf("unset: Token = %q, want empty", c.Token)
+	}
+	for _, tok := range []string{"abc123", "0f3a9c41d2e8b7a6f5c4d3e2b1a0f9e8d7c6b5a4f3e2d1c0", "A-Z_a.z~+/="} {
+		c, err := Load(nil, env(map[string]string{"SD2NAS_TOKEN": tok}))
+		if err != nil {
+			t.Errorf("%q: %v", tok, err)
+			continue
+		}
+		if c.Token != tok {
+			t.Errorf("Token = %q, want %q", c.Token, tok)
+		}
+	}
+	const want = "SD2NAS_TOKEN may use only letters, digits and . _ ~ + / = -"
+	for _, tok := range []string{"abc def", "a$b", "a'b", "a;b", "abc\x7f", "é"} {
+		_, err := Load(nil, env(map[string]string{"SD2NAS_TOKEN": tok}))
+		if err == nil || err.Error() != want {
+			t.Errorf("%q: err = %v, want %q", tok, err, want)
+		}
+	}
+}

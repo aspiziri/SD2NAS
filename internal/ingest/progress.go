@@ -24,6 +24,16 @@ type ProgressSnapshot struct {
 	BytesTotal int64          `json:"bytes_total"`
 	BytesDone  int64          `json:"bytes_done"`
 	Counts     catalog.Counts `json:"counts"`
+
+	// The file being copied (card path, its size, bytes copied so far) while
+	// the copy runs.
+	Current     string `json:"current,omitempty"`
+	CurrentSize int64  `json:"current_size,omitempty"`
+	CurrentDone int64  `json:"current_done,omitempty"`
+	// The staging folder the import waits for, and what holds it (a
+	// staging.Holder), while it waits.
+	WaitingFolder string `json:"waiting_folder,omitempty"`
+	WaitingHolder string `json:"waiting_holder,omitempty"`
 }
 
 // Progress is a running ingest's live state, safe for concurrent use.

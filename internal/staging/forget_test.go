@@ -80,14 +80,43 @@ func importOf(t *testing.T, e *opsEnv, staged map[string]string, culled, archive
 
 var forgetStaged = map[string]string{"a.jpg": "abc", "b.jpg": "defgh"}
 
+// addMissing records that import id found each content's archive copy
+// missing (assets inserted in state missing, linked by rows with outcome
+// missing). It returns their hashes.
+func addMissing(t *testing.T, e *opsEnv, id int64, contents ...string) []string {
+	t.Helper()
+	var shas []string
+	for i, content := range contents {
+		sha := shaOf(content)
+		a := catalog.Asset{SHA256: sha, Size: int64(len(content)), Kind: media.KindImage, State: catalog.StateMissing,
+			RelPath: "Archive/lost" + string(rune('0'+i)) + ".jpg", UpdatedAt: opsNow}
+		if err := e.db.InsertAsset(t.Context(), a, shaOf("fp:"+content)); err != nil {
+			t.Fatal(err)
+		}
+		f := catalog.IngestFile{CardPath: "DCIM/" + content + ".jpg", Size: a.Size, QuickFP: shaOf("fp:" + content), SHA256: sha,
+			Outcome: catalog.OutcomeMissing}
+		if err := e.db.AddIngestFiles(t.Context(), id, []catalog.IngestFile{f}); err != nil {
+			t.Fatal(err)
+		}
+		shas = append(shas, sha)
+	}
+	return shas
+}
+
 func TestForgetSummary(t *testing.T) {
 	e := newOpsEnv(t)
 	id, _, _, _, _ := importOf(t, e, forgetStaged, []string{"culled"}, []string{"archived"})
+	addMissing(t, e, id, "lost")
+	if n, err := e.db.RequestRestore(t.Context(), id, opsNow); err != nil || n != 1 {
+		t.Fatalf("RequestRestore = %d, %v; want 1", n, err)
+	}
+	addMissing(t, e, id, "lost again")
 	got, err := e.svc.ForgetSummary(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := ForgetSummary{Staged: 2, StagedBytes: 8, Culled: 1, Archived: 1, Reimportable: 1}
+	want := ForgetSummary{Staged: 2, StagedBytes: 8, Culled: 1, Archived: 1, Reimportable: 1,
+		Missing: 2, Restorable: 2, RestoreRequested: 1}
 	if got != want {
 		t.Errorf("summary = %+v, want %+v", got, want)
 	}
@@ -99,14 +128,18 @@ func TestForgetSummary(t *testing.T) {
 func TestForgetDeletesFiles(t *testing.T) {
 	e := newOpsEnv(t)
 	id, f, staged, culled, archived := importOf(t, e, forgetStaged, []string{"culled"}, []string{"archived"})
+	missing := addMissing(t, e, id, "lost")
 	v := e.version()
 	got, err := e.svc.Forget(t.Context(), id, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := ForgetResult{Forgotten: 3, DeletedFiles: 2, KeptArchived: 1, Removed: []int64{f.ID}}
+	want := ForgetResult{Forgotten: 3, DeletedFiles: 2, KeptArchived: 1, KeptMissing: 1, Removed: []int64{f.ID}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("result = %+v, want %+v", got, want)
+	}
+	if a := e.asset(t, missing[0]); a.State != catalog.StateMissing {
+		t.Errorf("missing asset = %+v, want it kept", a)
 	}
 	e.mustNotExist(t, "Staging/2025-05-30/a.jpg", "Staging/2025-05-30/b.jpg", "Staging/2025-05-30")
 	for _, sha := range append(slices.Clone(staged), culled...) {

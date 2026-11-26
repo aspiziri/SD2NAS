@@ -1,8 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>SD2NAS</Name>
-  <!-- :edge tracks main until v0.1.0; switch to :latest after the first release -->
-  <Repository>ghcr.io/aspiziri/sd2nas:edge</Repository>
+  <Repository>ghcr.io/aspiziri/sd2nas:latest</Repository>
   <Registry>https://github.com/aspiziri/SD2NAS/pkgs/container/sd2nas</Registry>
   <Network>bridge</Network>
   <MyIP/>
@@ -31,4 +30,5 @@ Set up the card script and notifications as the README describes: https://github
   <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group that owns created files (100 = users)" Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
   <Config Name="UMASK" Target="UMASK" Default="000" Mode="" Description="000 keeps imported files editable over SMB" Type="Variable" Display="advanced" Required="false" Mask="false">000</Config>
   <Config Name="Card poller" Target="SD2NAS_POLL_CARDS" Default="false" Mode="" Description="Only for setups without the Unassigned Devices script: true imports cards that get mounted under /cards after the container starts (it can't unmount them or send Unraid notifications). Leave false when the script is installed." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="Password (SD2NAS_TOKEN)" Target="SD2NAS_TOKEN" Default="" Mode="" Description="Optional password for the web UI and the card script. Generate one with: openssl rand -hex 24 (letters, digits and . _ ~ + / = - only, or SD2NAS won't start). When set, the web UI asks for it once per browser, and the card script must send it: add it single-quoted to sd2nas.cfg as the README shows. Leave empty for no token: then anyone on your network can use SD2NAS." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
 </Container>

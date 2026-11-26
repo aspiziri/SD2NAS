@@ -565,6 +565,41 @@ func TestMissingFiles(t *testing.T) {
 	}
 }
 
+func TestMissingSince(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	a := archivedAt(t, d, 1, "Archive/s/a.JPG", 0)
+	b := archivedAt(t, d, 2, "Archive/s/b.JPG", 0)
+	back := archivedAt(t, d, 3, "Archive/s/c.JPG", 0)
+	if err := d.MarkMissing(ctx, a, t1); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.MarkMissing(ctx, b, t2); err != nil {
+		t.Fatal(err)
+	}
+	// missing, then found again: archived, so not counted
+	if err := d.MarkMissing(ctx, back, t2); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetArchivePath(ctx, back, "Archive/s/c.JPG", 3, t2.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		after  time.Time
+		n      int
+		latest time.Time
+	}{
+		{t1.Add(-time.Millisecond), 2, t2},
+		{t1, 1, t2},
+		{t2, 0, time.Time{}},
+	} {
+		n, latest, err := d.MissingSince(ctx, tc.after)
+		if err != nil || n != tc.n || !latest.Equal(tc.latest) {
+			t.Errorf("MissingSince(%v) = %d, %v, %v; want %d, %v", tc.after, n, latest, err, tc.n, tc.latest)
+		}
+	}
+}
+
 func TestRecentArchiveFolders(t *testing.T) {
 	d := openTest(t)
 	ctx := t.Context()

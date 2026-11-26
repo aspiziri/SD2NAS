@@ -199,6 +199,9 @@ func TestThumbFailure(t *testing.T) {
 		{"missing tool", fmt.Errorf("x.ARW: %w", &exec.Error{Name: "exiftool", Err: exec.ErrNotFound}), 404, false},
 		{"too large", fmt.Errorf("%w: 20000x10000", thumbs.ErrTooLarge), 422, false},
 		{"undecodable", fmt.Errorf("x: %w", thumbs.ErrUndecodable), 422, false},
+		{"remembered undecodable", fmt.Errorf("%w: x: %w", thumbs.ErrRemembered, thumbs.ErrUndecodable), 422, false},
+		{"remembered too large", fmt.Errorf("%w: %w", thumbs.ErrRemembered, thumbs.ErrTooLarge), 422, false},
+		{"remembered no image", fmt.Errorf("%w: %w", thumbs.ErrRemembered, thumbs.ErrNoImage), 404, false},
 		{"closed", thumbs.ErrClosed, 503, false},
 		{"canceled", context.Canceled, 503, false},
 		{"deadline", context.DeadlineExceeded, 500, true},
@@ -226,6 +229,27 @@ func TestThumbUndecodable(t *testing.T) {
 	}
 	sha := insertAsset(t, f, catalog.StateStaged, rel)
 	wantThumbError(t, get(t, f.s, "/api/thumbs/"+sha), http.StatusUnprocessableEntity, "could not be decoded")
+	// The second ask (either size) gets the remembered failure, same answer.
+	wantThumbError(t, get(t, f.s, "/api/thumbs/"+sha), http.StatusUnprocessableEntity, "earlier render")
+	wantThumbError(t, get(t, f.s, "/api/preview/"+sha), http.StatusUnprocessableEntity, "could not be decoded")
+}
+
+func TestThumbWarning(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("x: %w", thumbs.ErrUndecodable), "cannot decode for a thumbnail"},
+		{fmt.Errorf("%w: 20000x10000", thumbs.ErrTooLarge), "thumbnail refused"},
+		{fmt.Errorf("%w: x: %w", thumbs.ErrRemembered, thumbs.ErrUndecodable), ""},
+		{fmt.Errorf("%w: %w", thumbs.ErrRemembered, thumbs.ErrTooLarge), ""},
+		{thumbs.ErrNoImage, ""},
+	}
+	for _, c := range cases {
+		if got := thumbWarning(c.err); got != c.want {
+			t.Errorf("thumbWarning(%v) = %q, want %q", c.err, got, c.want)
+		}
+	}
 }
 
 func TestThumbWarmAfterIngest(t *testing.T) {

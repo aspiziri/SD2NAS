@@ -130,6 +130,11 @@ func run(log *slog.Logger) error {
 		{Name: "config", Path: cfg.Data, NeedWrite: true},
 	})
 	srv.SetLogger(log)
+	srv.SetToken(cfg.Token)
+	if w := tokenWarning(cfg.Token); w != "" {
+		log.Warn(w)
+		srv.AddWarning(w)
+	}
 	if errors.Is(lockErr, lockfile.ErrUnsupported) {
 		msg := fmt.Sprintf("could not lock %s (%v): a second SD2NAS using this folder would not be stopped", cfg.Data, lockErr)
 		log.Warn(msg)
@@ -286,4 +291,13 @@ func wrap(what string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("%s: %w", what, err)
+}
+
+// tokenWarning is the /healthz warning for a short token; "" when there is
+// none or it is long enough.
+func tokenWarning(token string) string {
+	if len(token) > 0 && len(token) < 16 {
+		return "SD2NAS_TOKEN is shorter than 16 characters: pick a longer, random one"
+	}
+	return ""
 }

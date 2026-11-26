@@ -406,3 +406,57 @@ func TestClassifyCopyError(t *testing.T) {
 		t.Errorf("joined deadline = %d, want CopyFailCanceled", got)
 	}
 }
+
+func TestCopyHashedProgress(t *testing.T) {
+	dir := t.TempDir()
+	data := pattern(1 << 20)
+	src := writeBytes(t, dir, "src.MP4", data)
+	want, err := CopyHashed(t.Context(), src, filepath.Join(dir, "plain.MP4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var seen []int64
+	sum, err := CopyHashedProgress(t.Context(), src, filepath.Join(dir, "out.MP4"), func(done int64) { seen = append(seen, done) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum != want {
+		t.Errorf("hash %s, want %s", sum, want)
+	}
+	if len(seen) == 0 || seen[len(seen)-1] != 1<<20 {
+		t.Fatalf("progress = %v, want it to end at %d", seen, 1<<20)
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] <= seen[i-1] {
+			t.Fatalf("progress not strictly increasing: %v", seen)
+		}
+	}
+
+	if _, err := CopyHashedProgress(t.Context(), src, filepath.Join(dir, "nil.MP4"), nil); err != nil {
+		t.Errorf("nil progress: %v", err)
+	}
+}
+
+func TestCopyHashedProgressStopsWhenCanceled(t *testing.T) {
+	dir := t.TempDir()
+	src := writeBytes(t, dir, "src.MP4", pattern(1<<20))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	calls, afterCancel := 0, 0
+	canceled := false
+	_, err := CopyHashedProgress(ctx, src, filepath.Join(dir, "out.MP4"), func(int64) {
+		calls++
+		if canceled {
+			afterCancel++
+		}
+		cancel()
+		canceled = true
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if calls != 1 || afterCancel != 0 {
+		t.Errorf("progress called %d times (%d after cancel), want exactly 1", calls, afterCancel)
+	}
+}

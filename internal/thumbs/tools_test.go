@@ -1,6 +1,7 @@
 package thumbs
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -8,11 +9,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,96 +35,195 @@ func TestMain(m *testing.M) {
 }
 
 // fakeTool stands in for exiftool or ffmpeg when a test sets
-// SD2NAS_FAKE_TOOL and points Config.Exiftool/FFmpeg at os.Args[0]. It
-// appends its arguments as one JSON line to $SD2NAS_FAKE_ARGS.
+// SD2NAS_FAKE_TOOL and points Config.Exiftool/FFmpeg at os.Args[0]. Run
+// once per call, it appends its arguments as one JSON line to
+// $SD2NAS_FAKE_ARGS and answers as the mode says. Started with -stay_open,
+// it serves exiftool's argfile protocol instead (fakeStayOpen).
 func fakeTool(mode string, args []string) int {
-	line, err := json.Marshal(args)
-	if err == nil {
-		var f *os.File
-		f, err = os.OpenFile(os.Getenv("SD2NAS_FAKE_ARGS"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o666)
-		if err == nil {
-			_, err = f.Write(append(line, '\n'))
-			if cerr := f.Close(); err == nil {
-				err = cerr
-			}
-		}
+	if slices.Contains(args, "-stay_open") {
+		return fakeStayOpen(mode)
 	}
-	if err != nil {
+	if err := appendJSONLine(os.Getenv("SD2NAS_FAKE_ARGS"), args); err != nil {
 		fmt.Fprintln(os.Stderr, "fake tool: recording args:", err)
 		return 99
 	}
-	jpg, err := encodeJPEG(redBlueImage(64, 32), 0)
+	code, _ := fakeAnswer(mode, args, os.Stdout, os.Stderr)
+	return code
+}
+
+// appendJSONLine appends v as one JSON line to file.
+func appendJSONLine(file string, v any) error {
+	line, err := json.Marshal(v)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "fake tool:", err)
+		return err
+	}
+	f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o666)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(append(line, '\n'))
+	return errors.Join(err, f.Close())
+}
+
+// fakeStayOpen serves "exiftool -stay_open True -@ -": it logs its pid to
+// $SD2NAS_FAKE_TOOL_LOG, then reads argfile lines from stdin. At each
+// -execute<N> it records the request's arguments (without the -echo4
+// pair) to $SD2NAS_FAKE_ARGS, answers as the mode says, and ends the
+// answer with {ready<N>} on stdout and the -echo4 text on stderr. A mode
+// that makes a one-shot tool exit makes it exit (it dies). "-stay_open",
+// "False" or the end of stdin makes it exit 0.
+func fakeStayOpen(mode string) int {
+	if err := appendJSONLine(os.Getenv("SD2NAS_FAKE_TOOL_LOG"), os.Getpid()); err != nil {
+		fmt.Fprintln(os.Stderr, "fake tool: logging the start:", err)
 		return 99
 	}
-	b64 := func(b []byte) string { return "base64:" + base64.StdEncoding.EncodeToString(b) }
-	hasArg := func(a string) bool {
-		for _, x := range args {
-			if x == a {
-				return true
-			}
+	sc := bufio.NewScanner(os.Stdin)
+	var req []string
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "False" && len(req) > 0 && req[len(req)-1] == "-stay_open" {
+			return 0
 		}
-		return false
-	}
-	switch mode {
-	case "exif-preview":
-		fmt.Printf(`[{"SourceFile":"x","Orientation":6,"PreviewImage":"%s"}]`, b64(jpg))
-	case "exif-jpgfromraw":
-		if hasArg("-JpgFromRaw") {
-			fmt.Printf(`[{"SourceFile":"x","JpgFromRaw":"%s"}]`, b64(jpg))
-		} else {
-			fmt.Print(`[{"SourceFile":"x","Orientation":1}]`)
+		n, ok := strings.CutPrefix(line, "-execute")
+		if !ok {
+			req = append(req, line)
+			continue
 		}
-	case "exif-none":
-		fmt.Print(`[{"SourceFile":"x"}]`)
-	case "exif-huge":
-		fmt.Printf(`[{"SourceFile":"x","PreviewImage":"%s"}]`, b64(hugePNG(20000, 20000)))
-	case "huge-frame":
-		if _, err := os.Stdout.Write(hugePNG(20000, 20000)); err != nil {
+		args, echo := req, ""
+		if i := slices.Index(args, "-echo4"); i >= 0 && i+1 < len(args) {
+			echo = args[i+1]
+			args = slices.Delete(slices.Clone(args), i, i+2)
+		}
+		req = nil
+		if err := appendJSONLine(os.Getenv("SD2NAS_FAKE_ARGS"), args); err != nil {
+			fmt.Fprintln(os.Stderr, "fake tool: recording args:", err)
 			return 99
 		}
+		var out bytes.Buffer
+		code, stop := fakeAnswer(mode, args, &out, os.Stderr)
+		if _, err := os.Stdout.Write(out.Bytes()); err != nil || stop {
+			return code
+		}
+		if out.Len() > 0 && !bytes.HasSuffix(out.Bytes(), []byte("\n")) {
+			fmt.Println() // exiftool's JSON ends with a newline
+		}
+		fmt.Printf("{ready%s}\n", n)
+		fmt.Fprintln(os.Stderr, echo)
+	}
+	return 0
+}
+
+// fakeAnswer writes mode's answer to one call with args. stop says that
+// the tool exits with code (a failure, or a stay_open tool that dies).
+func fakeAnswer(mode string, args []string, stdout, stderr io.Writer) (code int, stop bool) {
+	jpg, err := encodeJPEG(redBlueImage(64, 32), 0)
+	if err != nil {
+		fmt.Fprintln(stderr, "fake tool:", err)
+		return 99, true
+	}
+	b64 := func(b []byte) string { return "base64:" + base64.StdEncoding.EncodeToString(b) }
+	write := func(b []byte) (int, bool) {
+		if _, err := stdout.Write(b); err != nil {
+			return 99, true
+		}
+		return 0, false
+	}
+	switch mode {
+	case "exif-preview", "preview":
+		fmt.Fprintf(stdout, `[{"SourceFile":"x","Orientation":6,"PreviewImage":"%s"}]`, b64(jpg))
+	case "exif-jpgfromraw":
+		if slices.Contains(args, "-JpgFromRaw") {
+			fmt.Fprintf(stdout, `[{"SourceFile":"x","JpgFromRaw":"%s"}]`, b64(jpg))
+		} else {
+			fmt.Fprint(stdout, `[{"SourceFile":"x","Orientation":1}]`)
+		}
+	case "exif-none":
+		fmt.Fprint(stdout, `[{"SourceFile":"x"}]`)
+	case "exif-error":
+		fmt.Fprint(stdout, `[{"SourceFile":"x","Error":"File is empty"}]`)
+	case "exif-huge":
+		fmt.Fprintf(stdout, `[{"SourceFile":"x","PreviewImage":"%s"}]`, b64(hugePNG(20000, 20000)))
+	case "huge-frame":
+		return write(hugePNG(20000, 20000))
 	case "garbage":
-		fmt.Print("not json")
+		fmt.Fprint(stdout, "not json")
 	case "fail":
-		fmt.Fprint(os.Stderr, "boom: bad file")
-		return 3
+		fmt.Fprint(stderr, "boom: bad file")
+		return 3, true
+	case "die":
+		fmt.Fprintln(stderr, "fake tool: dying")
+		return 3, true
+	case "stderr":
+		fmt.Fprintln(stderr, "Error: File format error - x")
+	case "notfound":
+		fmt.Fprintln(stderr, "Error: File not found - x")
+	case "unreadable":
+		// Unreadable while <path>.locked exists (a permission fault the
+		// owner can fix), then the normal preview.
+		if _, err := os.Stat(args[len(args)-1] + ".locked"); err == nil {
+			fmt.Fprint(stdout, `[{"SourceFile":"x"}]`)
+			fmt.Fprintln(stderr, "Error: Error opening file - x")
+			break
+		}
+		fmt.Fprintf(stdout, `[{"SourceFile":"x","Orientation":6,"PreviewImage":"%s"}]`, b64(jpg))
+	case "foreign":
+		fmt.Fprint(stdout, "{ready0}\n")
+		fmt.Fprintf(stdout, `[{"SourceFile":"x","Orientation":6,"PreviewImage":"%s"}]`, b64(jpg))
 	case "hang":
 		time.Sleep(time.Minute)
 	case "ffmpeg-short", "ffmpeg-short-old":
 		for i, a := range args {
 			if a == "-ss" && i+1 < len(args) && args[i+1] == "0" {
-				if _, err := os.Stdout.Write(jpg); err != nil {
-					return 99
-				}
-				return 0
+				return write(jpg)
 			}
 		}
 		if mode == "ffmpeg-short" {
-			fmt.Fprint(os.Stderr, "[out#0/image2pipe @ 0x0] Nothing was written into output file, because at least one of its streams received no packets.")
-			return 234
+			fmt.Fprint(stderr, "[out#0/image2pipe @ 0x0] Nothing was written into output file, because at least one of its streams received no packets.")
+			return 234, true
 		}
-	case "big":
-		if _, err := os.Stdout.Write(make([]byte, 2<<20)); err != nil {
-			return 99
+	case "ffmpeg-needs-file":
+		// Like real ffmpeg: exit non-zero when the input file is gone.
+		for i, a := range args {
+			if a == "-i" && i+1 < len(args) {
+				if _, err := os.Stat(strings.TrimPrefix(args[i+1], "file:")); err != nil {
+					fmt.Fprintln(stderr, args[i+1]+": No such file or directory")
+					return 254, true
+				}
+			}
 		}
+		return write(jpg)
+	case "big", "huge":
+		return write(make([]byte, 2<<20)) // tests lower maxToolOutput to 1 MiB
 	default:
-		fmt.Fprintln(os.Stderr, "fake tool: unknown mode", mode)
-		return 98
+		fmt.Fprintln(stderr, "fake tool: unknown mode", mode)
+		return 98, true
 	}
-	return 0
+	return 0, false
 }
 
 // fakeCache returns a Cache whose exiftool and ffmpeg are the fake tool in
-// the given mode, and the file that records the arguments of each call.
+// the given mode, and the file that records the arguments of each call
+// (each request, for exiftool). Each start of a stay_open fake is logged,
+// see fakeStarts.
 func fakeCache(t *testing.T, mode string, cfg Config) (*Cache, string) {
 	t.Helper()
 	cfg.Exiftool = os.Args[0]
 	cfg.FFmpeg = os.Args[0]
-	argsFile := filepath.Join(t.TempDir(), "args.jsonl")
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args.jsonl")
 	t.Setenv("SD2NAS_FAKE_TOOL", mode)
 	t.Setenv("SD2NAS_FAKE_ARGS", argsFile)
+	t.Setenv("SD2NAS_FAKE_TOOL_LOG", filepath.Join(dir, "starts.jsonl"))
+	// A -race build sleeps 1 s before exiting, which would make every
+	// Close of a stay_open fake time out and kill it.
+	t.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
 	return newCache(t, cfg), argsFile
+}
+
+// fakeStarts returns how many stay_open fakes have started in this test.
+func fakeStarts(t *testing.T) int {
+	t.Helper()
+	return countLines(t, os.Getenv("SD2NAS_FAKE_TOOL_LOG"))
 }
 
 // recordedArgs reads back the calls the fake tool recorded.
@@ -218,7 +323,17 @@ func TestRawPreviewArgs(t *testing.T) {
 	if !reddish(img.At(16, 4)) {
 		t.Errorf("top is not reddish: %v", img.At(16, 4))
 	}
-	wantArgs(t, argsFile, []string{"-json", "-b", "-n", "-Orientation", "-PreviewImage", "--", src.Path})
+	wantArgs(t, argsFile, exifArgs("PreviewImage", src.Path))
+	if n := fakeStarts(t); n != 1 {
+		t.Errorf("%d exiftool starts, want 1", n)
+	}
+}
+
+// exifArgs is one request to the stay_open exiftool for tag of path. The
+// path is absolute and goes without "--": exiftool ignores -execute after
+// "--" and would never answer.
+func exifArgs(tag, path string) []string {
+	return []string{"-charset", "filename=utf8", "-json", "-b", "-n", "-Orientation", "-" + tag, path}
 }
 
 func TestRawFallsBackToJpgFromRaw(t *testing.T) {
@@ -231,9 +346,10 @@ func TestRawFallsBackToJpgFromRaw(t *testing.T) {
 	if w, h := dims(t, dst); w != 64 || h != 32 {
 		t.Fatalf("size = %dx%d, want 64x32", w, h)
 	}
-	wantArgs(t, argsFile,
-		[]string{"-json", "-b", "-n", "-Orientation", "-PreviewImage", "--", src.Path},
-		[]string{"-json", "-b", "-n", "-Orientation", "-JpgFromRaw", "--", src.Path})
+	wantArgs(t, argsFile, exifArgs("PreviewImage", src.Path), exifArgs("JpgFromRaw", src.Path))
+	if n := fakeStarts(t); n != 1 {
+		t.Errorf("%d exiftool starts, want 1 (both requests share the process)", n)
+	}
 }
 
 func TestRawNoPreview(t *testing.T) {
@@ -252,10 +368,18 @@ func TestRawRejectsHugePreview(t *testing.T) {
 	}
 }
 
+func TestRawJSONError(t *testing.T) {
+	c, _ := fakeCache(t, "exif-error", Config{})
+	_, err := c.Get(context.Background(), fakeSource(t, 14, media.KindRaw), ThumbSize)
+	if !errors.Is(err, ErrUndecodable) || !strings.Contains(err.Error(), "File is empty") {
+		t.Fatalf("err = %v, want ErrUndecodable carrying the JSON Error", err)
+	}
+}
+
 func TestToolFailureSurfacesStderr(t *testing.T) {
-	c, _ := fakeCache(t, "fail", Config{})
+	c, _ := fakeCache(t, "stderr", Config{})
 	_, err := c.Get(context.Background(), fakeSource(t, 5, media.KindRaw), ThumbSize)
-	if err == nil || !strings.Contains(err.Error(), "boom: bad file") {
+	if err == nil || !strings.Contains(err.Error(), "File format error") {
 		t.Fatalf("err = %v, want one containing the tool's stderr", err)
 	}
 	if !errors.Is(err, ErrUndecodable) {
@@ -343,6 +467,77 @@ func TestVideoFailureReportsBoth(t *testing.T) {
 		t.Errorf("err = %v, want ErrUndecodable", err)
 	}
 	wantArgs(t, argsFile, videoArgs("1", src.Path), videoArgs("0", src.Path))
+}
+
+// TestVideoMovedWhileQueuedNotRemembered: the file was there when Get
+// checked it, but was renamed (by Shift, Move or Promote) before ffmpeg
+// ran, as happens while a render waits for a worker slot. The failure is
+// not the file's fault: it is answered as a missing file and not
+// remembered, so the next Get renders once the file is back.
+func TestVideoMovedWhileQueuedNotRemembered(t *testing.T) {
+	cases := []struct {
+		name string
+		move func(t *testing.T, path string)
+	}{
+		{"removed", func(t *testing.T, path string) {
+			if err := os.Rename(path, path+".moved"); err != nil {
+				t.Error(err)
+			}
+		}},
+		{"replaced", func(t *testing.T, path string) {
+			// Another file renamed onto the path; this one fails too.
+			other := writeSource(t, filepath.Dir(path), "other.bin", []byte("another file"))
+			if err := os.Rename(path, path+".moved"); err != nil {
+				t.Error(err)
+			}
+			if err := os.Rename(other, path); err != nil {
+				t.Error(err)
+			}
+		}},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mode := "ffmpeg-needs-file"
+			if tc.name == "replaced" {
+				mode = "fail"
+			}
+			c, _ := fakeCache(t, mode, Config{Workers: 1})
+			src := fakeSource(t, 13+i, media.KindVideo)
+			var renders atomic.Int32
+			c.render = func(ctx context.Context, s Source) (image.Image, error) {
+				if renders.Add(1) == 1 {
+					tc.move(t, s.Path)
+				}
+				return c.renderSource(ctx, s)
+			}
+			_, err := c.Get(context.Background(), src, ThumbSize)
+			if !errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrUndecodable) || errors.Is(err, ErrNoImage) {
+				t.Fatalf("first Get err = %v, want fs.ErrNotExist and not a fault of the file", err)
+			}
+			c.mu.Lock()
+			kept := len(c.failed)
+			c.mu.Unlock()
+			if kept != 0 {
+				t.Fatalf("%d failures remembered, want 0", kept)
+			}
+			if tc.name == "replaced" {
+				t.Setenv("SD2NAS_FAKE_TOOL", "ffmpeg-needs-file")
+				if err := os.Remove(src.Path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Rename(src.Path+".moved", src.Path); err != nil {
+				t.Fatal(err)
+			}
+			dst, err := c.Get(context.Background(), src, ThumbSize)
+			if err != nil {
+				t.Fatalf("second Get after the file is back: %v", err)
+			}
+			if w, h := dims(t, dst); w != 64 || h != 32 {
+				t.Fatalf("size = %dx%d, want 64x32", w, h)
+			}
+		})
+	}
 }
 
 func TestVideoBadFrame(t *testing.T) {

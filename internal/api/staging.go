@@ -23,7 +23,7 @@ type stagingHandlers struct {
 
 const (
 	smallBody = 64 << 10 // rename, merge, promote, forget
-	largeBody = 4 << 20  // move, cull: up to staging.MaxFiles hashes
+	largeBody = 4 << 20  // move, cull, shift: up to staging.MaxFiles hashes
 )
 
 // MountStaging registers the staging endpoints and the staging.changed
@@ -37,6 +37,7 @@ func (s *Server) MountStaging(svc *staging.Service) {
 	s.mux.HandleFunc("POST /api/staging/merge", h.merge)
 	s.mux.HandleFunc("POST /api/staging/move", h.move)
 	s.mux.HandleFunc("POST /api/staging/cull", h.cull)
+	s.mux.HandleFunc("POST /api/staging/shift", h.shift)
 	s.mux.HandleFunc("POST /api/staging/promote", h.promote)
 	s.mux.HandleFunc("GET /api/staging/promote", h.promoteStatus)
 	s.mux.HandleFunc("DELETE /api/staging/promote/{jobId}", h.cancelPromote) // no clash: DELETE /api/staging/{id} has one segment fewer
@@ -299,6 +300,23 @@ func (h *stagingHandlers) cull(w http.ResponseWriter, r *http.Request) {
 	res, err := h.svc.Cull(opContext(r), body.FileShas)
 	if err != nil {
 		writeOpError(w, h.log, "folder", "cull staged files", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (h *stagingHandlers) shift(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		FileShas []string `json:"fileShas"`
+		Seconds  *int64   `json:"seconds"` // nil: Shift answers the "Say how far" sentence
+	}
+	if err := decodeBody(w, r, &body, largeBody); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res, err := h.svc.Shift(opContext(r), staging.ShiftRequest{SHAs: body.FileShas, Seconds: body.Seconds})
+	if err != nil {
+		writeOpError(w, h.log, "folder", "shift staged files", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)

@@ -14,11 +14,13 @@ type notificationHandlers struct {
 }
 
 // MountNotifications registers GET /api/notifications and
-// POST /api/notifications/take, and makes Close close n. Call it before serving.
+// POST /api/notifications/take, tells n about every saved settings change,
+// and makes Close close n. Call it before serving.
 func (s *Server) MountNotifications(n *notices.Service) {
 	h := &notificationHandlers{n: n, s: s}
 	s.mux.HandleFunc("GET /api/notifications", h.pending)
 	s.mux.HandleFunc("POST /api/notifications/take", h.take)
+	s.onSettingsChanged(n.SettingsChanged) // never blocks
 	// Notices close first, before the services registered earlier, so a late
 	// tick never reads a closed service.
 	s.closers = append([]func(){n.Close}, s.closers...)

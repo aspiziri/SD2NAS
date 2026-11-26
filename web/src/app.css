@@ -41,7 +41,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .pill.bad { background: rgba(229,99,107,.15); color: var(--bad); }
 .pill.live { background: var(--warn); color: #1b1b1b; }
 details { background: var(--panel2); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
-summary { cursor: pointer; min-height: 24px; }
+summary { cursor: pointer; min-height: 44px; box-sizing: border-box; padding: 10px 0; margin: -10px 0; }
+details[open] > summary { margin-bottom: 0; }
 details ul { margin: 8px 0 0; padding-left: 18px; color: var(--muted); }
 .note { background: rgba(79,156,249,.1); border: 1px solid rgba(79,156,249,.35); border-radius: 8px; padding: 9px 11px; font-size: 13px; color: #b9d6fb; margin: 10px 0; }
 .note.ok { background: rgba(63,191,127,.1); border-color: rgba(63,191,127,.35); color: #a9e7c6; }
@@ -64,10 +65,11 @@ details ul { margin: 8px 0 0; padding-left: 18px; color: var(--muted); }
 .btn.danger { color: var(--bad); }
 .btn.bad { background: var(--bad); border-color: var(--bad); color: #fff; }
 .btn.link { background: none; border: 0; color: var(--accent); padding: 0 6px; }
-input[type=text], select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 9px 10px; font: inherit; width: 100%; min-height: 44px; }
+input[type=text], input[type=time], select, textarea { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 9px 10px; font: inherit; width: 100%; min-height: 44px; }
 input[type=checkbox], input[type=radio] { accent-color: var(--accent); width: 18px; height: 18px; margin: 0; }
 label.f { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 12px; }
 .preview { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; margin-top: 8px; max-height: 160px; overflow: auto; }
+textarea { resize: vertical; }
 .field-error { color: var(--bad); font-size: 12px; margin-top: 4px; }
 /* Long-press selects on touch: no text selection, callout or image drag. */
 .selectable { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }

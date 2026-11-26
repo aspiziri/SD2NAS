@@ -37,7 +37,8 @@ type Server struct {
 	mounts   []Mount
 	writable map[string]PathInfo // startup write probes, keyed by mount name
 	mux      *http.ServeMux
-	handler  http.Handler // mux behind the request guard
+	handler  http.Handler // mux behind the token check, behind the request guard
+	auth     auth         // SetToken; the zero value means no token
 	problems []string     // permanent /healthz problems added after startup
 	warnings []string     // permanent /healthz warnings added after startup
 
@@ -54,6 +55,9 @@ type Server struct {
 	feed         *ingestFeed   // set by MountIngest
 	hookMu       sync.Mutex
 	finished     []func(catalog.Ingest)
+
+	settingsMu  sync.Mutex
+	settingsFns []func() // run after every saved settings change
 }
 
 // New builds the server and probes writable mounts once. Probing on every
@@ -78,7 +82,12 @@ func New(version string, mounts []Mount) *Server {
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /api/events", s.handleEvents)
-	s.handler = guard(s.mux)
+	s.mux.HandleFunc("GET /api/auth", s.handleAuth)
+	s.mux.HandleFunc("POST /api/login", s.handleLogin)
+	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
+	// The guard goes first: a cross-site request is refused before it can
+	// learn whether its credentials were right.
+	s.handler = guard(s.requireToken(s.mux))
 	return s
 }
 
@@ -115,6 +124,20 @@ func (s *Server) finishedHooks() []func(catalog.Ingest) {
 	s.hookMu.Lock()
 	defer s.hookMu.Unlock()
 	return append([](func(catalog.Ingest))(nil), s.finished...)
+}
+
+// onSettingsChanged registers fn to run after every saved settings change.
+// fn must not block.
+func (s *Server) onSettingsChanged(fn func()) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	s.settingsFns = append(s.settingsFns, fn)
+}
+
+func (s *Server) settingsHooks() []func() {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	return append([]func(){}, s.settingsFns...)
 }
 
 // AddProblem adds a permanent /healthz problem (for example, the catalog

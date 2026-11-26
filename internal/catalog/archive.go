@@ -469,6 +469,23 @@ func (d *DB) ArchiveCounts(ctx context.Context) (ArchiveCounts, error) {
 	return c, nil
 }
 
+// MissingSince counts the assets marked missing after after (updated_at,
+// still missing) and returns the newest such updated_at (zero when n is 0).
+func (d *DB) MissingSince(ctx context.Context, after time.Time) (n int, latest time.Time, err error) {
+	var last string
+	// formatTime is fixed width, so text order is time order
+	if err := d.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM assets
+		WHERE state = 'missing' AND updated_at > ?`, formatTime(after)).Scan(&n, &last); err != nil {
+		return 0, time.Time{}, fmt.Errorf("count missing since %s: %w", formatTime(after), err)
+	}
+	if last != "" {
+		if latest, err = parseTime(last); err != nil {
+			return 0, time.Time{}, fmt.Errorf("count missing since %s: parse updated_at %q: %w", formatTime(after), last, err)
+		}
+	}
+	return n, latest, nil
+}
+
 // MissingFiles returns up to limit missing files under Archive/, by rel_path.
 func (d *DB) MissingFiles(ctx context.Context, limit int) ([]MissingFile, error) {
 	lo, hi, err := prefixRange(ArchiveRoot)

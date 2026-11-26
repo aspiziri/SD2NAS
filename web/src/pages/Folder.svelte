@@ -4,16 +4,20 @@
   import { live } from '../lib/live.svelte.js';
   import { navigate } from '../lib/router.svelte.js';
   import { isId } from '../lib/paths.js';
-  import { formatBytes, dateRange, kindChips, extLabel } from '../lib/format.js';
+  import { formatBytes, dateRange, kindChips, extLabel, formatCapture } from '../lib/format.js';
+  import { needsReload } from '../lib/views.js';
+  import { loadPref, savePref, FOLDER_VIEW_KEY } from '../lib/prefs.js';
   import { clickAction, toggleKey, selectRange, dragSelection, prune } from '../lib/selection.js';
   import { folderDate, folderName, checkFolderName } from '../lib/naming.js';
   import { describeError, plural } from '../lib/messages.js';
+  import { parseAmount, secondsBetween, previewShift, isWholeShift, MAX_SHIFT, MAX_SHIFT_FILES } from '../lib/shift.js';
   import { longPressSelect } from '../lib/press.js';
   import { toast } from '../lib/toast.svelte.js';
   import Thumb from '../components/Thumb.svelte';
   import Lightbox from '../components/Lightbox.svelte';
   import Dialog from '../components/Dialog.svelte';
   import SelectionBar from '../components/SelectionBar.svelte';
+  import ViewSwitch from '../components/ViewSwitch.svelte';
 
   let { id } = $props();
   let kind = $state(''); // the chip asked for; '' = all
@@ -23,12 +27,20 @@
   let gone = $state(false); // the folder no longer exists (merged, promoted, discarded)
   let open = $state(-1); // index into data.files shown full screen; -1 = none
   let ctl = null;
+  let reloadedOnce = false; // F10: one extra load when a load returns a version other than the live one
+
+  const VIEWS = [{ value: 'grid', label: 'Grid' }, { value: 'list', label: 'List' }];
+  let view = $state(loadPref(FOLDER_VIEW_KEY, VIEWS.map((v) => v.value), 'grid'));
+  function setView(v) {
+    view = v;
+    savePref(FOLDER_VIEW_KEY, v);
+  }
 
   let selected = $state(new Set()); // file hashes
   let anchor = null;
   let drag = null; // { base, anchor, adding } while a finger drag-selects
 
-  let dialog = $state(''); // '' | 'move' | 'cull'
+  let dialog = $state(''); // '' | 'move' | 'cull' | 'shift'
   let busy = $state(false);
   let dialogError = $state('');
   let others = $state(null); // the other staging folders, for "Move to…"
@@ -56,6 +68,14 @@
         if (j >= 0) open = j;
         else hide();
       }
+      // The event that announced this version may have arrived while the
+      // request ran: if the stream is ahead of what we got, load once more.
+      if (needsReload(res.version, live.staging.version, live.connected)) {
+        if (!reloadedOnce) {
+          reloadedOnce = true;
+          load(k);
+        }
+      } else reloadedOnce = false;
     } catch (err) {
       if (err.name === 'AbortError' || mine.signal.aborted) return;
       if (err.status === 404) {
@@ -235,6 +255,101 @@
     });
   }
 
+  // Shift times. shiftFiles are the files the shift is about: the selection, or
+  // every staged file of the folder whatever the kind chips show (PF23).
+  const TOO_MANY = "Folders over 20,000 files can't be shifted whole; select fewer files.";
+  let shiftFiles = $state([]);
+  let shiftWhole = $state(false);
+  let shiftLoading = $state(false);
+  let shiftMode = $state('amount'); // 'amount' | 'target'
+  let shiftSign = $state('+');
+  let shiftFields = $state({ days: '', hours: '', minutes: '', seconds: '' });
+  let shiftTarget = $state('');
+  let shiftTouched = $state(false); // the user changed something: only then is a "not yet" error shown
+  let dayStartsAt = $state('');
+  let previewNote = $state('');
+
+  const shiftFirst = $derived(
+    shiftFiles.reduce((best, x) => (x.capture_time && (!best || x.capture_time < best.capture_time) ? x : best), null),
+  );
+  const shiftAmount = $derived.by(() => {
+    if (shiftMode === 'amount') return parseAmount({ sign: shiftSign, ...shiftFields });
+    if (!shiftFirst) return { error: 'None of these files has a capture time.' };
+    const secs = shiftTarget ? secondsBetween(shiftFirst.capture_time, shiftTarget) : NaN;
+    if (Number.isNaN(secs)) return { error: 'Enter the time this file should read.' };
+    if (secs === 0) return { error: 'Shift by at least one second.' };
+    if (Math.abs(secs) > MAX_SHIFT) return { error: 'Shift by at most 100 years.' };
+    return { seconds: secs };
+  });
+  const shiftPreview = $derived(
+    shiftAmount.seconds !== undefined && data ? previewShift(shiftFiles, shiftAmount.seconds, { dayStartsAt, folder: data.folder, whole: shiftWhole }) : null,
+  );
+
+  async function openShift(whole) {
+    dialogError = '';
+    previewNote = '';
+    shiftWhole = isWholeShift({ button: whole, kind: shownKind, selected: selected.size, folderFiles: data.folder.files });
+    shiftTouched = false;
+    shiftMode = 'amount';
+    shiftSign = '+';
+    shiftFields = { days: '', hours: '', minutes: '', seconds: '' };
+    shiftTarget = '';
+    shiftLoading = whole && shownKind !== '';
+    shiftFiles = whole ? (shiftLoading ? [] : files) : files.filter((x) => selected.has(x.sha256));
+    dialog = 'shift';
+    const jobs = [];
+    if (shiftLoading) {
+      jobs.push(
+        api(`/api/staging/${id}/files`).then(
+          (res) => (shiftFiles = res.files),
+          (err) => (dialogError = `Couldn't list every file of this folder: ${describeError(err)}`),
+        ),
+      );
+    }
+    if (!dayStartsAt) {
+      jobs.push(
+        api('/api/settings').then(
+          (res) => (dayStartsAt = res.settings.day_starts_at),
+          (err) => (previewNote = `The new folder dates can't be previewed: ${describeError(err)}`),
+        ),
+      );
+    }
+    await Promise.all(jobs);
+    shiftLoading = false;
+    if (!shiftTarget) shiftTarget = shiftFirst?.capture_time.slice(0, 19) ?? '';
+  }
+
+  // A 4xx answer means nothing was shifted, so the dialog stays for a retry.
+  // Any other failure may have shifted some files already (a 500 "shifted N of
+  // M files: ..."): the dialog's file list is then stale, so close it, say what
+  // the server said, and reload; a second submit from it must never happen.
+  async function doShift() {
+    const seconds = shiftAmount.seconds;
+    const shas = shiftFiles.map((x) => x.sha256);
+    busy = true;
+    dialogError = '';
+    try {
+      const res = await api('/api/staging/shift', { method: 'POST', body: { fileShas: shas, seconds } });
+      let msg = `Shifted ${plural(res.shifted, 'file', 'files')}`;
+      if (res.moved) msg += `; ${plural(res.moved, 'file', 'files')} moved to other folders`;
+      if (res.skipped) msg += `; ${plural(res.skipped, 'file', 'files')} had no capture time`;
+      toast(res.wanted_name ? `${msg}. The folder kept its name ${res.folder.name}; it wanted ${res.wanted_name}. Merge them if they belong together.` : msg);
+      dialog = '';
+      clear();
+      if (res.removed) navigate('/staging', { replace: true });
+      else load(shownKind);
+    } catch (err) {
+      if (err.status >= 400 && err.status < 500) dialogError = describeError(err);
+      else {
+        dialog = '';
+        toast(describeError(err), 'bad', 10000);
+      }
+      load(shownKind);
+    } finally {
+      busy = false;
+    }
+  }
+
   function doCull() {
     const shas = [...selected];
     const fid = data.folder.id;
@@ -265,6 +380,7 @@
   {@const f = data.folder}
   <h1>{f.name}</h1>
   <p class="sub">{dateRange(f.dates)} · {plural(f.files, 'file', 'files')} · {formatBytes(f.bytes)}</p>
+  {#if f.files > MAX_SHIFT_FILES}<p class="muted small">{TOO_MANY}</p>{/if}
   {#if error}
     <div class="note bad" role="alert">Couldn't refresh this folder: {error}</div>
   {/if}
@@ -272,6 +388,7 @@
   {#if selecting}
     <SelectionBar count={selected.size} total={files.length} onclear={clear} onall={selectAll}>
       <button class="btn" onclick={openMove}>Move to…</button>
+      <button class="btn" onclick={() => openShift(false)}>Shift times…</button>
       <button class="btn danger" onclick={() => { dialogError = ''; dialog = 'cull'; }}>Cull</button>
     </SelectionBar>
   {/if}
@@ -282,6 +399,8 @@
       {/each}
     </div>
     <span class="spacer"></span>
+    <ViewSwitch label="View" options={VIEWS} value={view} onchange={setView} />
+    <button class="btn" onclick={() => openShift(true)} disabled={f.files > MAX_SHIFT_FILES} title={f.files > MAX_SHIFT_FILES ? TOO_MANY : ''}>Shift all times…</button>
     {#if inArchive.length && !selecting}
       <button class="btn" onclick={selectInArchive}>Select {inArchive.length} in archive</button>
     {:else if !selecting}
@@ -292,6 +411,31 @@
   {#if files.length === 0}
     <p class="muted">No files here.</p>
   {:else}
+    {#if view === 'list'}
+      <div class="rows selectable" class:selecting use:longPressSelect={press}>
+        {#each files as file, i (file.sha256)}
+          {@const on = selected.has(file.sha256)}
+          <div class="lrow" class:sel={on} data-key={file.sha256}>
+            <button class="lpick" onclick={() => toggle(file.sha256)} aria-pressed={on} aria-label="{on ? 'Unselect' : 'Select'} {file.name}">
+              <span class="box" class:on>✓</span>
+            </button>
+            <button class="lbody" onclick={(e) => onTileClick(e, i)} aria-label={selecting ? `${on ? 'Unselect' : 'Select'} ${file.name}` : `Show ${file.name}`}>
+              <span class="lthumb"><Thumb sha={file.sha256} kind={file.kind} label={extLabel(file)} /></span>
+              <span class="linfo">
+                <span class="lname">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠ </span>{/if}{file.name}</span>
+                <span class="lmeta small muted">
+                  {#if file.capture_time}<span>{formatCapture(file.capture_time)}</span>{/if}
+                  <span>{file.kind === 'raw' ? 'RAW' : file.kind === 'video' ? 'Video' : 'JPG'}</span>
+                  <span>{formatBytes(file.size)}</span>
+                  {#if file.clock_warnings?.length}<span class="warn">Check the clock</span>{/if}
+                  {#if file.in_archive}<span class="pill ok" title="Already in the archive: {file.in_archive}">In archive</span>{/if}
+                </span>
+              </span>
+            </button>
+          </div>
+        {/each}
+      </div>
+    {:else}
     <div class="grid selectable" class:selecting use:longPressSelect={press}>
       {#each files as file, i (file.sha256)}
         {@const on = selected.has(file.sha256)}
@@ -305,6 +449,7 @@
         </div>
       {/each}
     </div>
+    {/if}
   {/if}
   {#if open >= 0 && open < files.length}
     <Lightbox files={data.files} bind:index={open} onclose={hide} />
@@ -334,6 +479,58 @@
     {#snippet actions()}
       <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
       <button class="btn primary" onclick={doMove} disabled={busy || !moveReady}>{busy ? 'Moving…' : 'Move'}</button>
+    {/snippet}
+  </Dialog>
+
+  <Dialog open={dialog === 'shift'} title={shiftWhole ? 'Shift all times' : `Shift ${plural(shiftFiles.length, 'file', 'files')}`} onclose={() => !busy && (dialog = '')} {busy}>
+    <div class="dests" role="radiogroup" aria-label="How to shift">
+      <label class="dest"><input type="radio" bind:group={shiftMode} value="amount" /> <span>By an amount</span></label>
+      {#if shiftMode === 'amount'}
+        <div class="amount">
+          <div class="sign" role="group" aria-label="Direction">
+            <button class="btn" class:primary={shiftSign === '+'} aria-pressed={shiftSign === '+'} onclick={() => { shiftSign = '+'; shiftTouched = true; }} aria-label="+ (later)">+</button>
+            <button class="btn" class:primary={shiftSign === '-'} aria-pressed={shiftSign === '-'} onclick={() => { shiftSign = '-'; shiftTouched = true; }} aria-label="− (earlier)">−</button>
+          </div>
+          {#each [['days', 'Days'], ['hours', 'Hours'], ['minutes', 'Minutes'], ['seconds', 'Seconds']] as [key, label] (key)}
+            <label class="num"><span class="muted small">{label}</span>
+              <input type="text" inputmode="numeric" placeholder="0" bind:value={shiftFields[key]} oninput={() => (shiftTouched = true)} /></label>
+          {/each}
+        </div>
+      {/if}
+      <label class="dest"><input type="radio" bind:group={shiftMode} value="target" /> <span>So that a file reads…</span></label>
+      {#if shiftMode === 'target' && shiftFirst}
+        <div class="amount target">
+          <p class="small" style="margin:0"><span class="mono">{shiftFirst.name}</span> now reads <span class="mono">{formatCapture(shiftFirst.capture_time)}</span>. It should read:</p>
+          <input class="dt" type="datetime-local" step="1" bind:value={shiftTarget} oninput={() => (shiftTouched = true)} aria-label="Correct time for {shiftFirst.name}" />
+        </div>
+      {/if}
+    </div>
+    {#if shiftLoading}
+      <p class="muted small">Loading files…</p>
+    {:else if shiftAmount.error}
+      {#if shiftTouched || shiftAmount.error !== 'Shift by at least one second.'}<div class="field-error">{shiftAmount.error}</div>{/if}
+    {:else if shiftPreview?.error}
+      <div class="field-error">{shiftPreview.error}</div>
+    {:else if shiftPreview}
+      <div class="note preview">
+        {#if shiftPreview.first}
+          <div>First: <span class="mono">{shiftPreview.first.from}</span> → <span class="mono">{shiftPreview.first.to}</span></div>
+          {#if shiftPreview.count > 1}<div>Last: <span class="mono">{shiftPreview.last.from}</span> → <span class="mono">{shiftPreview.last.to}</span></div>{/if}
+        {/if}
+        {#if shiftPreview.folderName !== null}
+          <div>{shiftPreview.folderName === data.folder.name ? 'The folder keeps its name:' : 'The folder is renamed:'} <span class="mono">{shiftPreview.folderName}</span></div>
+        {:else if shiftPreview.moved}
+          <div>{plural(shiftPreview.moved, 'file leaves', 'files leave')} this folder.</div>
+        {/if}
+        {#if shiftPreview.skipped}<div>{plural(shiftPreview.skipped, 'file has', 'files have')} no capture time and stays as it is.</div>{/if}
+      </div>
+    {/if}
+    {#if previewNote}<p class="muted small">{previewNote}</p>{/if}
+    <p class="muted small">Only names and capture times change; the files' contents stay as they are. Files whose new date isn't one of this folder's dates move to the folder for that date.</p>
+    {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
+    {#snippet actions()}
+      <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
+      <button class="btn primary" onclick={doShift} disabled={busy || shiftLoading || shiftFiles.length === 0 || shiftAmount.seconds === undefined || !!shiftPreview?.error}>{busy ? 'Shifting…' : 'Shift'}</button>
     {/snippet}
   </Dialog>
 
@@ -374,10 +571,36 @@
   @media (hover: hover) { .cell:hover .pick { opacity: 1; } }
   /* On touch the invisible tick must not swallow taps meant for the tile. */
   @media (hover: none) { .grid:not(.selecting) .pick { pointer-events: none; } }
+  /* List view: a 56 px thumbnail, then the name and details. The tick is its own 44 px target. */
+  .rows { display: flex; flex-direction: column; gap: 4px; }
+  .lrow { display: flex; align-items: center; min-height: 56px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  .lrow.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .lpick { flex: none; width: 44px; align-self: stretch; min-height: 56px; padding: 0; border: 0; background: none; cursor: pointer; display: grid; place-items: center; }
+  .box { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700; border: 2px solid var(--muted); color: transparent; }
+  .box.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .lbody { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; background: none; border: 0; padding: 0 10px 0 0; color: inherit; font: inherit; text-align: left; cursor: pointer; min-height: 56px; }
+  .lbody:hover .lname { color: var(--accent); }
+  .lthumb { flex: none; width: 84px; padding: 0; }
+  .linfo { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
+  .lname { overflow-wrap: anywhere; }
+  .lmeta { display: flex; flex-wrap: wrap; gap: 0 10px; align-items: center; }
+  .rows.selecting .lbody { cursor: pointer; }
+  .amount { display: grid; grid-template-columns: auto repeat(4, minmax(0, 1fr)); gap: 8px; align-items: end; margin: 0 0 8px 28px; }
+  .amount.target { display: block; }
+  .amount.target > p { margin-bottom: 8px; }
+  .sign { display: flex; gap: 4px; }
+  .sign .btn { min-width: 44px; justify-content: center; padding: 0; }
+  .num { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .num input { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 9px 10px; font: inherit; width: 100%; min-height: 44px; box-sizing: border-box; }
+  .dt { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 9px 10px; font: inherit; width: 100%; min-height: 44px; box-sizing: border-box; }
+  .preview div { overflow-wrap: anywhere; }
   .dests { display: grid; gap: 2px; max-height: 50dvh; overflow: auto; margin: 0 -4px; padding: 0 4px; }
   .dest { display: flex; gap: 10px; align-items: center; min-height: 44px; cursor: pointer; overflow-wrap: anywhere; }
   .newfolder { margin: 0 0 8px 28px; }
   @media (max-width: 760px) {
+    .amount { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-left: 0; }
+    .sign { grid-column: 1 / -1; }
+    .sign .btn { flex: 1; }
     .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
     .hidden-phone { display: none; }
   }

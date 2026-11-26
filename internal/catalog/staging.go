@@ -95,6 +95,30 @@ func (d *DB) StagingFolderForDate(ctx context.Context, date string, at time.Time
 	return out, nil
 }
 
+// StagingFolderWithDate is StagingFolderForDate's two lookups without
+// writing: the folder whose dates contain date (lowest id), else the folder
+// named exactly date, returned with its dates unchanged (the caller adds
+// date). false when neither exists.
+func (d *DB) StagingFolderWithDate(ctx context.Context, date string) (StagingFolder, bool, error) {
+	if !dateRE.MatchString(date) {
+		return StagingFolder{}, false, fmt.Errorf("staging folder: bad date %q", date)
+	}
+	for _, q := range []string{
+		"SELECT " + stagingCols + ` FROM staging_folders f
+			WHERE EXISTS (SELECT 1 FROM json_each(f.dates) WHERE json_each.value = ?) ORDER BY id LIMIT 1`,
+		"SELECT " + stagingCols + " FROM staging_folders WHERE name = ?",
+	} {
+		f, err := scanStagingFolder(d.db.QueryRowContext(ctx, q, date))
+		if err == nil {
+			return f, true, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return StagingFolder{}, false, fmt.Errorf("staging folder with %s: %w", date, err)
+		}
+	}
+	return StagingFolder{}, false, nil
+}
+
 // StagingFolders returns every folder ordered by name.
 func (d *DB) StagingFolders(ctx context.Context) ([]StagingFolder, error) {
 	rows, err := d.db.QueryContext(ctx, "SELECT "+stagingCols+" FROM staging_folders ORDER BY name")

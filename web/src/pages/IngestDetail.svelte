@@ -16,7 +16,9 @@
   const MAX = 200; // longest file list shown
 
   let forget = $state(null); // GET /api/ingest/{id}/forget, for finished imports
-  let dialog = $state(''); // '' | 'forget' | 'reimport'
+  let dialog = $state(''); // '' | 'forget' | 'reimport' | 'reimportMissing'
+  // Missing files not yet asked for: what the re-import button would request.
+  const toRequest = $derived(Math.max(0, (forget?.restorable ?? 0) - (forget?.restore_requested ?? 0)));
   let busy = $state(false);
   let dialogError = $state('');
   let deleteFiles = $state(false); // Decision 10: starts unticked
@@ -67,6 +69,14 @@
     run(async () => {
       const res = await api(`/api/ingest/${id}/reimport-culled`, { method: 'POST' });
       toast(res.message, res.forgotten ? 'ok' : 'warn', 7000);
+      if (res.started) navigate('/ingest');
+    });
+  }
+
+  function doReimportMissing() {
+    run(async () => {
+      const res = await api(`/api/ingest/${id}/reimport-missing`, { method: 'POST' });
+      toast(res.message, res.requested ? 'ok' : 'warn', 7000);
       if (res.started) navigate('/ingest');
     });
   }
@@ -190,6 +200,13 @@
     <details open>
       <summary>{missingCopies(missing.length)}</summary>
       <p class="muted small" style="margin:8px 0">SD2NAS knows these files, but their copies in the archive are gone, so the card isn't safe to format. Keep it until you've found or restored them; the Archive index page lists the missing files.</p>
+      {#if forget && forget.restore_requested > 0}
+        <p class="small" style="margin:8px 0">{plural(forget.restore_requested, 'file', 'files')} will be imported again the next time you insert the card.</p>
+      {/if}
+      {#if forget && toRequest > 0}
+        <button class="btn" disabled={importing} onclick={() => { dialogError = ''; dialog = 'reimportMissing'; }}>Re-import {plural(toRequest, 'missing file', 'missing files')}…</button>
+        {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
+      {/if}
       {@render fileList(missing, missingRow)}
     </details>
   {/if}
@@ -230,6 +247,7 @@
       <li>{plural(forget.staged, 'file', 'files')} still in staging ({formatBytes(forget.staged_bytes)})</li>
       <li>{plural(forget.culled, 'culled file', 'culled files')}</li>
       <li>{plural(forget.archived, 'file', 'files')} already in the archive stay known</li>
+      {#if forget.missing > 0}<li>{plural(forget.missing, 'file', 'files')} whose archive copy is missing stay known</li>{/if}
     </ul>
     {#if forget.staged}
       <label class="toggle"><input type="checkbox" bind:checked={deleteFiles} /> <span>Also delete the {plural(forget.staged, 'file', 'files')} still in staging</span></label>
@@ -253,6 +271,16 @@
   {#snippet actions()}
     <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
     <button class="btn primary" onclick={doReimport} disabled={busy}>{busy ? 'Working…' : 'Re-import'}</button>
+  {/snippet}
+</Dialog>
+
+<Dialog open={dialog === 'reimportMissing'} title="Re-import {plural(toRequest, 'missing file', 'missing files')}?" onclose={() => !busy && (dialog = '')} {busy}>
+  <p class="muted">SD2NAS copies these files from the card into Staging again. If an array disk dropped out, fix that first: its files come back by themselves at the next archive scan.</p>
+  <p class="muted">If the card is still in the reader, this starts right away; otherwise the files are copied the next time it is inserted.</p>
+  {#if dialogError}<div class="note bad" role="alert">{dialogError}</div>{/if}
+  {#snippet actions()}
+    <button class="btn" onclick={() => (dialog = '')} disabled={busy}>Cancel</button>
+    <button class="btn primary" onclick={doReimportMissing} disabled={busy}>{busy ? 'Working…' : 'Re-import'}</button>
   {/snippet}
 </Dialog>
 

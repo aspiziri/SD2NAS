@@ -2,10 +2,12 @@ package api
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/aspiziri/SD2NAS/internal/indexer"
 )
@@ -110,17 +112,18 @@ func (h *archiveHandlers) changed(w http.ResponseWriter, r *http.Request) {
 
 func (h *archiveHandlers) accept(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		UpTo *int64 `json:"upTo"`
+		UpTo json.RawMessage `json:"upTo"`
 	}
 	if err := decodeBody(w, r, &body, smallBody); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.UpTo == nil || *body.UpTo < 1 {
+	upTo, err := strconv.ParseInt(string(body.UpTo), 10, 64)
+	if len(body.UpTo) == 0 || err != nil || upTo < 1 {
 		writeError(w, http.StatusBadRequest, "upTo must be a positive whole number.")
 		return
 	}
-	n, err := h.idx.Accept(opContext(r), *body.UpTo)
+	n, err := h.idx.Accept(opContext(r), upTo)
 	if err != nil {
 		h.fail(w, "accept archive changes", err)
 		return

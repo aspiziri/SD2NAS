@@ -149,13 +149,17 @@ func (h *Hub) Len() int {
 // falls too far behind, or the server closes. A failed write or flush
 // means the client has gone, so the stream just ends.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	ch, unsubscribe := s.hub.subscribe()
-	defer unsubscribe()
-	rc := http.NewResponseController(w)
 	hdr := w.Header()
 	hdr.Set("Content-Type", "text/event-stream")
 	hdr.Set("Cache-Control", "no-store")
 	hdr.Set("X-Accel-Buffering", "no")
+	if r.Method == http.MethodHead { // the GET route answers HEAD too: headers only, at once
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	ch, unsubscribe := s.hub.subscribe()
+	defer unsubscribe()
+	rc := http.NewResponseController(w)
 	w.WriteHeader(http.StatusOK)
 	write := func(b []byte) bool {
 		if _, err := w.Write(b); err != nil {

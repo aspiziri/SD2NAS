@@ -325,3 +325,62 @@ func TestRenameStagingFolderLeavesPromotedAt(t *testing.T) {
 		t.Errorf("promoted_at = %v, want NULL", p)
 	}
 }
+
+func TestShiftAsset(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	capture := time.Date(2025, 5, 30, 14, 2, 11, 0, time.Local)
+	a := Asset{SHA256: hexN(1), Size: 1, Kind: media.KindImage, CaptureTime: capture, State: StateStaged,
+		RelPath: "Staging/2025-05-30/2025-05-30 14.02.11.JPG", UpdatedAt: t0}
+	if err := d.InsertAsset(ctx, a, hexN(101)); err != nil {
+		t.Fatal(err)
+	}
+	other := stagedAt(t, d, 2, "Staging/2025-05-30/b.JPG")
+	in, err := d.CreateIngest(ctx, "/cards/X", "X", "", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = d.AddClockWarnings(ctx, in.ID, []ClockWarning{
+		{CardPath: "DCIM/a.JPG", SHA256: a.SHA256, Kind: ClockFuture, Detail: "in the future"},
+		{CardPath: "DCIM/a.JPG", SHA256: a.SHA256, Kind: ClockGPSMismatch, Detail: "gps"},
+		{CardPath: "DCIM/b.JPG", SHA256: other, Kind: ClockFuture, Detail: "x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shifted := capture.Add(time.Hour)
+	if err := d.ShiftAsset(ctx, a.SHA256, "Staging/2025-05-30/2025-05-30 15.02.11.JPG", shifted, t2); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.AssetBySHA(ctx, a.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CaptureTime.Format(CaptureLayout) != "2025-05-30T15:02:11" || got.RelPath != "Staging/2025-05-30/2025-05-30 15.02.11.JPG" ||
+		!got.UpdatedAt.Equal(t2) || got.State != StateStaged {
+		t.Errorf("asset = %+v", got)
+	}
+	ws, err := d.ClockWarnings(ctx, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 1 || ws[0].SHA256 != other {
+		t.Errorf("clock warnings = %+v, want only the other file's", ws)
+	}
+
+	if err := d.ArchiveAsset(ctx, other, "Archive/b.JPG", t0); err != nil {
+		t.Fatal(err)
+	}
+	err = d.ShiftAsset(ctx, other, "Staging/2025-05-30/c.JPG", shifted, t2)
+	if !errors.Is(err, ErrWrongState) {
+		t.Errorf("archived: err = %v, want ErrWrongState", err)
+	}
+	wantPath(t, d, other, "Archive/b.JPG", StateArchived)
+	if ws, _ := d.ClockWarnings(ctx, in.ID); len(ws) != 1 {
+		t.Errorf("a refused shift deleted clock warnings: %+v", ws)
+	}
+	if err := d.ShiftAsset(ctx, hexN(9), "Staging/x.JPG", shifted, t2); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown hash: err = %v, want ErrNotFound", err)
+	}
+}

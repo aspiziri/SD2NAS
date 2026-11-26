@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { plural, joinList, describeError, rescanSummary, promoteSummary, promoteToast, promoteStates, missingCopies } from './messages.js';
+import { plural, joinList, describeError, rescanSummary, promoteSummary, promoteToast, promoteStates, missingCopies, waitingText, copyDetail } from './messages.js';
 import { ApiError } from './api.js';
 
 const scan = (o) => ({ adopted_folders: 0, added_files: 0, moved_files: 0, restored_files: 0, culled_files: 0, removed_folders: 0,
@@ -94,4 +94,20 @@ test('missingCopies', () => {
   assert.equal(missingCopies(1), "1 file's archive copy is missing");
   assert.equal(missingCopies(2), "2 files' archive copies are missing");
   assert.equal(missingCopies(1234), "1,234 files' archive copies are missing");
+});
+
+test('waitingText names who holds the folder', () => {
+  assert.equal(waitingText('2025-05-30 - Trip', 'promote'), 'Waiting for 2025-05-30 - Trip: a promote is moving it.');
+  assert.equal(waitingText('2025-05-30 - Trip', 'operation'), 'Waiting for 2025-05-30 - Trip: a staging change is in progress.');
+  assert.equal(waitingText('2025-05-30 - Trip', 'rescan'), 'Waiting for 2025-05-30 - Trip: the staging rescan is checking it.');
+  assert.equal(waitingText('2025-05-30 - Trip', 'other'), 'Waiting for 2025-05-30 - Trip: it is busy.');
+  assert.equal(waitingText('2025-05-30 - Trip', ''), 'Waiting for 2025-05-30 - Trip: it is busy.');
+});
+
+test('copyDetail shows the current big file only', () => {
+  assert.equal(copyDetail({ current: 'DCIM/100MSDCF/C0001.MP4', current_size: 8e9, current_done: 2e9 }), 'Copying C0001.MP4 · 2.0 GB of 8.0 GB');
+  assert.equal(copyDetail({ current: 'C0001.MP4', current_size: 49_999_999, current_done: 1 }), null);
+  assert.equal(copyDetail({ current_size: 8e9, current_done: 1 }), null);
+  assert.equal(copyDetail({ current: 'a\\b\\C2.MP4', current_size: 5e7, current_done: 0 }), 'Copying C2.MP4 · 0 B of 50.0 MB');
+  assert.equal(copyDetail(null), null);
 });

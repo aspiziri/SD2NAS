@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"io/fs"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -96,7 +97,7 @@ func decodeUntrusted(data []byte) (image.Image, error) {
 // JpgFromRaw), turned upright with the RAW's own Orientation tag.
 func (c *Cache) rawPreview(ctx context.Context, path string) (image.Image, error) {
 	for _, tag := range []string{"PreviewImage", "JpgFromRaw"} {
-		out, err := c.runTool(ctx, c.cfg.Exiftool, "-json", "-b", "-n", "-Orientation", "-"+tag, "--", path)
+		out, err := c.exiftool(ctx, path, "-json", "-b", "-n", "-Orientation", "-"+tag)
 		if err != nil {
 			return nil, err
 		}
@@ -106,6 +107,9 @@ func (c *Cache) rawPreview(ctx context.Context, path string) (image.Image, error
 		}
 		if len(res) != 1 {
 			return nil, fmt.Errorf("%w: exiftool output: %d results, want 1", ErrUndecodable, len(res))
+		}
+		if msg, _ := res[0]["Error"].(string); msg != "" {
+			return nil, fmt.Errorf("exiftool: %w: %s", ErrUndecodable, msg)
 		}
 		enc, _ := res[0][tag].(string) // absent when the file has no such image
 		if enc == "" {
@@ -127,6 +131,56 @@ func (c *Cache) rawPreview(ctx context.Context, path string) (image.Image, error
 		return orient(img, int(o)), nil
 	}
 	return nil, ErrNoImage
+}
+
+// exiftool runs exiftool with opts for path and returns its stdout. It goes
+// through the long-lived -stay_open process, except for a path the argfile
+// can't carry: one with a line break, or a relative one, which without
+// "--" could read as an option (exiftool ignores -execute after "--", so a
+// request can't use it). Those get a process of their own, as before.
+func (c *Cache) exiftool(ctx context.Context, path string, opts ...string) ([]byte, error) {
+	if !filepath.IsAbs(path) || strings.ContainsAny(path, "\r\n") {
+		return c.runTool(ctx, c.cfg.Exiftool, append(opts, "--", path)...)
+	}
+	args := append(append([]string{"-charset", "filename=utf8"}, opts...), path)
+	out, msg, err := c.exif.run(ctx, args)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("exiftool: %w", err)
+		}
+		return nil, err
+	}
+	if msg != "" {
+		// exiftool -stay_open keeps going after a file it can't read, so
+		// its "Error:" line (or stderr without any answer) stands in for a
+		// one-shot run's failing exit status.
+		if strings.Contains(msg, "Error: File not found") {
+			// Moved or deleted since generate looked: not the file's fault,
+			// so not to be remembered.
+			return nil, fmt.Errorf("exiftool: %w: %s", fs.ErrNotExist, msg)
+		}
+		if strings.Contains(msg, "Error: Error opening file") {
+			// Unreadable (permissions, I/O): a fault the owner can fix, as
+			// os.Open's EACCES is for a JPEG, so not to be remembered.
+			return nil, fmt.Errorf("exiftool: %w: %s", fs.ErrPermission, msg)
+		}
+		if len(bytes.TrimSpace(out)) == 0 || hasErrorLine(msg) {
+			return nil, fmt.Errorf("exiftool: %w: %s", ErrUndecodable, msg)
+		}
+		c.cfg.Log.Warn("tool wrote to stderr", "tool", filepath.Base(c.cfg.Exiftool), "args", args, "stderr", msg)
+	}
+	return out, nil
+}
+
+// hasErrorLine reports whether exiftool's stderr reports an error (rather
+// than only warnings) for the file.
+func hasErrorLine(msg string) bool {
+	for _, l := range strings.Split(msg, "\n") {
+		if strings.HasPrefix(l, "Error: ") {
+			return true
+		}
+	}
+	return false
 }
 
 // videoFrame returns the frame at 1 s, or at 0 s for a clip shorter than

@@ -3,9 +3,11 @@
 package config
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 )
 
@@ -19,7 +21,15 @@ type Config struct {
 	Umask  *int   // applied at startup when set (UMASK env, octal)
 
 	PollCards bool // import cards that appear under Cards without the host script
+
+	// Token is the optional shared password (env SD2NAS_TOKEN only, so it
+	// never shows in ps). Empty means none.
+	Token string
 }
+
+// tokenChars are the characters a token may use: safe unquoted or
+// single-quoted in the bash-sourced sd2nas.cfg.
+var tokenChars = regexp.MustCompile("^[A-Za-z0-9._~+/=-]+$")
 
 // Load reads configuration from env first, then lets flags override it.
 // getenv is os.Getenv in production and a map lookup in tests.
@@ -58,6 +68,13 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		}
 		v := int(m)
 		c.Umask = &v
+	}
+
+	if s := getenv("SD2NAS_TOKEN"); s != "" {
+		if !tokenChars.MatchString(s) {
+			return Config{}, errors.New("SD2NAS_TOKEN may use only letters, digits and . _ ~ + / = -")
+		}
+		c.Token = s
 	}
 	return c, nil
 }

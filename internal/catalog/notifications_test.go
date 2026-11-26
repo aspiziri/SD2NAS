@@ -189,3 +189,26 @@ func TestTakeConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestLatestNotificationTime(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	if got, err := d.LatestNotificationTime(ctx, "missing:"); err != nil || !got.IsZero() {
+		t.Fatalf("none = %v, %v; want zero, nil", got, err)
+	}
+	addN(t, d, "missing:2026-01-01T00:00:00.5Z", notifT0)
+	addN(t, d, "missing:2026-01-02T00:00:00Z", notifT0)
+	addN(t, d, "backup:2026-01-03T00:00:00Z", notifT0)
+	want := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	if got, err := d.LatestNotificationTime(ctx, "missing:"); err != nil || !got.Equal(want) {
+		t.Errorf("latest = %v, %v; want %v", got, err, want)
+	}
+	// the prefix is matched literally: _ is no wildcard
+	if got, err := d.LatestNotificationTime(ctx, "missin_:"); err != nil || !got.IsZero() {
+		t.Errorf("missin_: = %v, %v; want zero, nil", got, err)
+	}
+	addN(t, d, "missing:soon", notifT0)
+	if _, err := d.LatestNotificationTime(ctx, "missing:"); err == nil || !strings.Contains(err.Error(), `"missing:soon"`) {
+		t.Errorf("unparsable key: err = %v, want one naming the key", err)
+	}
+}
