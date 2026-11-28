@@ -240,6 +240,24 @@ func TestRunMissingBlocksSafeToFormat(t *testing.T) {
 			t.Errorf("message = %q", msg)
 		}
 	})
+	t.Run("ignored", func(t *testing.T) {
+		// Ignored on the Archive page: deleted on purpose, so seen before, like a cull.
+		e := newEnv(t)
+		card := e.cards
+		writeJPEG(t, card, "DCIM/100MSDCF/DSC00001.JPG", mt.ExifSpec{DateTimeOriginal: "2025:06:01 10:00:00"})
+		p := cardPath(card, "DCIM/100MSDCF/DSC00001.JPG")
+		a := catalog.Asset{SHA256: mustHash(t, p), Size: mustSize(t, p), Kind: media.KindImage, State: catalog.StateMissing,
+			RelPath: "Archive/2025-06-01 - Hike/x.JPG", UpdatedAt: testNow}
+		if err := e.cat.InsertAsset(t.Context(), a, mustFP(t, p)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.cat.IgnoreMissing(t.Context(), a.SHA256); err != nil {
+			t.Fatal(err)
+		}
+		out := e.run(t, card)
+		wantDone(t, out, catalog.Counts{Seen: 1, SeenBefore: 1}, true)
+		wantStaged(t, e)
+	})
 	t.Run("archived wins", func(t *testing.T) {
 		e := newEnv(t)
 		card := e.fixtureCard(t, "SONY_A7IV")

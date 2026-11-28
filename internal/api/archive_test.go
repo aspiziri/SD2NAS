@@ -226,11 +226,133 @@ func TestArchiveChangedAndAccept(t *testing.T) {
 	}
 }
 
+// fileList returns stats[key] (missing_files or ignored_files) as path -> sha256.
+func fileList(t *testing.T, m map[string]any, key string) map[string]string {
+	t.Helper()
+	l, ok := m[key].([]any)
+	if !ok {
+		t.Fatalf("%s = %#v, want a list", key, m[key])
+	}
+	out := map[string]string{}
+	for _, e := range l {
+		f, _ := e.(map[string]any)
+		rel, _ := f["rel_path"].(string)
+		out[rel], _ = f["sha256"].(string)
+	}
+	return out
+}
+
+func TestArchiveIgnoreMissing(t *testing.T) {
+	f := newFullServer(t)
+	putArchive(t, f, "S/a.jpg", "aaa")
+	putArchive(t, f, "S/b.jpg", "bbbb")
+	scanned(t, f)
+	for _, n := range []string{"a.jpg", "b.jpg"} {
+		if err := os.Remove(filepath.Join(f.photos, "Archive", "S", n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := scanned(t, f)
+	missing := fileList(t, m, "missing_files")
+	if m["missing"] != float64(2) || len(missing) != 2 || m["ignored"] != float64(0) || len(fileList(t, m, "ignored_files")) != 0 {
+		t.Fatalf("before ignore: missing %v %v, ignored %v %v", m["missing"], m["missing_files"], m["ignored"], m["ignored_files"])
+	}
+	a := missing["Archive/S/a.jpg"]
+	version := m["version"]
+	rec := send(t, f.s, http.MethodPost, "/api/archive/missing/ignore", `{"sha256":"`+a+`"}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("ignore: %d %s", rec.Code, rec.Body)
+	}
+	check := func(when string, wantMissing, wantIgnored []string) map[string]any {
+		t.Helper()
+		m := archiveStats(t, f)
+		gotM, gotI := fileList(t, m, "missing_files"), fileList(t, m, "ignored_files")
+		if m["missing"] != float64(len(wantMissing)) || m["ignored"] != float64(len(wantIgnored)) || len(gotM) != len(wantMissing) || len(gotI) != len(wantIgnored) {
+			t.Fatalf("%s: missing %v %v, ignored %v %v; want %v, %v", when, m["missing"], gotM, m["ignored"], gotI, wantMissing, wantIgnored)
+		}
+		for _, p := range wantMissing {
+			if _, ok := gotM[p]; !ok {
+				t.Errorf("%s: %s not missing (%v)", when, p, gotM)
+			}
+		}
+		for _, p := range wantIgnored {
+			if _, ok := gotI[p]; !ok {
+				t.Errorf("%s: %s not ignored (%v)", when, p, gotI)
+			}
+		}
+		return m
+	}
+	m = check("after ignore", []string{"Archive/S/b.jpg"}, []string{"Archive/S/a.jpg"})
+	if m["version"] == version {
+		t.Errorf("version %v did not change, so open pages would not reload", version)
+	}
+	// It survives a rescan and a full re-index.
+	scanned(t, f)
+	check("after a rescan", []string{"Archive/S/b.jpg"}, []string{"Archive/S/a.jpg"})
+	wantStarted(t, f, `{"full":true}`, true)
+	waitIdle(t, f)
+	check("after a re-index", []string{"Archive/S/b.jpg"}, []string{"Archive/S/a.jpg"})
+
+	// Ignoring twice, or un-ignoring a file that is missing, is a conflict.
+	e := wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/missing/ignore", `{"sha256":"`+a+`"}`), http.StatusConflict, "wrong_state")
+	if e.Error != "That file is no longer missing. Reload the page." {
+		t.Errorf("ignore twice: error %q", e.Error)
+	}
+	e = wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/missing/unignore", `{"sha256":"`+missing["Archive/S/b.jpg"]+`"}`), http.StatusConflict, "wrong_state")
+	if e.Error != "That file is no longer ignored. Reload the page." {
+		t.Errorf("un-ignore a missing file: error %q", e.Error)
+	}
+
+	if rec := send(t, f.s, http.MethodPost, "/api/archive/missing/unignore", `{"sha256":"`+a+`"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("un-ignore: %d %s", rec.Code, rec.Body)
+	}
+	check("after un-ignore", []string{"Archive/S/a.jpg", "Archive/S/b.jpg"}, nil)
+
+	// An ignored file put back is archived again.
+	if rec := send(t, f.s, http.MethodPost, "/api/archive/missing/ignore", `{"sha256":"`+a+`"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("ignore again: %d %s", rec.Code, rec.Body)
+	}
+	putArchive(t, f, "S/a.jpg", "aaa")
+	scanned(t, f)
+	m = check("after putting it back", []string{"Archive/S/b.jpg"}, nil)
+	if m["files"] != float64(1) {
+		t.Errorf("files %v, want 1 (a.jpg archived again)", m["files"])
+	}
+}
+
+func TestArchiveIgnoreBadRequests(t *testing.T) {
+	f := newFullServer(t)
+	for _, p := range []string{"ignore", "unignore"} {
+		for body, msg := range map[string]string{
+			`{}`:                "sha256 must be 64 lowercase hex digits.",
+			`{"sha256":"xyz"}`:  "sha256 must be 64 lowercase hex digits.",
+			`{"sha256":1}`:      "The request body is not valid JSON.",
+			`{"sha256":"a","x"`: "The request body is not valid JSON.",
+			`{"x":1}`:           "The request has a field this server does not know.",
+		} {
+			e := wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/missing/"+p, body), http.StatusBadRequest, "")
+			if e.Error != msg {
+				t.Errorf("%s %s: error %q, want %q", p, body, e.Error, msg)
+			}
+		}
+		e := wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/missing/"+p, `{"sha256":"`+strings.Repeat("ab", 32)+`"}`), http.StatusNotFound, "")
+		if e.Error != "That file is no longer in the index." {
+			t.Errorf("%s unknown: error %q", p, e.Error)
+		}
+	}
+}
+
 func TestArchiveAfterClose(t *testing.T) {
 	f := newFullServer(t)
 	f.s.Close()
-	for _, p := range []string{"changed/accept", "pause", "resume"} {
-		e := wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/"+p, `{"upTo":1}`), http.StatusServiceUnavailable, "")
+	for p, body := range map[string]string{
+		"changed/accept":   `{"upTo":1}`,
+		"pause":            `{"upTo":1}`,
+		"resume":           `{"upTo":1}`,
+		"missing/ignore":   `{"sha256":"` + strings.Repeat("ab", 32) + `"}`,
+		"missing/unignore": `{"sha256":"` + strings.Repeat("ab", 32) + `"}`,
+	} {
+		e := wantCode(t, send(t, f.s, http.MethodPost, "/api/archive/"+p, body), http.StatusServiceUnavailable, "")
 		if e.Error != "SD2NAS is shutting down" {
 			t.Errorf("%s: error %q", p, e.Error)
 		}

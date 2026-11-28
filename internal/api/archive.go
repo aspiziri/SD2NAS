@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/aspiziri/SD2NAS/internal/catalog"
 	"github.com/aspiziri/SD2NAS/internal/indexer"
 )
 
@@ -27,6 +29,8 @@ func (s *Server) MountArchive(idx *indexer.Service) {
 	s.mux.HandleFunc("POST /api/archive/resume", h.resume)
 	s.mux.HandleFunc("GET /api/archive/changed", h.changed)
 	s.mux.HandleFunc("POST /api/archive/changed/accept", h.accept)
+	s.mux.HandleFunc("POST /api/archive/missing/ignore", h.ignore)
+	s.mux.HandleFunc("POST /api/archive/missing/unignore", h.unignore)
 	// The snapshot runs outside the hub's lock, and the OnChange callback
 	// (which runs under the indexer's lock) only publishes.
 	s.hub.AddSnapshot(func() (string, any, error) { return EventIndexerProgress, idx.Status(), nil })
@@ -129,4 +133,37 @@ func (h *archiveHandlers) accept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"accepted": n})
+}
+
+func (h *archiveHandlers) ignore(w http.ResponseWriter, r *http.Request) {
+	h.setIgnored(w, r, "ignore missing file", "That file is no longer missing. Reload the page.", h.idx.Ignore)
+}
+
+func (h *archiveHandlers) unignore(w http.ResponseWriter, r *http.Request) {
+	h.setIgnored(w, r, "un-ignore missing file", "That file is no longer ignored. Reload the page.", h.idx.Unignore)
+}
+
+// setIgnored answers ignore and unignore: {"sha256": "<hex>"} in, 204 out.
+// An asset no longer in the state the button was for is a 409.
+func (h *archiveHandlers) setIgnored(w http.ResponseWriter, r *http.Request, what, moved string, set func(context.Context, string) error) {
+	var body struct {
+		SHA256 string `json:"sha256"`
+	}
+	if err := decodeBody(w, r, &body, smallBody); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	err := set(opContext(r), body.SHA256)
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, catalog.ErrBadHash):
+		writeError(w, http.StatusBadRequest, "sha256 must be 64 lowercase hex digits.")
+	case errors.Is(err, catalog.ErrNotFound):
+		writeError(w, http.StatusNotFound, "That file is no longer in the index.")
+	case errors.Is(err, catalog.ErrWrongState):
+		writeJSON(w, http.StatusConflict, opError{Error: moved, Code: "wrong_state"})
+	default:
+		h.fail(w, what, err)
+	}
 }
