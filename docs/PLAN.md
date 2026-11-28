@@ -468,6 +468,8 @@ POST   /api/archive/pause
 POST   /api/archive/resume
 GET    /api/archive/changed
 POST   /api/archive/changed/accept
+POST   /api/archive/missing/ignore   {sha256}  a missing file deleted on purpose: culled, keeping its path
+POST   /api/archive/missing/unignore {sha256}  missing again
 
 GET    /api/settings
 PUT    /api/settings
