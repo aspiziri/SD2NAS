@@ -44,8 +44,10 @@ type ArchiveChange struct {
 	ChangedAt time.Time `json:"changed_at"`
 }
 
-// MissingFile is an archive file the index knows but the disk no longer has.
+// MissingFile is an archive file the index knows but the disk no longer
+// has, or one of those the owner ignored.
 type MissingFile struct {
+	SHA256  string    `json:"sha256"`
 	RelPath string    `json:"rel_path"`
 	Size    int64     `json:"size"`
 	Since   time.Time `json:"since"` // updated_at: when it was marked missing
@@ -63,6 +65,7 @@ type ArchiveCounts struct {
 	Files    int   // archived assets under Archive/
 	Bytes    int64 // their sizes
 	Missing  int
+	Ignored  int // missing files the owner ignored
 	Changed  int // archive_changes rows
 	Copies   int
 	Imported int // assets with a first_ingest, any state ("files in ingest history")
@@ -457,6 +460,7 @@ func (d *DB) ArchiveCounts(ctx context.Context) (ArchiveCounts, error) {
 		{&c.Files, "SELECT COUNT(*) FROM assets WHERE state = 'archived' AND rel_path >= ? AND rel_path < ?", []any{lo, hi}},
 		{&c.Bytes, "SELECT COALESCE(SUM(size), 0) FROM assets WHERE state = 'archived' AND rel_path >= ? AND rel_path < ?", []any{lo, hi}},
 		{&c.Missing, "SELECT COUNT(*) FROM assets WHERE state = 'missing' AND rel_path >= ? AND rel_path < ?", []any{lo, hi}},
+		{&c.Ignored, "SELECT COUNT(*) FROM assets WHERE state = 'culled' AND rel_path >= ? AND rel_path < ?", []any{lo, hi}},
 		{&c.Changed, "SELECT COUNT(*) FROM archive_changes", nil},
 		// duplicates of archived content only: a staged file's copy is shown in Staging
 		{&c.Copies, "SELECT COUNT(*) FROM archive_copies c JOIN assets a ON a.sha256 = c.sha256 WHERE a.state = 'archived'", nil},
@@ -488,36 +492,103 @@ func (d *DB) MissingSince(ctx context.Context, after time.Time) (n int, latest t
 
 // MissingFiles returns up to limit missing files under Archive/, by rel_path.
 func (d *DB) MissingFiles(ctx context.Context, limit int) ([]MissingFile, error) {
+	return d.archiveFilesIn(ctx, "missing files", StateMissing, limit)
+}
+
+// IgnoredFiles returns up to limit ignored missing files under Archive/, by rel_path.
+func (d *DB) IgnoredFiles(ctx context.Context, limit int) ([]MissingFile, error) {
+	return d.archiveFilesIn(ctx, "ignored files", StateCulled, limit)
+}
+
+func (d *DB) archiveFilesIn(ctx context.Context, what string, state AssetState, limit int) ([]MissingFile, error) {
 	lo, hi, err := prefixRange(ArchiveRoot)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := d.db.QueryContext(ctx, `SELECT rel_path, size, updated_at FROM assets
-		WHERE state = 'missing' AND rel_path >= ? AND rel_path < ? ORDER BY rel_path LIMIT ?`, lo, hi, limit)
+	rows, err := d.db.QueryContext(ctx, `SELECT sha256, rel_path, size, updated_at FROM assets
+		WHERE state = ? AND rel_path >= ? AND rel_path < ? ORDER BY rel_path LIMIT ?`, string(state), lo, hi, limit)
 	if err != nil {
-		return nil, fmt.Errorf("missing files: %w", err)
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	var out []MissingFile
 	for rows.Next() {
 		var (
 			m     MissingFile
+			sha   []byte
 			since string
 		)
-		if err := rows.Scan(&m.RelPath, &m.Size, &since); err != nil {
-			return nil, errors.Join(fmt.Errorf("missing files: %w", err), rows.Close())
+		if err := rows.Scan(&sha, &m.RelPath, &m.Size, &since); err != nil {
+			return nil, errors.Join(fmt.Errorf("%s: %w", what, err), rows.Close())
 		}
+		m.SHA256 = blobToHex(sha)
 		if m.Since, err = parseTime(since); err != nil {
-			return nil, errors.Join(fmt.Errorf("missing file %s: parse updated_at: %w", m.RelPath, err), rows.Close())
+			return nil, errors.Join(fmt.Errorf("%s: %s: parse updated_at: %w", what, m.RelPath, err), rows.Close())
 		}
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, errors.Join(fmt.Errorf("missing files: %w", err), rows.Close())
+		return nil, errors.Join(fmt.Errorf("%s: %w", what, err), rows.Close())
 	}
 	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("missing files: %w", err)
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	return out, nil
+}
+
+// IgnoreMissing records that missing archive file sha was deleted on purpose:
+// it becomes culled, as a cull would have left it, but keeps its rel_path, so
+// it is listed as ignored and UnignoreMissing can undo it. A card holding the
+// content counts it as seen before, and a pending "Re-import missing files"
+// request for it goes. updated_at stays the time it was marked missing, so
+// undoing it raises no new missing-files notice. An asset in another state,
+// or missing outside Archive/, is a *WrongStateError.
+func (d *DB) IgnoreMissing(ctx context.Context, sha string) error {
+	return d.setIgnored(ctx, "ignore missing", sha, StateMissing, StateCulled)
+}
+
+// UnignoreMissing makes ignored file sha missing again.
+func (d *DB) UnignoreMissing(ctx context.Context, sha string) error {
+	return d.setIgnored(ctx, "un-ignore missing", sha, StateCulled, StateMissing)
+}
+
+func (d *DB) setIgnored(ctx context.Context, verb, sha string, from, to AssetState) error {
+	b, err := hexToBlob(sha)
+	if err != nil {
+		return err
+	}
+	lo, hi, err := prefixRange(ArchiveRoot)
+	if err != nil {
+		return err
+	}
+	err = d.tx(ctx, func(tx *sql.Tx) error {
+		// A cull from Staging has no rel_path, so only an ignored file matches culled here.
+		res, err := tx.ExecContext(ctx, "UPDATE assets SET state = ? WHERE sha256 = ? AND state = ? AND rel_path >= ? AND rel_path < ?",
+			string(to), b, string(from), lo, hi)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			var state string
+			err := tx.QueryRowContext(ctx, "SELECT state FROM assets WHERE sha256 = ?", b).Scan(&state)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			if err != nil {
+				return err
+			}
+			return &WrongStateError{Verb: verb, SHA256: sha, State: AssetState(state)}
+		}
+		_, err = tx.ExecContext(ctx, "DELETE FROM restore_requests WHERE sha256 = ?", b)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", verb, sha, err)
+	}
+	return nil
 }
 
 // RecentArchiveFolders returns the top-level archive folders with the newest

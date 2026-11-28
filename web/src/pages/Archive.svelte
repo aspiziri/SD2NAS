@@ -21,6 +21,7 @@
   let dialogError = $state('');
   let accepting = $state(false);
   let acceptError = $state('');
+  let ignoring = $state(''); // sha256 of the file an ignore or un-ignore request is for
   let scanAsked = false; // this page started the pass that is running
   let scanSeen = null; // finished_at of the last pass already handled
 
@@ -87,6 +88,7 @@
   const userPaused = $derived(running?.paused_by === 'user');
   const problems = $derived(last?.errors ?? []);
   const missingFiles = $derived(stats?.missing_files ?? []);
+  const ignoredFiles = $derived(stats?.ignored_files ?? []);
   const changeList = $derived(changes?.changes ?? []);
   const datePart = (iso) => formatWhen(iso).slice(0, 10);
   const bareFolder = (f) => f.replace(/^Archive\//, '');
@@ -130,6 +132,20 @@
       acceptError = describeError(err);
     } finally {
       accepting = false;
+    }
+  }
+
+  // setIgnored ignores (or un-ignores) one missing file.
+  async function setIgnored(f, ignore) {
+    ignoring = f.sha256;
+    try {
+      await api(`/api/archive/missing/${ignore ? 'ignore' : 'unignore'}`, { method: 'POST', body: { sha256: f.sha256 } });
+      toast(ignore ? 'Ignored. Cards that still hold it are safe to format.' : 'Missing again. Cards that still hold it are not safe to format.', 'ok', 6000);
+    } catch (err) {
+      toast(err.status === 409 ? err.message : describeError(err), 'warn', 6000);
+    } finally {
+      ignoring = '';
+      load();
     }
   }
 </script>
@@ -208,13 +224,34 @@
   {#if stats.missing > 0}
     <div class="card">
       <h2>⚠ {plural(stats.missing, 'file is', 'files are')} missing from the archive</h2>
-      <p class="muted small lead">SD2NAS indexed these files, but they're no longer in the archive. Cards that still hold them won't be reported as safe to format. If you moved them, the next scan finds them.</p>
+      <p class="muted small lead">SD2NAS indexed these files, but they're no longer in the archive. Cards that still hold them won't be reported as safe to format. If you moved them, the next scan finds them. Ignore the ones you deleted on purpose.</p>
       <ul class="plain">
-        {#each missingFiles as f (f.rel_path)}
-          <li><span class="mono">{f.rel_path}</span> <span class="muted small size">{formatBytes(f.size)}</span></li>
+        {#each missingFiles as f (f.sha256)}
+          <li class="file">
+            <span class="name"><span class="mono">{f.rel_path}</span> <span class="muted small size">{formatBytes(f.size)}</span></span>
+            <button class="btn link" disabled={ignoring !== ''} onclick={() => setIgnored(f, true)}>{ignoring === f.sha256 ? 'Ignoring…' : 'Ignore'}</button>
+          </li>
         {/each}
         {#if stats.missing > missingFiles.length}<li class="muted">…and {formatCount(stats.missing - missingFiles.length)} more</li>{/if}
       </ul>
+    </div>
+  {/if}
+
+  {#if stats.ignored > 0}
+    <div class="card">
+      <details class="ignored">
+        <summary>{plural(stats.ignored, 'ignored missing file', 'ignored missing files')}</summary>
+        <p class="muted small ignored-lead">Deleted on purpose, so they count as culled: cards that still hold them are safe to format and don't import them again. If one comes back to the archive, the next scan indexes it.</p>
+        <ul class="plain">
+          {#each ignoredFiles as f (f.sha256)}
+            <li class="file">
+              <span class="name"><span class="mono">{f.rel_path}</span> <span class="muted small size">{formatBytes(f.size)}</span></span>
+              <button class="btn link" disabled={ignoring !== ''} onclick={() => setIgnored(f, false)}>{ignoring === f.sha256 ? 'Saving…' : 'Un-ignore'}</button>
+            </li>
+          {/each}
+          {#if stats.ignored > ignoredFiles.length}<li class="muted">…and {formatCount(stats.ignored - ignoredFiles.length)} more</li>{/if}
+        </ul>
+      </details>
     </div>
   {/if}
 
@@ -289,6 +326,11 @@
   ul.plain li { padding: 6px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
   ul.plain li:last-child { border-bottom: 0; }
   .size { white-space: nowrap; margin-left: 6px; }
+  ul.plain li.file { display: flex; align-items: center; gap: 10px; padding: 0; }
+  li.file .name { flex: 1; min-width: 0; padding: 6px 0; }
+  li.file .btn { flex: none; }
+  details.ignored { background: none; padding: 0; margin: 0; }
+  .ignored-lead { margin: 4px 0 10px; }
   .accept { margin-top: 12px; }
   table.stack td { overflow-wrap: anywhere; }
   @media (max-width: 760px) {

@@ -193,7 +193,7 @@ CREATE TABLE assets (
   capture_time  TEXT,                   -- local time, as named
   tz_offset     TEXT,                   -- from EXIF OffsetTimeOriginal, if any
   state         TEXT NOT NULL,          -- staged | archived | culled | missing
-  rel_path      TEXT,                   -- relative to /photos; NULL when culled
+  rel_path      TEXT,                   -- relative to /photos; NULL when culled from Staging; kept under Archive/ when a missing file is ignored
   mtime         INTEGER,                -- for cheap rescans
   first_ingest  INTEGER REFERENCES ingests(id),  -- NULL if found by indexer
   updated_at    TEXT NOT NULL
@@ -273,6 +273,11 @@ Schema version 3 adds the `missing` ingest outcome (`ingests.missing`), `archive
 **Culled stays remembered:** culling or discarding deletes the file and sets
 `state = culled`, `rel_path = NULL`. The row and fingerprint stay, so it's
 skipped on future ingests. The ingest summary offers "Re-import anyway".
+Culled with a `rel_path` under `Archive/` means an ignored missing file (the
+Archive index page's Ignore): only ignore writes that combination, and the
+ignored list, its count and Un-ignore rely on it, so any new way to cull must
+keep clearing `rel_path`. "Forget this import" keeps ignored files; "Re-import
+anyway" forgets them like any cull.
 "Forget this import" (§8) is the one exception to "never deleted": it deletes the forgotten assets' fingerprints so the card imports them again. Schema version 2 adds `ingests.forgotten_at`.
 
 ---
@@ -353,7 +358,8 @@ directory names an operation creates.
 | Merge N → 1 | move files into the target folder (collision loop), remove empty sources | union `dates`, update paths |
 | Move files | same as merge, per file; "New folder…" creates one | update paths and dates |
 | Cull files / discard folder | delete files | `state = culled`, `rel_path = NULL` |
-| Forget an import | optionally delete the import's files still in `Staging/` first | then delete the import's `staged` and `culled` asset rows and their fingerprints, so the same card imports them again; `archived` rows are never forgotten (that would import archive duplicates); the ingest stays in the history marked as forgotten |
+| Forget an import | optionally delete the import's files still in `Staging/` first | then delete the import's `staged` and `culled` asset rows and their fingerprints, so the same card imports them again; `archived`, `missing` and ignored rows are never forgotten (that would import archive duplicates, or files deleted on purpose); the ingest stays in the history marked as forgotten |
+| Ignore / un-ignore a missing archive file | none | `missing` ↔ `culled`, `rel_path` kept, `updated_at` unchanged (so un-ignoring raises no new missing notice), restore requests for it dropped |
 | Promote (queued, one job at a time) | `os.Rename(Staging/X, Archive/<pattern>)`, instant within the share. If the target folder already exists, merge into it file by file with the collision loop. If a rename ever returns `EXDEV`, fall back to copy, verify hash, delete. | `state = archived`, new paths, drop the `staging_folders` row |
 
 **Listing and reconcile.** A staging folder's files are the `staged`
@@ -468,6 +474,8 @@ POST   /api/archive/pause
 POST   /api/archive/resume
 GET    /api/archive/changed
 POST   /api/archive/changed/accept
+POST   /api/archive/missing/ignore   {sha256}  a missing file deleted on purpose: culled, keeping its path
+POST   /api/archive/missing/unignore {sha256}  missing again
 
 GET    /api/settings
 PUT    /api/settings

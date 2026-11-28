@@ -23,6 +23,7 @@ type ForgetSummary struct {
 	Staged       int   `json:"staged"` // files of this import still in staging
 	StagedBytes  int64 `json:"staged_bytes"`
 	Culled       int   `json:"culled"`       // culled files of this import (the card brings them back after a forget)
+	Ignored      int   `json:"ignored"`      // ignored missing archive files: stay known, still ignored
 	Archived     int   `json:"archived"`     // already in the archive: stay known
 	Reimportable int   `json:"reimportable"` // its "seen before" files whose asset is culled ("Re-import anyway")
 	Missing      int   `json:"missing"`      // missing from the archive: stay known
@@ -39,6 +40,7 @@ type ForgetResult struct {
 	DeletedFiles int     `json:"deleted_files"`
 	KeptArchived int     `json:"kept_archived"`
 	KeptMissing  int     `json:"kept_missing"`
+	KeptIgnored  int     `json:"kept_ignored"`
 	Removed      []int64 `json:"removed"` // staging folders left empty and removed
 }
 
@@ -58,15 +60,17 @@ func (s *Service) ForgetSummary(ctx context.Context, ingestID int64) (ForgetSumm
 	}
 	out := ForgetSummary{Reimportable: len(culled), Forgotten: !in.ForgottenAt.IsZero()}
 	for _, a := range assets {
-		switch a.State {
-		case catalog.StateStaged:
+		switch {
+		case a.Ignored():
+			out.Ignored++
+		case a.State == catalog.StateStaged:
 			out.Staged++
 			out.StagedBytes += a.Size
-		case catalog.StateCulled:
+		case a.State == catalog.StateCulled:
 			out.Culled++
-		case catalog.StateArchived:
+		case a.State == catalog.StateArchived:
 			out.Archived++
-		case catalog.StateMissing:
+		case a.State == catalog.StateMissing:
 			out.Missing++
 		}
 	}
@@ -79,7 +83,7 @@ func (s *Service) ForgetSummary(ctx context.Context, ingestID int64) (ForgetSumm
 // Forget forgets import ingestID (§8, Decision 10): its staged and culled
 // assets are deleted from the catalog with their fingerprints, after their
 // files in Staging/ are deleted when deleteFiles is set, so the same card
-// imports them again. Archived assets stay known. The ingest stays in the
+// imports them again. Archived, missing and ignored assets stay known. The ingest stays in the
 // history, marked forgotten. The caller keeps imports from running
 // meanwhile (ingest.Manager.Exclusive).
 func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) (ForgetResult, error) {
@@ -135,11 +139,17 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 			res.KeptArchived++
 		case catalog.StateMissing:
 			res.KeptMissing++
+		case catalog.StateCulled:
+			if a.Ignored() {
+				res.KeptIgnored++
+			}
 		}
 	}
-	// Archived and missing assets are never forgotten (ForgetAssets refuses them too).
+	// Archived and missing assets are never forgotten (ForgetAssets refuses
+	// them too), and neither are ignored ones: forgetting one would drop it
+	// from the ignored list and the card would copy it again.
 	forget = slices.DeleteFunc(forget, func(a catalog.Asset) bool {
-		return a.State == catalog.StateArchived || a.State == catalog.StateMissing
+		return a.State == catalog.StateArchived || a.State == catalog.StateMissing || a.Ignored()
 	})
 	// Files first, then the catalog (global rule): a delete that fails half
 	// way leaves the import unforgotten, so Forget can simply run again
@@ -196,7 +206,7 @@ func (s *Service) Forget(ctx context.Context, ingestID int64, deleteFiles bool) 
 var forgetAfterRead func()
 
 // forgetPlan reads import ingestID's assets: those to forget (staged and
-// culled) and archived and missing ones (kept) in forget, the staged ones in staged,
+// culled) and archived, missing and ignored ones (kept) in forget, the staged ones in staged,
 // and the ids of the folders holding the staged ones. A staged asset that
 // is not inside a known staging folder is ErrChanged.
 func (s *Service) forgetPlan(ctx context.Context, ingestID int64) (forget, staged []catalog.Asset, ids []int64, err error) {

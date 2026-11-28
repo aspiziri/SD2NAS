@@ -565,6 +565,84 @@ func TestMissingFiles(t *testing.T) {
 	}
 }
 
+func TestIgnoreMissing(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	a := archivedAt(t, d, 1, "Archive/s/a.JPG", 0)
+	b := archivedAt(t, d, 2, "Archive/s/b.JPG", 0)
+	for _, sha := range []string{a, b} {
+		if err := d.MarkMissing(ctx, sha, t1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putRequest(t, d, a, t2)
+	if err := d.IgnoreMissing(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	// culled, as a cull would leave it, but the path stays to list it by
+	wantPath(t, d, a, "Archive/s/a.JPG", StateCulled)
+	if got, _ := d.AssetBySHA(ctx, a); !got.UpdatedAt.Equal(t1) {
+		t.Errorf("updated_at = %v, want the missing time %v", got.UpdatedAt, t1)
+	}
+	if r := requests(t, d); len(r) != 0 {
+		t.Errorf("restore requests = %v, want the ignored file's gone", r)
+	}
+	c, err := d.ArchiveCounts(ctx)
+	if err != nil || c.Missing != 1 || c.Ignored != 1 {
+		t.Errorf("counts = %+v, %v; want 1 missing, 1 ignored", c, err)
+	}
+	if m, _ := d.MissingFiles(ctx, 10); len(m) != 1 || m[0].SHA256 != b {
+		t.Errorf("missing = %+v, want only b", m)
+	}
+	ig, err := d.IgnoredFiles(ctx, 10)
+	if err != nil || len(ig) != 1 || ig[0].SHA256 != a || ig[0].RelPath != "Archive/s/a.JPG" || ig[0].Size != 1 || !ig[0].Since.Equal(t1) {
+		t.Errorf("ignored = %+v, %v", ig, err)
+	}
+	if n, _, _ := d.MissingSince(ctx, t0); n != 1 {
+		t.Errorf("MissingSince = %d, want 1 (ignored files are not missing)", n)
+	}
+	wrongState(t, d.IgnoreMissing(ctx, a), "culled")
+
+	if err := d.UnignoreMissing(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	wantPath(t, d, a, "Archive/s/a.JPG", StateMissing)
+	if got, _ := d.AssetBySHA(ctx, a); !got.UpdatedAt.Equal(t1) {
+		t.Errorf("updated_at after un-ignore = %v, want %v", got.UpdatedAt, t1)
+	}
+	if n, _, _ := d.MissingSince(ctx, t1); n != 0 {
+		t.Errorf("MissingSince(t1) = %d after un-ignore, want 0 (no new notice)", n)
+	}
+	wrongState(t, d.UnignoreMissing(ctx, a), "missing")
+}
+
+func TestIgnoreMissingOnlyArchiveFiles(t *testing.T) {
+	d := openTest(t)
+	ctx := t.Context()
+	arch := archivedAt(t, d, 1, "Archive/s/a.JPG", 0)
+	wrongState(t, d.IgnoreMissing(ctx, arch), "archived")
+	wrongState(t, d.UnignoreMissing(ctx, arch), "archived")
+	// A cull from Staging is not an ignored file: it has no path to go back to.
+	culled := stagedAt(t, d, 2, "Staging/x/b.JPG")
+	if err := d.CullAsset(ctx, culled, t1); err != nil {
+		t.Fatal(err)
+	}
+	wrongState(t, d.UnignoreMissing(ctx, culled), "culled")
+	wantPath(t, d, culled, "", StateCulled)
+	if ig, _ := d.IgnoredFiles(ctx, 10); len(ig) != 0 {
+		t.Errorf("ignored = %+v, want none", ig)
+	}
+	if c, _ := d.ArchiveCounts(ctx); c.Ignored != 0 {
+		t.Errorf("ignored count = %d, want 0", c.Ignored)
+	}
+	if err := d.IgnoreMissing(ctx, hexN(9)); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown hash: err = %v, want ErrNotFound", err)
+	}
+	if err := d.IgnoreMissing(ctx, "nope"); !errors.Is(err, ErrBadHash) {
+		t.Errorf("bad hash: err = %v, want ErrBadHash", err)
+	}
+}
+
 func TestMissingSince(t *testing.T) {
 	d := openTest(t)
 	ctx := t.Context()

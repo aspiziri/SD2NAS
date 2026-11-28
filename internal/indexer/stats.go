@@ -19,6 +19,8 @@ type Stats struct {
 	Copies         int                    `json:"copies"`
 	Imported       int                    `json:"imported"`
 	MissingFiles   []catalog.MissingFile  `json:"missing_files"` // <= 50, never null
+	Ignored        int                    `json:"ignored"`       // missing files the owner ignored
+	IgnoredFiles   []catalog.MissingFile  `json:"ignored_files"` // <= 50, never null
 	Recent         []catalog.RecentFolder `json:"recent"`        // <= 5, never null
 	RescanAt       string                 `json:"rescan_at"`     // "03:00"
 	BackupDir      string                 `json:"backup_dir"`    // effective
@@ -49,8 +51,11 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 		return Stats{}, err
 	}
 	st.Files, st.Bytes, st.Copies, st.Imported = c.Files, c.Bytes, c.Copies, c.Imported
-	st.Changed, st.Missing = c.Changed, c.Missing
+	st.Changed, st.Missing, st.Ignored = c.Changed, c.Missing, c.Ignored
 	if st.MissingFiles, err = s.db.MissingFiles(ctx, maxMissingShown); err != nil {
+		return Stats{}, err
+	}
+	if st.IgnoredFiles, err = s.db.IgnoredFiles(ctx, maxMissingShown); err != nil {
 		return Stats{}, err
 	}
 	if st.Recent, err = s.db.RecentArchiveFolders(ctx, maxRecentShown); err != nil {
@@ -58,6 +63,9 @@ func (s *Service) Stats(ctx context.Context) (Stats, error) {
 	}
 	if st.MissingFiles == nil {
 		st.MissingFiles = []catalog.MissingFile{}
+	}
+	if st.IgnoredFiles == nil {
+		st.IgnoredFiles = []catalog.MissingFile{}
 	}
 	if st.Recent == nil {
 		st.Recent = []catalog.RecentFolder{}
@@ -100,30 +108,55 @@ func (s *Service) Changes(ctx context.Context) (ChangeList, error) {
 // Accept clears the changes with id <= upTo and returns how many. It is
 // ErrClosed after Close.
 func (s *Service) Accept(ctx context.Context, upTo int64) (int, error) {
+	var n int
+	err := s.change(ctx, "count archive changes after accept", func() (err error) {
+		if upTo < 1 {
+			return fmt.Errorf("indexer: accept up to %d: want a positive id", upTo)
+		}
+		n, err = s.db.AcceptArchiveChanges(ctx, upTo)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// Ignore records that missing file sha was deleted on purpose
+// (catalog.IgnoreMissing). It is ErrClosed after Close.
+func (s *Service) Ignore(ctx context.Context, sha string) error {
+	return s.change(ctx, "count missing files after ignore", func() error { return s.db.IgnoreMissing(ctx, sha) })
+}
+
+// Unignore makes ignored file sha missing again (catalog.UnignoreMissing).
+// It is ErrClosed after Close.
+func (s *Service) Unignore(ctx context.Context, sha string) error {
+	return s.change(ctx, "count missing files after un-ignore", func() error { return s.db.UnignoreMissing(ctx, sha) })
+}
+
+// change runs write, an owner's change to the catalog, then reloads the
+// counts and tells the pages (a new Version). It is ErrClosed after Close.
+func (s *Service) change(ctx context.Context, what string, write func() error) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return 0, ErrClosed
+		return ErrClosed
 	}
 	s.wg.Add(1) // Close waits, so the catalog is not closed under the write
 	s.mu.Unlock()
 	defer s.wg.Done()
 
-	if upTo < 1 {
-		return 0, fmt.Errorf("indexer: accept up to %d: want a positive id", upTo)
+	if err := write(); err != nil {
+		return err
 	}
-	n, err := s.db.AcceptArchiveChanges(ctx, upTo)
-	if err != nil {
-		return 0, err
-	}
-	// The delete has committed: a failed count refresh is logged, not
-	// answered, and the next pass or accept counts again.
+	// The write has committed: a failed count refresh is logged, not
+	// answered, and the next pass or change counts again.
 	if err := s.refreshCounts(context.WithoutCancel(ctx)); err != nil {
-		s.log.Error("count archive changes after accept", "err", err)
+		s.log.Error(what, "err", err)
 	}
 	s.mu.Lock()
 	s.status.Version++
 	s.reportLocked(true)
 	s.mu.Unlock()
-	return n, nil
+	return nil
 }
