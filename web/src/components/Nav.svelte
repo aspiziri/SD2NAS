@@ -18,7 +18,7 @@
   </a>
   <a href="/archive" class="tab" class:active={tab === 'archive'} aria-current={tab === 'archive' ? 'page' : undefined}>
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="4" rx="1" /><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" /><path d="M10 12h4" /></svg>
-    <span class="label">Archive<span class="only-desktop">{' '}index</span></span>
+    <span class="label">Archive</span>
     {#if live.indexer.changed}<span class="pill warn">{live.indexer.changed}</span>{/if}
   </a>
   <a href="/settings" class="tab" class:active={tab === 'settings'} aria-current={tab === 'settings' ? 'page' : undefined}>

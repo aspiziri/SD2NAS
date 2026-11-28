@@ -27,7 +27,7 @@
   {#if queue.running}
     {@const j = queue.running}
     <h2>Promoting to the archive</h2>
-    <p class="muted small">{promoteSummary(j)}{#if j.bytes_total} · {formatBytes(j.bytes_done)} of {formatBytes(j.bytes_total)}{/if}</p>
+    <p class="muted small">{promoteSummary(j)}{#if j.bytes_total}{' '}· {formatBytes(j.bytes_done)} of {formatBytes(j.bytes_total)}{/if}</p>
     <div class="bar" aria-hidden="true"><i style="width:{pct(j)}%"></i></div>
     {@render folderList(j)}
   {/if}

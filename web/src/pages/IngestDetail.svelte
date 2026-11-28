@@ -160,7 +160,7 @@
   <h1>{cardName(ingest)}</h1>
   {#if ingest.forgotten_at}<span class="pill">Forgotten {formatWhen(ingest.forgotten_at)}</span>{/if}
   <p class="sub">
-    {formatWhen(ingest.started_at)} · <span class="mono">{ingest.card_path}</span>{#if ingest.card_size} · {formatBytes(ingest.card_size)} of photos and videos{/if}
+    {formatWhen(ingest.started_at)} · <span class="mono">{ingest.card_path}</span>{#if ingest.card_size}{' '}· {formatBytes(ingest.card_size)} of photos and videos{/if}
   </p>
   {#if live_}
     <LiveIngest />
