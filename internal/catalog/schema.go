@@ -35,7 +35,7 @@ CREATE TABLE assets (
   capture_time  TEXT,                         -- local wall clock as named, 2006-01-02T15:04:05
   tz_offset     TEXT NOT NULL DEFAULT '',     -- EXIF OffsetTimeOriginal, if any
   state         TEXT NOT NULL CHECK (state IN ('staged','archived','culled','missing')),
-  rel_path      TEXT,                         -- slash-separated, relative to /photos; NULL when culled
+  rel_path      TEXT,                         -- slash-separated, relative to /photos; NULL when culled from Staging; kept under Archive/ when a missing file is ignored
   mtime         INTEGER,                      -- UnixNano of the stored file, for cheap rescans
   first_ingest  INTEGER REFERENCES ingests(id),  -- NULL if found by the indexer
   updated_at    TEXT NOT NULL

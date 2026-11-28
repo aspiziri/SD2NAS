@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aspiziri/SD2NAS/internal/media"
@@ -35,6 +36,13 @@ type Asset struct {
 	Mtime       int64      `json:"mtime,omitempty"`        // UnixNano; 0 = NULL
 	FirstIngest int64      `json:"first_ingest,omitempty"` // 0 = NULL
 	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// Ignored reports whether a is a missing archive file the owner ignored
+// (IgnoreMissing): culled, but still at its Archive/ path. A cull from
+// Staging clears the path, so it is never ignored.
+func (a Asset) Ignored() bool {
+	return a.State == StateCulled && strings.HasPrefix(a.RelPath, ArchiveRoot)
 }
 
 const assetCols = "sha256, size, kind, capture_time, tz_offset, state, rel_path, mtime, first_ingest, updated_at"

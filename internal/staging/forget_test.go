@@ -125,6 +125,67 @@ func TestForgetSummary(t *testing.T) {
 	}
 }
 
+// addIgnored is addMissing plus an ignore of each (the Archive page's Ignore).
+func addIgnored(t *testing.T, e *opsEnv, id int64, contents ...string) []string {
+	t.Helper()
+	shas := addMissing(t, e, id, contents...)
+	for _, sha := range shas {
+		if err := e.db.IgnoreMissing(t.Context(), sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return shas
+}
+
+func TestForgetKeepsIgnored(t *testing.T) {
+	e := newOpsEnv(t)
+	id, _, _, culled, _ := importOf(t, e, forgetStaged, []string{"culled"}, []string{"archived"})
+	ignored := addIgnored(t, e, id, "deleted on purpose")
+	sum, err := e.svc.ForgetSummary(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Ignored != 1 || sum.Culled != 1 {
+		t.Errorf("summary = %+v, want 1 ignored and 1 culled (the ignored file is not counted as culled)", sum)
+	}
+	got, err := e.svc.Forget(t.Context(), id, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Forgotten != 3 || got.KeptIgnored != 1 || got.KeptArchived != 1 {
+		t.Errorf("result = %+v, want 3 forgotten (2 staged, 1 culled), 1 ignored and 1 archived kept", got)
+	}
+	a := e.asset(t, ignored[0])
+	if !a.Ignored() || a.RelPath != "Archive/lost0.jpg" {
+		t.Errorf("ignored asset = %+v, want it kept, culled at its archive path", a)
+	}
+	if _, err := e.db.AssetBySHA(t.Context(), culled[0]); !errors.Is(err, catalog.ErrNotFound) {
+		t.Errorf("culled asset: err = %v, want ErrNotFound", err)
+	}
+	if slices.Contains(e.removedHashes(), ignored[0]) {
+		t.Errorf("removed hashes %v include the ignored file", e.removedHashes())
+	}
+}
+
+// "Re-import anyway" still forgets an ignored file the card saw: asking to
+// import the card's culled files again is what it is for.
+func TestForgetCulledForgetsIgnored(t *testing.T) {
+	e := newOpsEnv(t)
+	id, _, _, _, _ := importOf(t, e, nil, nil, nil)
+	sha := addIgnored(t, e, id, "deleted on purpose")[0]
+	f := catalog.IngestFile{CardPath: "DCIM/again.jpg", Size: 18, QuickFP: shaOf("fp:deleted on purpose"), SHA256: sha,
+		Outcome: catalog.OutcomeSeenBefore}
+	if err := e.db.AddIngestFiles(t.Context(), id, []catalog.IngestFile{f}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := e.svc.ForgetCulled(t.Context(), id); err != nil || got != 1 {
+		t.Fatalf("ForgetCulled = %d, %v; want 1", got, err)
+	}
+	if _, err := e.db.AssetBySHA(t.Context(), sha); !errors.Is(err, catalog.ErrNotFound) {
+		t.Errorf("ignored asset: err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestForgetDeletesFiles(t *testing.T) {
 	e := newOpsEnv(t)
 	id, f, staged, culled, archived := importOf(t, e, forgetStaged, []string{"culled"}, []string{"archived"})

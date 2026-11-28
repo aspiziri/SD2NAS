@@ -248,6 +248,7 @@
       <li>{plural(forget.culled, 'culled file', 'culled files')}</li>
       <li>{plural(forget.archived, 'file', 'files')} already in the archive stay known</li>
       {#if forget.missing > 0}<li>{plural(forget.missing, 'file', 'files')} whose archive copy is missing stay known</li>{/if}
+      {#if forget.ignored > 0}<li>{plural(forget.ignored, 'ignored missing file stays', 'ignored missing files stay')} ignored</li>{/if}
     </ul>
     {#if forget.staged}
       <label class="toggle"><input type="checkbox" bind:checked={deleteFiles} /> <span>Also delete the {plural(forget.staged, 'file', 'files')} still in staging</span></label>
