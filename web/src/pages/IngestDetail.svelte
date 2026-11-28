@@ -160,7 +160,7 @@
   <h1>{cardName(ingest)}</h1>
   {#if ingest.forgotten_at}<span class="pill">Forgotten {formatWhen(ingest.forgotten_at)}</span>{/if}
   <p class="sub">
-    {formatWhen(ingest.started_at)} · <span class="mono">{ingest.card_path}</span>{#if ingest.card_size} · {formatBytes(ingest.card_size)} of photos and videos{/if}
+    {formatWhen(ingest.started_at)} · <span class="mono">{ingest.card_path}</span>{#if ingest.card_size}{' '}· {formatBytes(ingest.card_size)} of photos and videos{/if}
   </p>
   {#if live_}
     <LiveIngest />
@@ -191,7 +191,7 @@
       <p class="muted small" style="margin:8px 0">They were culled or discarded after an earlier import, so they're skipped and deleted shots don't come back.</p>
       {#if forget?.reimportable}
         <button class="btn" disabled={importing} onclick={() => { dialogError = ''; dialog = 'reimport'; }}>Re-import these anyway</button>
-        {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
+        {#if importing}<span class="muted small">Wait for the running import to finish.</span>{/if}
       {/if}
       {@render fileList(seenBefore, pathRow)}
     </details>
@@ -205,7 +205,7 @@
       {/if}
       {#if forget && toRequest > 0}
         <button class="btn" disabled={importing} onclick={() => { dialogError = ''; dialog = 'reimportMissing'; }}>Re-import {plural(toRequest, 'missing file', 'missing files')}…</button>
-        {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
+        {#if importing}<span class="muted small">Wait for the running import to finish.</span>{/if}
       {/if}
       {@render fileList(missing, missingRow)}
     </details>
@@ -236,7 +236,7 @@
       <h2>Forget this import</h2>
       <p class="muted small" style="margin:0 0 10px">SD2NAS forgets the files this import brought in or skipped as culled, so inserting the same card imports them again (to retest a card, say). Files already in the archive stay known, and the import stays in this history.</p>
       <button class="btn danger" disabled={importing} onclick={() => { dialogError = ''; deleteFiles = false; dialog = 'forget'; }}>Forget this import…</button>
-      {#if importing}<span class="muted small"> Wait for the running import to finish.</span>{/if}
+      {#if importing}<span class="muted small">Wait for the running import to finish.</span>{/if}
     </div>
   {/if}
 {/if}

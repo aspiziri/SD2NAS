@@ -422,7 +422,7 @@
             <button class="lbody" onclick={(e) => onTileClick(e, i)} aria-label={selecting ? `${on ? 'Unselect' : 'Select'} ${file.name}` : `Show ${file.name}`}>
               <span class="lthumb"><Thumb sha={file.sha256} kind={file.kind} label={extLabel(file)} /></span>
               <span class="linfo">
-                <span class="lname">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠ </span>{/if}{file.name}</span>
+                <span class="lname">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠{' '}</span>{/if}{file.name}</span>
                 <span class="lmeta small muted">
                   {#if file.capture_time}<span>{formatCapture(file.capture_time)}</span>{/if}
                   <span>{file.kind === 'raw' ? 'RAW' : file.kind === 'video' ? 'Video' : 'JPG'}</span>
@@ -442,7 +442,7 @@
         <div class="cell" class:sel={on} data-key={file.sha256}>
           <button class="tile" onclick={(e) => onTileClick(e, i)} aria-label={selecting ? `${on ? 'Unselect' : 'Select'} ${file.name}` : `Show ${file.name}`}>
             <Thumb sha={file.sha256} kind={file.kind} label={extLabel(file)} />
-            <span class="fn">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠ </span>{/if}{file.name}</span>
+            <span class="fn">{#if file.clock_warnings?.length}<span class="warn" title={file.clock_warnings.join('; ')}>⚠{' '}</span>{/if}{file.name}</span>
             {#if file.in_archive}<span class="inarch" title="Already in the archive: {file.in_archive}">In archive</span>{/if}
           </button>
           <button class="pick" class:on onclick={() => toggle(file.sha256)} aria-pressed={on} aria-label="{on ? 'Unselect' : 'Select'} {file.name}"><span>✓</span></button>
